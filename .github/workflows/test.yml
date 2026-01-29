@@ -48,4 +48,5 @@ jobs:
 
     - name: Run tests
       run: |
+        pip install ./fuse4dbricks
         pytest .
