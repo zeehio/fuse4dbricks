@@ -29,8 +29,17 @@ dependencies = [
     "httpx>=0.24.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-trio>=0.8.0",  # Critical for async tests
+    "pytest-mock>=3.11.0", # For mocking UCClient/Persistence
+    "ruff>=0.1.0",         # Fast Linter (Optional)
+    "mypy>=1.5.0",         # Type Checker (Optional)
+]
+
 [project.urls]
-"Homepage" = "https://github.com/tu-usuario/fuse4dbricks"
+"Homepage" = "https://github.com/zeehio/fuse4dbricks"
 
 [project.scripts]
 fuse4dbricks = "fuse4dbricks.main:cli_entry_point"
