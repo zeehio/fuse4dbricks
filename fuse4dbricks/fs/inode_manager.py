@@ -36,13 +36,14 @@ class InodeManager:
         self._create_root()
 
     def _create_root(self):
+        now = time.time()
         root_attr = {
             "st_mode": (stat.S_IFDIR | 0o755),
             "st_nlink": 2,
             "st_size": 4096,
-            "st_ctime": time.time(),
-            "st_mtime": time.time(),
-            "st_atime": time.time(),
+            "st_ctime": now,
+            "st_mtime": now,
+            "st_atime": now,
             "st_uid": 0,
             "st_gid": 0,
         }
