@@ -72,8 +72,6 @@ class InodeManager:
         # Path Construction
         if parent.entry_type == TYPE_ROOT:
             full_path = f"/{name}"
-        elif parent.full_path == "/":
-            full_path = f"/{name}"
         else:
             full_path = f"{parent.full_path}/{name}"
 
