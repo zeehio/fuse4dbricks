@@ -125,3 +125,155 @@ def test_directory_vs_file_attributes(manager):
     
     assert f_entry.attr['st_mode'] & stat.S_IFREG
     assert f_entry.attr['st_nlink'] == 1
+
+def test_idempotency_with_attribute_merge(manager):
+    """
+    If add_entry is called for an existing inode, it should update 
+    the attributes (merge) instead of ignoring them.
+    """
+    # 1. Create a file with size 100
+    attr_v1 = {"st_size": 100, "st_mtime": 1000}
+    entry_v1 = manager.add_entry(pyfuse3.ROOT_INODE, "data.csv", TYPE_FILE, attr_v1)
+    
+    assert entry_v1.attr["st_size"] == 100
+    inode_id = entry_v1.inode
+
+    # 2. Simulate readdir finding a newer version (size 200)
+    attr_v2 = {"st_size": 200, "st_mtime": 2000}
+    entry_v2 = manager.add_entry(pyfuse3.ROOT_INODE, "data.csv", TYPE_FILE, attr_v2)
+
+    # Assertions
+    assert entry_v2.inode == inode_id, "Inode ID must remain constant"
+    assert entry_v2.attr["st_size"] == 200, "Attributes should be updated in memory"
+    assert entry_v2.attr["st_mtime"] == 2000
+
+def test_type_collision_creates_zombie(manager):
+    """
+    If a directory is replaced by a file, the old directory inode 
+    should become a 'Zombie' (stale) but remain in memory if ref_count > 0.
+    """
+    # 1. Create a directory and simulate Kernel holding it
+    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", TYPE_DIRECTORY)
+    manager.increment_lookup_count(dir_entry.inode)  # ref_count = 1
+    
+    old_inode = dir_entry.inode
+
+    # 2. Replace it with a file (Type Mismatch)
+    file_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", TYPE_FILE)
+    
+    # Assertions
+    assert file_entry.inode != old_inode, "New inode must be created for type change"
+    
+    # Check Path Map: Should point to the NEW file
+    assert manager.get_inode_by_path("/workspace") == file_entry.inode
+    
+    # Check Old Inode (Zombie Status)
+    old_entry_fetched = manager.get_entry(old_inode)
+    assert old_entry_fetched is not None, "Old inode must persist because ref_count > 0"
+    assert old_entry_fetched.is_stale is True, "Old inode must be marked as stale"
+    assert old_entry_fetched.ref_count == 1
+
+def test_zombie_reaping_on_forget(manager):
+    """
+    Verifies that a Zombie inode is physically deleted once 
+    the Kernel releases the last reference (forget).
+    """
+    # Setup: Create zombie
+    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp", TYPE_DIRECTORY)
+    manager.increment_lookup_count(dir_entry.inode) # ref=1
+    
+    # Overwrite to make it stale
+    manager.add_entry(pyfuse3.ROOT_INODE, "temp", TYPE_FILE)
+    
+    # Confirm it still exists
+    assert manager.get_entry(dir_entry.inode) is not None
+    
+    # Action: Kernel forgets it
+    manager.forget(dir_entry.inode, 1) # ref=0
+    
+    # Assert: Should be gone from memory
+    assert manager.get_entry(dir_entry.inode) is None
+
+def test_recursive_pruning(manager):
+    """
+    Deleting/Replacing a parent folder should recursively mark 
+    children as stale and free up the path map.
+    """
+    # 1. Build hierarchy: /catalog/schema/volume
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", TYPE_CATALOG)
+    sch = manager.add_entry(cat.inode, "sch", TYPE_SCHEMA)
+    vol = manager.add_entry(sch.inode, "vol", TYPE_VOLUME)
+    
+    # 2. Hold reference to the deepest child (Volume)
+    manager.increment_lookup_count(vol.inode) # vol ref=1
+    
+    # 3. Replace the TOP level catalog with a file (drastic change)
+    # This triggers _prune_subtree starting at 'cat'
+    new_file = manager.add_entry(pyfuse3.ROOT_INODE, "cat", TYPE_FILE)
+    
+    # Assertions
+    
+    # The path "/cat" should now point to the new file
+    assert manager.get_inode_by_path("/cat") == new_file.inode
+    
+    # The old catalog should be gone (ref=0)
+    assert manager.get_entry(cat.inode) is None
+    
+    # The old schema should be gone (ref=0)
+    assert manager.get_entry(sch.inode) is None
+    
+    # The volume MUST survive because we held it (ref=1), but marked stale
+    saved_vol = manager.get_entry(vol.inode)
+    assert saved_vol is not None
+    assert saved_vol.is_stale is True
+    
+    # The volume's path should be removed from map (orphan)
+    # Note: Depending on implementation, checking path_map for the old path usually returns None
+    # because the parent was removed or the key deleted.
+    assert manager.get_inode_by_path("/cat/sch/vol") is None
+
+def test_infer_child_type_hierarchy(manager):
+    """Verify the mapping logic for API calls."""
+    root = manager.get_entry(pyfuse3.ROOT_INODE)
+    
+    # Root -> Catalog
+    assert manager.infer_child_type(root.inode) == TYPE_CATALOG
+    
+    # Catalog -> Schema
+    cat = manager.add_entry(root.inode, "c", TYPE_CATALOG)
+    assert manager.infer_child_type(cat.inode) == TYPE_SCHEMA
+    
+    # Schema -> Volume
+    sch = manager.add_entry(cat.inode, "s", TYPE_SCHEMA)
+    assert manager.infer_child_type(sch.inode) == TYPE_VOLUME
+    
+    # Volume -> Directory (Physical Storage)
+    vol = manager.add_entry(sch.inode, "v", TYPE_VOLUME)
+    assert manager.infer_child_type(vol.inode) == TYPE_DIRECTORY
+
+def test_path_construction_edge_cases(manager):
+    """Ensure no double slashes in paths."""
+    root = manager.get_entry(pyfuse3.ROOT_INODE)
+    assert root.full_path == "/" # Or "" depending on implementation, let's check behavior
+    
+    # If root.full_path is "/", constructing child shouldn't be "//child"
+    child = manager.add_entry(pyfuse3.ROOT_INODE, "child", TYPE_CATALOG)
+    assert child.full_path == "/child"
+    
+    grandchild = manager.add_entry(child.inode, "grand", TYPE_SCHEMA)
+    assert grandchild.full_path == "/child/grand"
+
+def test_strict_garbage_collection(manager):
+    """
+    Verify that entries are deleted immediately when ref_count hits 0,
+    even if they are not stale (Standard eviction).
+    """
+    entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp_file", TYPE_FILE)
+    manager.increment_lookup_count(entry.inode) # ref=1
+    
+    # Kernel forgets it
+    manager.forget(entry.inode, 1)
+    
+    # Should be deleted to save RAM
+    assert manager.get_entry(entry.inode) is None
+    assert manager.get_inode_by_path("/temp_file") is None
