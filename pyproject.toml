@@ -34,6 +34,7 @@ dev = [
     "pytest>=7.4.0",
     "pytest-trio>=0.8.0",  # Critical for async tests
     "pytest-mock>=3.11.0", # For mocking UCClient/Persistence
+    "respx",
     "ruff>=0.1.0",         # Fast Linter (Optional)
     "mypy>=1.5.0",         # Type Checker (Optional)
 ]
