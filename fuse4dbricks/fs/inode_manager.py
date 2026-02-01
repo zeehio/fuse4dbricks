@@ -103,7 +103,7 @@ class InodeManager:
 
         entry.is_stale = True
 
-        # do this now to let the fs reuse the path for another in9de 
+        # do this now to let the fs reuse the path for another inode 
         if entry.full_path in self._path_map:
             if self._path_map[entry.full_path] == inode:
                 del self._path_map[entry.full_path]
