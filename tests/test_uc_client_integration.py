@@ -1,9 +1,5 @@
 import os
 import pytest
-import httpx
-from email.utils import formatdate
-from aiohttp import web
-from datetime import datetime, timezone
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 

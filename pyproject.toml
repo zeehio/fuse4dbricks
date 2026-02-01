@@ -29,7 +29,7 @@ dependencies = [
     "httpx>=0.24.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-trio>=0.8.0",  # Critical for async tests
