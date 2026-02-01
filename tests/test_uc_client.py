@@ -33,7 +33,7 @@ def client(mock_auth_provider):
 
 # --- TESTS: AUTHENTICATION & RETRIES ---
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_request_success_200(client, mock_auth_provider):
     """Verify standard request flow: Auth header injection + Success."""
     # Setup Mock Response
@@ -55,7 +55,7 @@ async def test_request_success_200(client, mock_auth_provider):
     call_kwargs = client.client.build_request.call_args[1]
     assert call_kwargs["headers"]["Authorization"] == "Bearer fake_token_123"
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_request_401_retry_success(client, mock_auth_provider):
     """
     Critical: Verify that a 401 triggers a token refresh and a retry.
@@ -84,7 +84,7 @@ async def test_request_401_retry_success(client, mock_auth_provider):
     mock_auth_provider.get_access_token.assert_any_call(force_refresh=True)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_request_401_retry_failure(client):
     """
     Verify that if the retry also fails with 401 (or other error), we raise the error.
@@ -110,7 +110,7 @@ def test_quote_path_logic(client):
     assert client._quote_path("/already/absolute") == "/already/absolute"
     assert client._quote_path("space name") == "/space%20name"
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_file_metadata_parsing(client):
     """
     Verify HEAD request and RFC 7231 Date Parsing.
@@ -135,7 +135,7 @@ async def test_get_file_metadata_parsing(client):
     expected_dt = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
     assert meta["mtime"] == expected_dt.timestamp()
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_file_metadata_bad_date(client):
     """Robustness check: Malformed date should not crash the FUSE driver."""
     mock_response = MagicMock(spec=httpx.Response)
@@ -151,7 +151,7 @@ async def test_get_file_metadata_bad_date(client):
     assert meta["size"] == 500
     assert meta["mtime"] == 0.0 # Should fallback to 0.0
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_file_metadata_404(client):
     """Verify 404 returns None (used for lookup)."""
     mock_response = MagicMock(spec=httpx.Response)
@@ -163,7 +163,7 @@ async def test_get_file_metadata_404(client):
 
 # --- TESTS: DIRECTORY LISTING ---
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_list_directory_404_empty(client):
     """
     Verify 404 on directory listing returns empty list (crucial for ls).
@@ -177,7 +177,7 @@ async def test_list_directory_404_empty(client):
 
 # --- TESTS: DOWNLOAD & CONSISTENCY ---
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_download_chunk_headers(client):
     """Verify Range header injection."""
     mock_response = MagicMock(spec=httpx.Response)
@@ -194,7 +194,7 @@ async def test_download_chunk_headers(client):
     
     assert headers["Range"] == "bytes=0-99"
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_download_chunk_consistency_header(client):
     """
     Verify 'If-Unmodified-Since' is sent correctly when requested.
@@ -216,7 +216,7 @@ async def test_download_chunk_consistency_header(client):
     assert "If-Unmodified-Since" in headers
     assert headers["If-Unmodified-Since"] == "Sun, 01 Feb 2026 12:00:00 GMT"
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_download_chunk_412_precondition_failed(client):
     """
     Verify that if the file changed (412), the error is raised properly.
