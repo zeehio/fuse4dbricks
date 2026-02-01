@@ -1,10 +1,11 @@
 """
 Async client for Databricks Unity Catalog & Files API (v2.0).
-Handles pagination, robust authentication, and consistency checks for FUSE.
+Handles pagination, robust authentication, and asynchronous streaming for FUSE.
 """
 import httpx
 import logging
 import urllib.parse
+from typing import AsyncGenerator
 from email.utils import formatdate, parsedate_to_datetime
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,10 @@ class UnityCatalogClient:
     async def _request(self, method, url, params=None, headers=None, stream=False):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
-        Raises exception on http status error, consider catching 412 if the If-Unmodified-Since header is given.
         """
         if headers is None:
             headers = {}
         
-        # Inject dynamic auth token
         base_headers = await self._get_headers()
         headers.update(base_headers)
 
@@ -52,14 +51,16 @@ class UnityCatalogClient:
             logger.error(f"Connection error to {url}: {e}")
             raise
 
-        # 401 Retry Logic (Token Expiration Race Condition)
+        # 401 Retry Logic (Token Expiration)
         if response.status_code == 401:
             logger.warning("Token expired (401). Refreshing and retrying...")
-            # Force refresh in the provider
             self.auth_provider.get_access_token(force_refresh=True)
             
-            # Re-build request with new token
             headers.update(await self._get_headers())
+            # For stream=True, we must ensure the first response is closed before retrying
+            if stream:
+                await response.aclose()
+            
             request = self.client.build_request(method, url, params=params, headers=headers)
             response = await self.client.send(request, stream=stream)
 
@@ -72,8 +73,9 @@ class UnityCatalogClient:
                 return response
             return response.json()
         
-        # For streams, we return the response object so caller can .aread() or check status
+        # For streams, we return the response object to be used in a context manager
         if response.status_code >= 400:
+             await response.aclose()
              response.raise_for_status()
         return response
 
@@ -123,11 +125,7 @@ class UnityCatalogClient:
         return urllib.parse.quote(path)
 
     async def get_file_metadata(self, path):
-        """
-        HEAD request for size/mtime.
-        Uses robust RFC 7231 date parsing.
-        Returns the size in bytes and the mtime as a timestamp
-        """
+        """HEAD request for size/mtime."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
         
@@ -150,7 +148,7 @@ class UnityCatalogClient:
         return {"size": size, "mtime": mtime, "is_dir": False}
 
     async def list_directory_contents(self, path):
-        """Lists directory contents with pagination."""
+        """Lists directory contents."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
         
@@ -164,7 +162,7 @@ class UnityCatalogClient:
                 
             data = await self._request("GET", endpoint, params=params)
             if data is None:
-                break # Handle 404 as empty dir
+                break 
     
             results.extend(data.get("contents", []))
             next_token = data.get("next_page_token")
@@ -173,18 +171,25 @@ class UnityCatalogClient:
     
         return results
 
-    async def download_chunk(self, path, offset, length, if_unmodified_since=None):
+    async def download_chunk_stream(self, path: str, offset: int, length: int, if_unmodified_since: float = None) -> AsyncGenerator[bytes, None]:
         """
-        Downloads binary chunk using Range header.
-        Supports conditional read (If-Unmodified-Since) to ensure contents haven't changed by another user while reading them.
+        Asynchronously streams binary data from Unity Catalog.
+        Yields bytes in 64KB chunks to keep memory usage constant.
         """
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
 
         headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
-
         if if_unmodified_since:
             headers["If-Unmodified-Since"] = formatdate(if_unmodified_since, usegmt=True)
     
+        # We use _request with stream=True
         response = await self._request("GET", endpoint, headers=headers, stream=True)
-        return await response.aread()
+        
+        try:
+            # Yield data in increments of 64KB
+            async for chunk in response.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            # Crucial: close the stream to release the connection back to the pool
+            await response.aclose()

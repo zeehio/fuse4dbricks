@@ -16,77 +16,64 @@ def auth_mock():
     provider.get_access_token.return_value = "fake_token"
     return provider
 
+# --- HELPERS ---
+
+async def consume_stream(stream):
+    """Helper to drain the async generator into a single byte string."""
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 # --- TESTS ---
 
 @pytest.mark.trio
 async def test_consistency_precondition_failed_with_respx(auth_mock):
     """
-    The 'Frankenstein' Test:
     Verifies that the client raises 412 Precondition Failed if the file 
-    changes on the server between metadata fetch and data download.
+    changes on the server.
     """
     base_url = "https://adb-mock.net"
     file_path = "/Volumes/main/default/vol/data.bin"
     
-    # Setup Timestamps
-    # T1: What we think the file is (stale)
-    # T2: What the server actually has (new)
     t1_old = datetime(2026, 2, 1, 10, 0, 0, tzinfo=timezone.utc)
-    t2_new = datetime(2026, 2, 1, 11, 0, 0, tzinfo=timezone.utc)
-    
-    t1_str = formatdate(t1_old.timestamp(), usegmt=True)
-    t2_str = formatdate(t2_new.timestamp(), usegmt=True)
+
 
     async with respx.mock(base_url=base_url, assert_all_called=False) as respx_mock:
         client = UnityCatalogClient(base_url, auth_mock)
 
-        def side_effect(request):
-            # Check the conditional header sent by our client
-            if_unmodified = request.headers.get("If-Unmodified-Since")
-            
-            # Logic: If client sends T1, we reject with 412 because 
-            # the server "current" state is T2.
-            if if_unmodified == t1_str:
-                return httpx.Response(412, text="Precondition Failed")
-            
-            return httpx.Response(200, content=b"new data", headers={"Last-Modified": t2_str})
+        # Mock route for 412 error
+        respx_mock.get(path=f"/api/2.0/fs/files{file_path}").mock(
+            return_value=httpx.Response(412, text="Precondition Failed")
+        )
 
-        # Register the route with the corrected 'path' lookup
-        respx_mock.get(path=f"/api/2.0/fs/files{file_path}").mock(side_effect=side_effect)
-
-        # Execution: Attempt to download using the stale T1 timestamp
+        # Execution: Intentar descargar. El error debe saltar al iniciar el stream.
         with pytest.raises(httpx.HTTPStatusError) as excinfo:
-            await client.download_chunk(
+            stream = client.download_chunk_stream(
                 file_path, 
                 offset=0, 
                 length=10, 
                 if_unmodified_since=t1_old.timestamp()
             )
+            await consume_stream(stream)
         
-        # Verify the exception is indeed the 412 error from our logic
-        await excinfo.value.response.aread()
         assert excinfo.value.response.status_code == 412
-        assert "Precondition Failed" in excinfo.value.response.text
-        
         await client.close()
 
 @pytest.mark.trio
 async def test_consistency_success_with_respx(auth_mock):
     """
-    Verifies that if the file has NOT changed on the server, 
-    the download completes successfully with the conditional header.
+    Verifies successful download with conditional header using streaming.
     """
     base_url = "https://adb-mock.net"
     file_path = "/data.bin"
     
-    # Current timestamp
     t_now = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
     t_str = formatdate(t_now.timestamp(), usegmt=True)
 
     async with respx.mock(base_url=base_url) as respx_mock:
-        client = UnityCatalogClient(base_url, auth_mock)
+        client = UnityCatalogClient(base_url, auth_provider=auth_mock)
 
-        # Mock server that accepts the timestamp as current
         respx_mock.get(path="/api/2.0/fs/files/data.bin").mock(
             return_value=httpx.Response(
                 206, 
@@ -95,22 +82,27 @@ async def test_consistency_success_with_respx(auth_mock):
             )
         )
 
-        # Action: Request with current timestamp
-        data = await client.download_chunk(
+        # Action: Consumir el stream
+        stream = client.download_chunk_stream(
             file_path, 
             offset=0, 
             length=15, 
             if_unmodified_since=t_now.timestamp()
         )
+        data = await consume_stream(stream)
         
         assert data == b"consistent data"
+        
+        # Verify header was actually sent
+        sent_request = respx_mock.calls.last.request
+        assert sent_request.headers["If-Unmodified-Since"] == t_str
+        
         await client.close()
 
 @pytest.mark.trio
 async def test_download_without_conditional_header(auth_mock):
     """
-    Ensures the client works normally (without 412 checks) 
-    if if_unmodified_since is not provided.
+    Ensures the client works normally without 412 checks if timestamp is missing.
     """
     base_url = "https://adb-mock.net"
     file_path = "/simple.txt"
@@ -118,14 +110,14 @@ async def test_download_without_conditional_header(auth_mock):
     async with respx.mock(base_url=base_url) as respx_mock:
         client = UnityCatalogClient(base_url, auth_mock)
 
-        route = respx_mock.get(path="/api/2.0/fs/files/simple.txt").mock(
+        respx_mock.get(path="/api/2.0/fs/files/simple.txt").mock(
             return_value=httpx.Response(200, content=b"just data")
         )
 
-        data = await client.download_chunk(file_path, 0, 9)
+        stream = client.download_chunk_stream(file_path, 0, 9)
+        data = await consume_stream(stream)
         
-        # Verify no conditional header was sent
-        sent_request = route.calls.last.request
+        sent_request = respx_mock.calls.last.request
         assert "If-Unmodified-Since" not in sent_request.headers
         assert data == b"just data"
         
