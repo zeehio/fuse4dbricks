@@ -32,6 +32,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",
+    "pytest-asyncio",
     "pytest-trio>=0.8.0",  # Critical for async tests
     "pytest-mock>=3.11.0", # For mocking UCClient/Persistence
     "ruff>=0.1.0",         # Fast Linter (Optional)
@@ -46,3 +47,7 @@ fuse4dbricks = "fuse4dbricks.main:cli_entry_point"
 
 [tool.hatch.build.targets.wheel]
 packages = ["fuse4dbricks"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
