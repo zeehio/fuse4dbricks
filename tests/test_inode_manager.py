@@ -91,15 +91,6 @@ def test_forget_logic(manager):
     
     # 1. Forget partial count
     manager.forget(inode, 1) # Refs = 0
-    
-    # Since we didn't implement strict eviction on 0 for add_entry (it defaults to 0 refs in constructor logic I gave you?)
-    # Wait, looking at source: add_entry creates with ref_count=0 usually, unless increment_lookup_count is called.
-    # Let's check source logic: 
-    # "if entry.ref_count <= 0 ... del self._inode_map[inode]"
-    
-    # If I just added it, ref_count is 0. If I increment to 1, then forget 1, it becomes 0.
-    # It should be deleted.
-    
     assert manager.get_entry(inode) is None
     assert manager.get_inode_by_path("/temp") is None
 
