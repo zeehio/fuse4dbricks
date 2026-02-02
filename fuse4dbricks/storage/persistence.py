@@ -1,108 +1,210 @@
 """
-Disk Persistence Layer using atomic writes and LRU eviction.
-Manages 8MB chunks stored in a sharded directory structure.
+Disk Persistence Layer for FUSE.
+Implements streaming writes, single-level sharding, and lazy LRU eviction.
 """
 import os
 import time
-import shutil
 import hashlib
 import logging
+import trio
+import shutil
 from heapq import heappush, heappop
+from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
 class DiskPersistence:
-    def __init__(self, cache_dir, max_size_gb=10):
+    def __init__(self, cache_dir: str, max_size_gb: int = 2048, max_age_days: int = 7):
         self.cache_dir = cache_dir
-        self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
-        self.current_size = 0
-        self.access_log = []  # Heap: (access_time, file_path, size)
+        self.max_size_bytes = float(max_size_gb) * 1024**3
+        self.max_age_seconds = max_age_days * 86400
+        self.start_time = time.time()
         
-        self._init_cache()
+        self.current_size = 0
+        self.lock = trio.Lock()
+        self.access_log = []   # Heap: (timestamp, path, size)
+        self.access_map = {}   # Map: {path: latest_timestamp}
+        
+    async def run_services(self, nursery):
+        """Starts background maintenance and discovery."""
+        nursery.start_soon(self._graceful_init)
+        nursery.start_soon(self._background_maintenance)
 
-    def _init_cache(self):
-        """Scans existing cache to rebuild LRU heap and size."""
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
-            return
+    def _get_chunk_path(self, file_id: str, chunk_index: int) -> str:
+        """Determines path with 256-shard distribution based on chunk key."""
+        chunk_key = f"{file_id}_{chunk_index}"
+        shard = hashlib.md5(chunk_key.encode()).hexdigest()[:2]
+        shard_dir = os.path.join(self.cache_dir, shard)
+        os.makedirs(shard_dir, exist_ok=True)
+        return os.path.join(shard_dir, f"{chunk_key}.bin")
 
-        logger.info(f"Scanning cache directory {self.cache_dir}...")
+    async def _graceful_init(self):
+        """Non-blocking cache discovery."""
+        logger.info("Starting graceful cache discovery...")
+        await trio.to_thread.run_sync(self._sync_scan)
+        logger.info(f"Discovery complete. Initial size: {self.current_size/1e9:.2f} GB")
+
+    def _sync_scan(self):
+        """Synchronous recursive walk to rebuild state."""
         for root, _, files in os.walk(self.cache_dir):
             for f in files:
-                if f.endswith(".tmp"): # Cleanup partial writes
-                    os.remove(os.path.join(root, f))
-                    continue
-                    
                 path = os.path.join(root, f)
                 try:
                     stat = os.stat(path)
+                    
+                    if f.endswith(".tmp"):
+                        if stat.st_mtime < self.start_time:
+                            os.remove(path)
+                        continue
+                    
                     self.current_size += stat.st_size
+                    self.access_map[path] = stat.st_atime
                     heappush(self.access_log, (stat.st_atime, path, stat.st_size))
                 except OSError:
-                    pass
-        logger.info(f"Cache Initialized: {self.current_size / (1024**3):.2f} GB used.")
+                    continue
 
-    def generate_file_id(self, full_path, mtime):
+    async def retrieve_chunk(self, file_id: str, chunk_index: int) -> bytes:
         """
-        Creates a deterministic unique ID based on path AND mtime.
-        This ensures we invalidate cache if the remote file changes.
+        Retrieves a chunk from disk.
+        Updates LRU access time BEFORE reading to prevent concurrent eviction.
         """
-        raw_str = f"{full_path}:{mtime}"
-        return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
-
-    def _get_chunk_path(self, file_id, chunk_index):
-        # Sharding: use first 2 chars of hash to spread files across subdirs
-        shard = file_id[:2]
-        shard_dir = os.path.join(self.cache_dir, shard)
-        os.makedirs(shard_dir, exist_ok=True)
-        return os.path.join(shard_dir, f"{file_id}_{chunk_index}.bin")
-
-    def retrieve_chunk(self, file_id, chunk_index):
-        """Returns bytes if exists, else None."""
         path = self._get_chunk_path(file_id, chunk_index)
+        
+        # 1. OPTIMISTIC PROMOTION (Pinning)
+        # Mark as accessed so GC doesn't delete it while we read.
+        # Double-check pattern is not strictly needed here for safety, 
+        # but the lock is needed to update the map safely.
+        async with self.lock:
+            if path in self.access_map:
+                self.access_map[path] = time.time()
+
         try:
-            # Update access time (touch) for LRU
-            os.utime(path, None)
-            with open(path, "rb") as f:
-                return f.read()
+            # 2. READ (Safe now)
+            data = await trio.to_thread.run_sync(self._read_file, path)
+            
+            # 3. SELF-HEALING
+            # If file exists but wasn't in map (race condition or init miss)
+            if path not in self.access_map:
+                async with self.lock:
+                    if path not in self.access_map:
+                        self.current_size += len(data)
+                        now = time.time()
+                        self.access_map[path] = now
+                        heappush(self.access_log, (now, path, len(data)))
+            
+            return data
+            
         except FileNotFoundError:
             return None
 
-    def store_chunk(self, file_id, chunk_index, data):
-        """Atomic write of chunk data."""
-        size = len(data)
-        self.evict(size)
+    def _read_file(self, path: str) -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
 
-        final_path = self._get_chunk_path(file_id, chunk_index)
-        temp_path = final_path + ".tmp"
+    async def store_chunk_from_stream(self, file_id: str, chunk_index: int, 
+                                     stream: AsyncGenerator[bytes, None]):
+        """Consumes a stream and writes it to disk."""
+        path = self._get_chunk_path(file_id, chunk_index)
+        temp_path = f"{path}.{os.getpid()}.tmp"
         
+        bytes_written = 0
         try:
-            with open(temp_path, "wb") as f:
-                f.write(data)
-            os.rename(temp_path, final_path)
+            # Write to .tmp (No lock needed)
+            async with await trio.open_file(temp_path, "wb") as f:
+                async for chunk in stream:
+                    await f.write(chunk)
+                    bytes_written += len(chunk)
             
-            self.current_size += size
-            # Push to heap: (now, path, size)
-            heappush(self.access_log, (time.time(), final_path, size))
+            # Atomic Rename (No lock needed)
+            await trio.to_thread.run_sync(os.rename, temp_path, path)
             
-        except OSError as e:
-            logger.error(f"Failed to write chunk to disk: {e}")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            # 1. EVICT (Manage Lock Internally)
+            # FIX: Called OUTSIDE the main lock because evict() acquires the lock itself.
+            await self.evict(bytes_written)
 
-    def evict(self, required_space):
-        """Removes oldest files until we have space."""
-        while self.current_size + required_space > self.max_size_bytes:
-            if not self.access_log:
-                # Cache is empty but still no space? (Edge case: tiny quota)
-                break
+            # 2. UPDATE METADATA (Acquire Lock)
+            async with self.lock:
+                # If overwriting, logic could go here to subtract old size
+                self.current_size += bytes_written
+                now = time.time()
+                self.access_map[path] = now
+                heappush(self.access_log, (now, path, bytes_written))
                 
-            _, path, size = heappop(self.access_log)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                await trio.to_thread.run_sync(os.remove, temp_path)
+            raise e
+
+    async def evict(self, required_space: int):
+        """
+        Free up space removing old items.
+        THREAD-SAFE: Uses lock for state, releases for I/O.
+        """
+        while True:
+            # 1. DECISION PHASE (Lock Held)
+            async with self.lock:
+                if self.current_size + required_space <= self.max_size_bytes:
+                    return
+
+                if not self.access_log:
+                    return
+
+                ts_log, path, size = heappop(self.access_log)
+
+                if path not in self.access_map:
+                    continue 
+                
+                # Lazy check: if map has newer timestamp, repush
+                if self.access_map[path] > ts_log:
+                    heappush(self.access_log, (self.access_map[path], path, size))
+                    continue
+                
+                # Remove from index immediately
+                del self.access_map[path]
+                self.current_size -= size
             
-            # Check if file still exists (might have been deleted already)
-            if os.path.exists(path):
+            # 2. I/O PHASE (Lock Released)
+            try:
+                await trio.to_thread.run_sync(os.remove, path)
+                logger.debug(f"Evicted: {path}")
+            except OSError:
+                pass
+
+    async def _background_maintenance(self):
+        """
+        Hourly cleanup. Uses snapshot approach to avoid blocking.
+        """
+        while True:
+            await trio.sleep(3600)
+            now = time.time()
+            
+            # 1. Fast Snapshot (Lock Held)
+            async with self.lock:
                 try:
-                    os.remove(path)
-                    self.current_size -= size
+                    usage = await trio.to_thread.run_sync(shutil.disk_usage, self.cache_dir)
+                    disk_critical = (usage.free / usage.total) < 0.05
+                except OSError:
+                    disk_critical = False # Disk might be unmounted or weird error
+                
+                expired_candidates = [
+                    path for path, ts in self.access_map.items()
+                    if (now - ts > self.max_age_seconds) or disk_critical
+                ]
+
+            # 2. Slow Deletion (Lock Released)
+            for path in expired_candidates:
+                await trio.sleep(0) # Cooperative yield
+                
+                try:
+                    stat = await trio.to_thread.run_sync(os.stat, path)
+                    await trio.to_thread.run_sync(os.remove, path)
+                    
+                    # 3. State Update (Lock Held)
+                    async with self.lock:
+                        if path not in self.access_map:
+                            continue 
+
+                        del self.access_map[path]
+                        self.current_size -= stat.st_size
                 except OSError:
                     pass
