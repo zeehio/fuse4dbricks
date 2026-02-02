@@ -23,7 +23,8 @@ class UnityCatalogFS(pyfuse3.Operations):
 
     async def getattr(self, inode, ctx=None):
         entry = self.inodes.get_entry(inode)
-        if not entry: raise pyfuse3.FUSEError(errno.ENOENT)
+        if not entry:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
             # Delegate TTL check to Cache
