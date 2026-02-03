@@ -11,7 +11,8 @@ from identity.provider import EntraIDAuthProvider
 from api.uc_client import UnityCatalogClient
 from storage.persistence import DiskPersistence
 from fs.inode_manager import InodeManager
-from fs.cache_manager import CacheManager
+from fs.metadata_manager import MetadataManager
+from fs.data_manager import DataManager
 from fs.operations import UnityCatalogFS
 
 # Default Azure Databricks App ID (Standard Public Client)
@@ -36,8 +37,9 @@ def setup_logging(debug_mode):
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
 
 async def start_fuse(ops, mountpoint, debug_mode):
-    mount_options = ["ro", "fsname=dbfuse", "noatime", "default_permissions"]
-    if debug_mode: mount_options.append("debug")
+    mount_options = ["ro", "fsname=fuse4dbricks", "noatime", "default_permissions"]
+    if debug_mode:
+        mount_options.append("debug")
 
     try:
         pyfuse3.init(ops, mountpoint, mount_options)
@@ -67,7 +69,7 @@ async def async_main():
 
     # Auth
     logging.info("Initializing Authentication...")
-    keyring = LinuxKeyringManager(service_prefix="dbfuse")
+    keyring = LinuxKeyringManager(service_prefix="fuse4dbricks")
     auth_provider = EntraIDAuthProvider(args.tenant_id, args.client_id, keyring)
 
     try:
@@ -79,15 +81,16 @@ async def async_main():
 
     # Init Components
     uc_client = UnityCatalogClient(args.workspace, auth_provider)
-    persistence = DiskPersistence(cache_dir, max_size_gb=10)
+    persistence = DiskPersistence(cache_dir, max_size_gb=10,max_age_days=30)
     
     if args.clear_cache:
         logging.info("Clearing cache...")
         persistence.evict(persistence.current_size + 1)
 
     inode_manager = InodeManager()
-    cache_manager = CacheManager(uc_client, persistence, metadata_ttl=60)
-    operations = UnityCatalogFS(uc_client, inode_manager, cache_manager)
+    data_manager = DataManager(uc_client, persistence)
+    metadata_manager = MetadataManager(uc_client, ttl=30)
+    operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager)
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(start_fuse, operations, mountpoint, args.debug)
