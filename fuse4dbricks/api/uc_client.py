@@ -147,7 +147,7 @@ class UnityCatalogClient:
 
         return {"size": size, "mtime": mtime, "is_dir": False}
 
-    async def list_directory_contents(self, path):
+    async def list_directory_contents(self, path, limit=None):
         """Lists directory contents."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
@@ -168,7 +168,8 @@ class UnityCatalogClient:
             next_token = data.get("next_page_token")
             if not next_token:
                 break
-    
+            if limit is not None and len(results) >= limit:
+                break
         return results
 
     async def download_chunk_stream(self, path: str, offset: int, length: int, if_unmodified_since: float = None) -> AsyncGenerator[bytes, None]:
