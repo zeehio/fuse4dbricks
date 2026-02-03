@@ -14,12 +14,11 @@ from fs.inode_manager import (
 logger = logging.getLogger(__name__)
 
 class UnityCatalogFS(pyfuse3.Operations):
-    def __init__(self, uc_client, inode_manager, cache_manager):
+    def __init__(self, inode_manager, metadata_manager, data_manager):
         super(UnityCatalogFS, self).__init__()
-        self.uc_client = uc_client # Kept for ref, but Cache handles calls
         self.inodes = inode_manager
-        self.cache = cache_manager
-        self.supports_writeback_cache = True
+        self.data_manager = data_manager
+        self.metadata_manager = metadata_manager
 
     async def getattr(self, inode, ctx=None):
         entry = self.inodes.get_entry(inode)
@@ -27,8 +26,8 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
-            # Delegate TTL check to Cache
-            await self.cache.get_attr(entry)
+            # check ttl and update
+            await self.metadata_manager.get_attr(entry)
             return self._entry_to_fuse_attr(entry)
         except Exception:
             raise pyfuse3.FUSEError(errno.EIO)
@@ -36,17 +35,20 @@ class UnityCatalogFS(pyfuse3.Operations):
     async def lookup(self, parent_inode, name_b, ctx=None):
         name = name_b.decode('utf-8')
         parent_entry = self.inodes.get_entry(parent_inode)
-        if not parent_entry: raise pyfuse3.FUSEError(errno.ENOENT)
+        if not parent_entry:
+            raise pyfuse3.FUSEError(errno.ENOENT)
             
         # 1. Check Local Inodes
         full_path = f"{parent_entry.full_path}/{name}"
-        if parent_entry.full_path == "/": full_path = f"/{name}"
+        if parent_entry.full_path == "/":
+            full_path = f"/{name}"
             
         existing = self.inodes.get_inode_by_path(full_path)
-        if existing: return await self.getattr(existing)
+        if existing:
+            return await self.getattr(existing)
 
         # 2. Ask Cache/API
-        found = await self.cache.lookup_name(parent_entry, name)
+        found = await self.metadata_manager.lookup_name(parent_entry, name)
         if not found:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -54,7 +56,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         attr = None
         if 'size' in found:
             # Physical file Attr Construction
-            is_dir = found['type'] == TYPE_DIRECTORY
+            is_dir = found['type'] != TYPE_FILE
             mode = (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644)
             attr = {
                 "st_mode": mode,
@@ -72,7 +74,8 @@ class UnityCatalogFS(pyfuse3.Operations):
 
     async def readdir(self, inode, start_id, token):
         entry = self.inodes.get_entry(inode)
-        if not entry: raise pyfuse3.FUSEError(errno.ENOENT)
+        if not entry:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         # Yield . and ..
         if start_id == 0:
@@ -109,7 +112,8 @@ class UnityCatalogFS(pyfuse3.Operations):
 
     async def open(self, inode, flags, ctx):
         entry = self.inodes.get_entry(inode)
-        if entry.entry_type != TYPE_FILE: raise pyfuse3.FUSEError(errno.EISDIR)
+        if entry.entry_type != TYPE_FILE:
+            raise pyfuse3.FUSEError(errno.EISDIR)
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, offset, length):
