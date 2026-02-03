@@ -174,7 +174,8 @@ class InodeManager:
             self._delete_inode_internal(inode)
 
     def increment_lookup_count(self, inode, count=1):
-        """Incrementa el contador de referencias (llamado en lookup)."""
+        """ increments the reference counter that prevents inode deletion when the kernel asks to forget it
+        """
         if inode in self._inode_map:
             self._inode_map[inode].ref_count += count
 
