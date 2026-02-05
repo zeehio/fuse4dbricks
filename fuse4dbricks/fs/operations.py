@@ -48,7 +48,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             return await self.getattr(existing)
 
         # 2. Ask Cache/API
-        found = await self.metadata_manager.lookup_name(parent_entry, name)
+        found = await self.metadata_manager.lookup_child(parent_entry, name)
         if not found:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -137,7 +137,6 @@ class UnityCatalogFS(pyfuse3.Operations):
         attr.st_uid = entry.attr['st_uid']
         attr.st_gid = entry.attr['st_gid']
         attr.st_size = entry.attr['st_size']
-        # Convert Seconds (Float) to Nanoseconds (Int)
         attr.st_atime_ns = int(entry.attr['st_atime'] * 1e9)
         attr.st_ctime_ns = int(entry.attr['st_ctime'] * 1e9)
         attr.st_mtime_ns = int(entry.attr['st_mtime'] * 1e9)

@@ -1,7 +1,6 @@
 """
 Metadata Manager for FUSE4Databricks.
-Handles attribute caching, directory listings, hierarchical resolution, 
-and request coalescing to minimize Unity Catalog API calls.
+Handles attribute caching, directory listings, and request coalescing to minimize Unity Catalog API calls.
 """
 import time
 import trio
@@ -48,7 +47,8 @@ class MetadataManager:
     async def get_attributes(self, entry):
         """
         Retrieves attributes for an entry. 
-        Flow: RAM Cache -> Coalescing Wait -> API Call.
+        Flow: RAM Cache -> Coalescing Wait -> API Call (Type-Specific Validation).
+        Returns None if the object no longer exists or changed type.
         """
         # 1. Fast Check (Memory)
         async with self._cache_lock:
@@ -67,11 +67,11 @@ class MetadataManager:
 
         # 3. Real API Call (Leader Only)
         try:
-            attr = await self._fetch_entry_metadata(entry)
+            attr = await self._refresh_entry_metadata(entry)
             
             if attr:
                 await self._update_attr_cache(entry.full_path, attr)
-            return attr or entry.attr
+            return attr or entry.attr # Return old attr if refresh fails network-wise, but None if deleted
 
         finally:
             await self._notify_followers(self._inflight_attr, entry.full_path)
@@ -79,7 +79,7 @@ class MetadataManager:
     async def lookup_child(self, parent_entry, name):
         """
         Efficiently checks if a specific child exists without listing the whole parent.
-        Returns: (attributes_dict, entry_type) or (None, None).
+        Returns: attributes_dict
         """
         # Construct path
         if parent_entry.full_path == "/":
@@ -91,7 +91,7 @@ class MetadataManager:
         async with self._cache_lock:
             cached = self._get_valid_cache(self._attr_cache, child_path)
             if cached:
-                return cached, self._determine_type(cached)
+                return cached
 
         # 2. Coalescing (Reuse attr inflight tracker)
         wait_event = await self._join_or_lead_request(self._inflight_attr, child_path)
@@ -99,16 +99,15 @@ class MetadataManager:
         if wait_event:
             await wait_event.wait()
             async with self._cache_lock:
-                cached = self._get_valid_cache(self._attr_cache, child_path)
-                return (cached, self._determine_type(cached)) if cached else (None, None)
+                return self._get_valid_cache(self._attr_cache, child_path)
 
         # 3. Real API Lookup
         try:
-            attr, entry_type = await self._fetch_single_entity(parent_entry, name, child_path)
+            attr = await self._fetch_single_entity(parent_entry, name, child_path)
             
             if attr:
                 await self._update_attr_cache(child_path, attr)
-            return attr, entry_type
+            return attr
 
         finally:
             await self._notify_followers(self._inflight_attr, child_path)
@@ -146,19 +145,21 @@ class MetadataManager:
                 for item in raw_items:
                     # Construct child path
                     child_path = f"{entry.full_path}/{item['name']}"
-                    if entry.full_path == "/": child_path = f"/{item['name']}"
+                    if entry.full_path == "/": 
+                        child_path = f"/{item['name']}"
 
                     # Generate full FUSE attributes
-                    attr = self._gen_physical_attr(item) if entry.entry_type in [TYPE_VOLUME, TYPE_DIRECTORY] else self._gen_virtual_attr(is_dir=True)
+                    
+                    attr = self._gen_attr(item)
                     
                     # Store in Attribute Cache (Populating it proactively)
                     self._attr_cache[child_path] = (now + self.ttl, attr)
                     
                     # Prepare simple list for the directory cache
-                    is_dir = item.get('is_dir', False)
+                        
                     children_results.append({
                         'name': item['name'],
-                        'type': TYPE_DIRECTORY if is_dir else TYPE_FILE
+                        'is_dir': item['is_dir'],
                     })
                 
                 # Store Directory Listing
@@ -182,11 +183,8 @@ class MetadataManager:
         Force-evict a path. Crucial after a delete or write operation.
         Also invalidates the parent directory listing.
         """
-        # We don't need async lock for simple dict operations if not awaiting
-        # But for consistency with trio, we can just do a best-effort removal 
-        # or use the lock if calling from async context.
-        # Here we assume this is called from an async context.
         try:
+            # Best effort eviction
             if path in self._attr_cache:
                 del self._attr_cache[path]
             
@@ -241,26 +239,69 @@ class MetadataManager:
             return TYPE_DIRECTORY
         return TYPE_FILE
 
-    # --- API Interaction ---
+    # --- API Interaction & Validation ---
 
-    async def _fetch_entry_metadata(self, entry):
-        """Fetches metadata for an existing entry to refresh attributes."""
-        # Virtual nodes (Root, Catalogs, etc.) have static attributes
-        if entry.entry_type in [TYPE_ROOT, TYPE_CATALOG, TYPE_SCHEMA, TYPE_VOLUME]:
+    async def _refresh_entry_metadata(self, entry):
+        """
+        Refreshes metadata via API, checking for Type Consistency.
+        Splits logic: Files use get_file, Dirs use list_directory (check existence).
+        """
+        # Virtual nodes don't expire or change type
+        if entry.entry_type in (TYPE_ROOT, TYPE_CATALOG, TYPE_SCHEMA, TYPE_VOLUME):
             return entry.attr
 
         api_path = self._resolve_api_path(entry.full_path)
-        # api_path is None for root, catalog and schema.
         if not api_path:
             return entry.attr
 
-        try:
-            meta = await self.uc_client.get_file_metadata(api_path)
-            if not meta:
-                return None 
-            return self._gen_physical_attr(meta)
-        except Exception:
-            return entry.attr
+        # --- BRANCH 1: VALIDATING A DIRECTORY INODE ---
+        if entry.entry_type == TYPE_DIRECTORY:
+            try:
+                # Lightweight check, I need to check if the request works.
+                await self.uc_client.list_directory_contents(api_path, limit=1)
+                
+                # It exists and is a directory. Update access time.
+                updated_attr = entry.attr.copy()
+                updated_attr['st_atime'] = time.time()
+                return updated_attr
+
+            except Exception:
+                # 404 or "Not a directory" means the directory inode is stale.
+                logger.warning(f"Stale Directory detected: {entry.full_path}. Invalidating.")
+                self.invalidate(entry.full_path)
+                return None
+
+        # --- BRANCH 2: VALIDATING A FILE INODE ---
+        else: # TYPE_FILE
+            try:
+                meta = await self.uc_client.get_file_metadata(api_path)
+                
+                if not meta:
+                    self.invalidate(entry.full_path)
+                    return None
+                
+                # Check for Type Mismatch (e.g., Folder replaced by File)
+                is_api_dir = meta.get('is_dir', False) or meta.get('is_directory', False)
+                
+                if is_api_dir:
+                    # We expected a File, got a Directory
+                    logger.warning(f"Type mismatch for {entry.full_path}: Inode=File, API=Dir. Invalidating.")
+                    self.invalidate(entry.full_path)
+                    return None
+
+                # Update File Attrs
+                updated_attr = entry.attr.copy()
+                updated_attr.update({
+                    'st_size': meta.get('size', 0),
+                    'st_mtime': meta.get('mtime', time.time()),
+                    'st_ctime': meta.get('mtime', time.time()),
+                })
+                return updated_attr
+
+            except Exception:
+                # 404 or 400 (Bad Request on dir path)
+                self.invalidate(entry.full_path)
+                return None
 
     async def _fetch_single_entity(self, parent_entry, name, full_path):
         """Specific lookup logic per hierarchy level."""
@@ -268,29 +309,28 @@ class MetadataManager:
         
         try:
             if p_type == TYPE_ROOT:
-                if await self.uc_client.get_catalog(name):
-                    return self._gen_virtual_attr(is_dir=True), TYPE_CATALOG
+                meta = await self.uc_client.get_catalog(name)
+                return self._gen_attr(meta)
 
             elif p_type == TYPE_CATALOG:
-                if await self.uc_client.get_schema(parent_entry.name, name):
-                    return self._gen_virtual_attr(is_dir=True), TYPE_SCHEMA
+                meta = await self.uc_client.get_schema(parent_entry.name, name)
+                return self._gen_attr(meta)
 
             elif p_type == TYPE_SCHEMA:
                 parts = parent_entry.full_path.strip('/').split('/')
-                if await self.uc_client.get_volume(parts[0], parts[1], name):
-                    return self._gen_virtual_attr(is_dir=True), TYPE_VOLUME
+                meta = await self.uc_client.get_volume(parts[0], parts[1], name)
+                return self._gen_attr(meta)
 
             elif p_type in [TYPE_VOLUME, TYPE_DIRECTORY]:
                 api_path = self._resolve_api_path(full_path)
+                # FIXME: Is this a file or a dir?
                 meta = await self.uc_client.get_file_metadata(api_path)
                 if meta:
-                    attr = self._gen_physical_attr(meta)
-                    t_type = TYPE_DIRECTORY if meta.get('is_dir') else TYPE_FILE
-                    return attr, t_type
+                    attr = self._gen_attr(meta)
+                    return attr
         except Exception:
-            return None, None
-            
-        return None, None
+            return None
+        return None
 
     async def _fetch_raw_children(self, entry):
         """Fetches raw list from API to populate read-ahead cache."""
@@ -301,18 +341,33 @@ class MetadataManager:
             items = await self.uc_client.list_catalogs()
             # Virtual nodes, we mock size/mtime
             for i in items:
-                raw_results.append({'name': i['name'], 'is_dir': True})
+                raw_results.append({
+                    'name': i['name'], 
+                    'is_dir': True,
+                    'ctime': i['created_at'] / 1000.0,
+                    'mtime': i['updated_at'] / 1000.0,
+                })
 
         elif p_type == TYPE_CATALOG:
             items = await self.uc_client.list_schemas(entry.name)
             for i in items:
-                raw_results.append({'name': i['name'], 'is_dir': True})
+                raw_results.append({
+                    'name': i['name'],
+                    'is_dir': True,
+                    'ctime': i['created_at'] / 1000.0,
+                    'mtime': i['updated_at'] / 1000.0,
+                })
 
         elif p_type == TYPE_SCHEMA:
             parts = entry.full_path.strip('/').split('/')
             items = await self.uc_client.list_volumes(parts[0], parts[1])
             for i in items:
-                raw_results.append({'name': i['name'], 'is_dir': True})
+                raw_results.append({
+                    'name': i['name'],
+                    'is_dir': True,
+                    'ctime': i['created_at'] / 1000.0,
+                    'mtime': i['updated_at'] / 1000.0,
+                })
 
         elif p_type in [TYPE_VOLUME, TYPE_DIRECTORY]:
             api_path = self._resolve_api_path(entry.full_path)
@@ -321,42 +376,38 @@ class MetadataManager:
             for i in items:
                 raw_results.append({
                     'name': i['name'],
-                    'is_dir': i.get('is_directory', False) or i.get('is_dir', False),
+                    'is_dir': i['is_directory'],
                     'size': i.get('file_size', 0),
-                    'mtime': i.get('modification_time', 0)
+                    # api integer ms, we use float in seconds
+                    'mtime': i['last_modified']/1000.0
                 })
-        
         return raw_results
 
     # --- Attribute Generation ---
 
-    def _gen_virtual_attr(self, is_dir=True):
-        now = time.time()
-        return {
-            "st_mode": (stat.S_IFDIR | 0o755),
-            "st_nlink": 2,
-            "st_size": 4096,
-            "st_mtime": now,
-            "st_ctime": now,
-            "st_atime": now,
-            "st_uid": os.getuid(),
-            "st_gid": os.getgid(),
-        }
-
-    def _gen_physical_attr(self, meta):
-        is_dir = meta.get('is_dir', False)
-        # Handle mtime being None or in milliseconds
-        mtime = meta.get('mtime') or meta.get('modification_time', 0)
-        # Heuristic: if mtime > 20000000000, it's likely milliseconds
-        if mtime > 20000000000: 
-            mtime = mtime / 1000.0
+    def _gen_attr(self, meta):
+        """
+        meta is a dictionary typically given
+        by uc_client.
+        It must have:
+          - is_dir: boolean
+        If is_dir is False, it must have "size" in bytes
+        
+        It may have:
+        - mtime, ctime as a float, seconds since unix epoch
+        
+        This function retuns a dict of attributes the inode manager uses.
+        """
+        is_dir = meta['is_dir']
+        mtime = meta.get('mtime', 0.0)
+        ctime = meta.get('ctime', mtime)
         
         return {
             "st_mode": (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644),
             "st_nlink": 2 if is_dir else 1,
-            "st_size": meta.get('size', 0) or meta.get('file_size', 0),
+            "st_size": 4096 if is_dir else meta['size'],
             "st_mtime": mtime,
-            "st_ctime": mtime,
+            "st_ctime": ctime,
             "st_atime": time.time(),
             "st_uid": os.getuid(),
             "st_gid": os.getgid(),
