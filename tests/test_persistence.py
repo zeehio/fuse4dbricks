@@ -36,13 +36,13 @@ async def test_store_and_retrieve_basic(persistence):
     file_id = "test_file_1"
     chunk_index = 0
     data = b"Hello, World! This is a test chunk."
-    
+    mtime = 0.0
     # Store
     stream = async_byte_generator(data)
-    await persistence.store_chunk_from_stream(file_id, chunk_index, stream)
+    await persistence.store_chunk_from_stream(file_id, chunk_index, mtime, stream)
     
     # Retrieve
-    retrieved = await persistence.retrieve_chunk(file_id, chunk_index)
+    retrieved = await persistence.retrieve_chunk(file_id, chunk_index, mtime)
     assert retrieved == data
     
     # Check internal state
@@ -54,24 +54,26 @@ async def test_sharding_structure(persistence):
     """Verify 256-folder sharding logic (aa/bb/...) or single level."""
     file_id = "file_123"
     chunk_index = 5
+    mtime = 0
+    mtime_ms = int(mtime*1000)
     data = b"data"
     
     # Calculate expected path manually based on implementation
-    # Implementation uses: hash(file_id_index)[:2]
-    chunk_key = f"{file_id}_{chunk_index}"
-    expected_shard = hashlib.md5(chunk_key.encode()).hexdigest()[:2]
+    file_hash = hashlib.sha256(file_id.encode()).hexdigest()
+    shard1 = file_hash[:2]
+    shard2 = f"{(chunk_index // 1000):07d}"
     
     stream = async_byte_generator(data)
-    await persistence.store_chunk_from_stream(file_id, chunk_index, stream)
+    await persistence.store_chunk_from_stream(file_id, chunk_index, mtime, stream)
     
     # Verify file exists at specific sharded location
-    expected_path = os.path.join(persistence.cache_dir, expected_shard, f"{chunk_key}.bin")
+    expected_path = os.path.join(persistence.cache_dir, shard1, shard2, f"{file_hash}_{mtime_ms}_{chunk_index:07d}.bin")
     assert os.path.exists(expected_path)
 
 @pytest.mark.trio
 async def test_retrieve_missing_chunk(persistence):
     """Retrieving a non-existent chunk should return None safely."""
-    result = await persistence.retrieve_chunk("ghost_file", 99)
+    result = await persistence.retrieve_chunk("ghost_file", 99, 0.0)
     assert result is None
 
 # --- 2. STREAMING & ATOMICITY ---
@@ -90,7 +92,7 @@ async def test_streaming_write_failure_cleanup(persistence):
         raise ConnectionError("Network Reset")
     
     with pytest.raises(ConnectionError):
-        await persistence.store_chunk_from_stream(file_id, chunk_index, broken_generator())
+        await persistence.store_chunk_from_stream(file_id, chunk_index, 0.0, broken_generator())
     
     # Assertions
     # 1. Chunk should not exist in map
@@ -113,17 +115,18 @@ async def test_eviction_on_size_limit(cache_dir):
     # Create a tiny cache: 100 bytes max
     # We pass strict limit by mocking 0.0000001 GB roughly
     p = DiskPersistence(cache_dir, max_size_gb=(100 / 1024**3))
+    mtime = 0.0
     
     # Write Chunk A (60 bytes)
-    await p.store_chunk_from_stream("A", 0, async_byte_generator(b"A" * 60))
+    await p.store_chunk_from_stream("A", 0, mtime, async_byte_generator(b"A" * 60))
     assert p.current_size == 60
     
     # Write Chunk B (60 bytes) -> Total 120 > 100. Must evict A.
-    await p.store_chunk_from_stream("B", 0, async_byte_generator(b"B" * 60))
+    await p.store_chunk_from_stream("B", 0, mtime, async_byte_generator(b"B" * 60))
     
     assert p.current_size == 60
-    assert await p.retrieve_chunk("A", 0) is None
-    assert await p.retrieve_chunk("B", 0) == b"B" * 60
+    assert await p.retrieve_chunk("A", 0, mtime) is None
+    assert await p.retrieve_chunk("B", 0, mtime) == b"B" * 60
 
 @pytest.mark.trio
 async def test_lazy_promotion(cache_dir):
@@ -136,21 +139,21 @@ async def test_lazy_promotion(cache_dir):
     5. Result: B should be evicted, NOT A.
     """
     p = DiskPersistence(cache_dir, max_size_gb=(150 / 1024**3)) # Limit 150 bytes
-    
+    mtime = 0.0
     # 1. Store A (50 bytes) at T=100
     with patch("time.time", return_value=100.0):
-        await p.store_chunk_from_stream("A", 0, async_byte_generator(b"A" * 50))
+        await p.store_chunk_from_stream("A", 0, mtime, async_byte_generator(b"A" * 50))
         
     # 2. Store B (50 bytes) at T=200
     with patch("time.time", return_value=200.0):
-        await p.store_chunk_from_stream("B", 0, async_byte_generator(b"B" * 50))
+        await p.store_chunk_from_stream("B", 0, mtime, async_byte_generator(b"B" * 50))
         
     # State: [A(100), B(200)]. Size: 100/150.
     
     # 3. Read A at T=300 (Promotion)
     # This updates A in access_map to 300, but heap still has (100, path_A)
     with patch("time.time", return_value=300.0):
-        data = await p.retrieve_chunk("A", 0)
+        data = await p.retrieve_chunk("A", 0, mtime)
         assert data is not None
 
     # 4. Store C (60 bytes) at T=400. Total 160 > 150. Eviction needed.
@@ -158,12 +161,12 @@ async def test_lazy_promotion(cache_dir):
     #   - Pop A(100). Check Map. Map says A is 300. 300 > 100. Push A(300).
     #   - Pop B(200). Check Map. Map says B is 200. Evict B.
     with patch("time.time", return_value=400.0):
-        await p.store_chunk_from_stream("C", 0, async_byte_generator(b"C" * 60))
+        await p.store_chunk_from_stream("C", 0, mtime, async_byte_generator(b"C" * 60))
 
     # 5. Assertions
-    assert await p.retrieve_chunk("B", 0) is None # B was evicted
-    assert await p.retrieve_chunk("A", 0) is not None # A survived
-    assert await p.retrieve_chunk("C", 0) is not None # C is present
+    assert await p.retrieve_chunk("B", 0, mtime) is None # B was evicted
+    assert await p.retrieve_chunk("A", 0, mtime) is not None # A survived
+    assert await p.retrieve_chunk("C", 0, mtime) is not None # C is present
     
     # Verify size (50 + 60 = 110)
     assert p.current_size == 110

@@ -44,10 +44,11 @@ class DiskPersistence:
         """Determines path with 256-shard distribution based on chunk key."""
         sha256_hash = hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
         shard1 = sha256_hash[:2]
-        shard2 = chunk_index // 1000  # Secondary shard to prevent too many files in one dir
+        shard2 = f"{(chunk_index // 1000):07d}" # Secondary shard to prevent too many files in one dir
         shard_dir = os.path.join(self.cache_dir, shard1, shard2)
         os.makedirs(shard_dir, exist_ok=True)
-        return os.path.join(shard_dir, f"{sha256_hash}_{chunk_index:07d}.bin")
+        mtime_ms = int(mtime*1000)
+        return os.path.join(shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin")
 
     async def _graceful_init(self):
         """Non-blocking cache discovery."""
@@ -74,12 +75,12 @@ class DiskPersistence:
                 except OSError:
                     continue
 
-    async def retrieve_chunk(self, fs_path: str, chunk_index: int) -> bytes | None:
+    async def retrieve_chunk(self, fs_path: str, chunk_index: int, mtime: float) -> bytes | None:
         """
         Retrieves a chunk from disk.
         Updates LRU access time BEFORE reading to prevent concurrent eviction.
         """
-        path = self._get_chunk_path(fs_path, chunk_index)
+        path = self._get_chunk_path(fs_path, chunk_index, mtime)
         
         # 1. OPTIMISTIC PROMOTION (Pinning)
         # Mark as accessed so GC doesn't delete it while we read.
@@ -112,9 +113,9 @@ class DiskPersistence:
         with open(path, "rb") as f:
             return f.read()
 
-    async def store_chunk_from_stream(self, fs_path: str, chunk_index: int, stream: AsyncGenerator[bytes, None]):
+    async def store_chunk_from_stream(self, fs_path: str, chunk_index: int, mtime: float, stream: AsyncGenerator[bytes, None]):
         """Consumes a stream and writes it to disk."""
-        path = self._get_chunk_path(fs_path, chunk_index)
+        path = self._get_chunk_path(fs_path, chunk_index, mtime)
         temp_path = f"{path}.{os.getpid()}.tmp"
         
         bytes_written = 0

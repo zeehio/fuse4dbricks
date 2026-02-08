@@ -14,19 +14,9 @@ class DataManager:
         self.uc_client = uc_client
         self.persistence = persistence
         self.chunk_size = 8 * 1024 * 1024
-        self._inflight_downloads: dict[Tuple[str, int], trio.Event] = {}
-        "(file_id, chunk_id) -> trio.Event"
+        self._inflight_downloads: dict[Tuple[str, int, float], trio.Event] = {}
+        "(file_id, chunk_id, mtime) -> trio.Event"
         self._inflight_lock = trio.Lock()
-
-
-
-    def generate_file_id(self, full_path, mtime):
-        """
-        Creates a deterministic unique ID based on path AND mtime.
-        This ensures we invalidate cache if the remote file changes.
-        """
-        raw_str = f"{full_path}:{mtime}"
-        return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
 
     def _read_chunk(self, fs_path: str, chunk_id: int, mtime: float) -> bytes:
         pass
