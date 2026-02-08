@@ -1,16 +1,45 @@
 import pytest
-import time
 import stat
-import pyfuse3
-from fuse4dbricks.fs.inode_manager import (
-    InodeManager, 
-    TYPE_ROOT, TYPE_CATALOG, TYPE_SCHEMA, TYPE_VOLUME, TYPE_DIRECTORY, TYPE_FILE
-)
+
+try:
+    import pyfuse3
+except ImportError:
+    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+
+from fuse4dbricks.fs.inode_manager import InodeManager, InodeEntry, InodeEntryAttr
 
 @pytest.fixture
 def manager():
     """Fixture to provide a fresh InodeManager for each test."""
     return InodeManager()
+
+@pytest.fixture
+def dir_entry_attr():
+    """Fixture to provide a dummy directory InodeEntryAttr instance for each test."""
+    return InodeEntryAttr(
+        st_mode = (stat.S_IFDIR | 0o755),
+        st_nlink = 2,
+        st_size = 0,
+        st_ctime = 0,
+        st_mtime = 0,
+        st_atime = 0,
+        st_uid = 0,
+        st_gid = 0,
+    )
+
+@pytest.fixture
+def file_entry_attr():
+    """Fixture to provide a dummy file InodeEntryAttr instance for each test."""
+    return InodeEntryAttr(
+        st_mode = (stat.S_IFREG | 0o644),
+        st_nlink = 1,
+        st_size = 0,
+        st_ctime = 0,
+        st_mtime = 0,
+        st_atime = 0,
+        st_uid = 0,
+        st_gid = 0,
+    )
 
 def test_root_initialization(manager):
     """Verify the root inode is created correctly on init."""
@@ -18,46 +47,48 @@ def test_root_initialization(manager):
     assert root is not None
     assert root.inode == pyfuse3.ROOT_INODE
     assert root.name == "/"
-    assert root.entry_type == TYPE_ROOT
+    assert root.fs_path == "/"
+    assert root.is_dir == True
     assert root.ref_count == 1  # Root should have 1 ref by default
 
-def test_add_catalog_entry(manager):
+def test_add_catalog_entry(manager, dir_entry_attr):
     """Test adding a first-level child (Catalog)."""
     # Action
     entry = manager.add_entry(
         parent_inode=pyfuse3.ROOT_INODE, 
-        name="my_catalog", 
-        entry_type=TYPE_CATALOG
+        name="my_catalog",
+        is_dir = True,
+        attr = dir_entry_attr,
     )
 
     # Assertions
     assert entry.inode > pyfuse3.ROOT_INODE
     assert entry.name == "my_catalog"
     assert entry.parent_inode == pyfuse3.ROOT_INODE
-    assert entry.full_path == "/my_catalog"
+    assert entry.fs_path == "/my_catalog"
     
     # Check lookup by Inode
     fetched = manager.get_entry(entry.inode)
     assert fetched == entry
 
-def test_deep_path_construction(manager):
+def test_deep_path_construction(manager, dir_entry_attr):
     """Verify full_path is constructed correctly for nested items."""
     # 1. Create Catalog
-    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat1", TYPE_CATALOG)
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat1", is_dir=True, attr=dir_entry_attr)
     
     # 2. Create Schema
-    sch = manager.add_entry(cat.inode, "sch1", TYPE_SCHEMA)
-    assert sch.full_path == "/cat1/sch1"
+    sch = manager.add_entry(cat.inode, "sch1", is_dir=True, attr=dir_entry_attr)
+    assert sch.fs_path == "/cat1/sch1"
     
     # 3. Create Volume
-    vol = manager.add_entry(sch.inode, "vol1", TYPE_VOLUME)
-    assert vol.full_path == "/cat1/sch1/vol1"
+    vol = manager.add_entry(sch.inode, "vol1", is_dir=True, attr=dir_entry_attr)
+    assert vol.fs_path == "/cat1/sch1/vol1"
 
-def test_lookup_by_path(manager):
+def test_lookup_by_path(manager, dir_entry_attr):
     """Test retrieving an inode using its string path."""
     # Setup
-    cat = manager.add_entry(pyfuse3.ROOT_INODE, "finance", TYPE_CATALOG)
-    sch = manager.add_entry(cat.inode, "reports", TYPE_SCHEMA)
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "finance", is_dir=True, attr=dir_entry_attr)
+    sch = manager.add_entry(cat.inode, "reports", is_dir=True, attr=dir_entry_attr)
 
     # Action
     found_inode = manager.get_inode_by_path("/finance/reports")
@@ -66,24 +97,9 @@ def test_lookup_by_path(manager):
     assert found_inode == sch.inode
     assert manager.get_inode_by_path("/non/existent") is None
 
-def test_infer_child_type(manager):
-    """Test the logic that tells readdir what to look for."""
-    root = manager.get_entry(pyfuse3.ROOT_INODE)
-    
-    # Root children are Catalogs
-    assert manager.infer_child_type(root.inode) == TYPE_CATALOG
-    
-    # Catalog children are Schemas
-    cat = manager.add_entry(root.inode, "c", TYPE_CATALOG)
-    assert manager.infer_child_type(cat.inode) == TYPE_SCHEMA
-    
-    # Volume children are Directories (Physical)
-    vol = manager.add_entry(cat.inode, "v", TYPE_VOLUME)
-    assert manager.infer_child_type(vol.inode) == TYPE_DIRECTORY # or FILE logic
-
-def test_forget_logic(manager):
+def test_forget_logic(manager, dir_entry_attr):
     """Test reference counting and eviction."""
-    entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp", TYPE_CATALOG)
+    entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp", is_dir=True, attr=dir_entry_attr)
     inode = entry.inode
     
     # Simulate FUSE increasing refcount (lookup)
@@ -94,63 +110,69 @@ def test_forget_logic(manager):
     assert manager.get_entry(inode) is None
     assert manager.get_inode_by_path("/temp") is None
 
-def test_duplicate_add_returns_existing(manager):
+def test_duplicate_add_returns_existing(manager, dir_entry_attr):
     """Adding the same entry twice should return the same inode."""
-    entry1 = manager.add_entry(pyfuse3.ROOT_INODE, "shared", TYPE_CATALOG)
-    entry2 = manager.add_entry(pyfuse3.ROOT_INODE, "shared", TYPE_CATALOG)
+    entry1 = manager.add_entry(pyfuse3.ROOT_INODE, "shared", is_dir=True, attr=dir_entry_attr)
+    entry2 = manager.add_entry(pyfuse3.ROOT_INODE, "shared", is_dir=True, attr=dir_entry_attr)
     
     assert entry1.inode == entry2.inode
     assert entry1 is entry2
 
-def test_directory_vs_file_attributes(manager):
+def test_directory_vs_file_attributes(manager, dir_entry_attr, file_entry_attr):
     """Verify default attributes differ for directories and files."""
     # Directory (Catalog)
-    d_entry = manager.add_entry(pyfuse3.ROOT_INODE, "d", TYPE_CATALOG)
-    assert d_entry.attr['st_mode'] & stat.S_IFDIR
-    assert d_entry.attr['st_nlink'] == 2
+    d_entry = manager.add_entry(pyfuse3.ROOT_INODE, "d", is_dir=True, attr=dir_entry_attr)
+    assert d_entry.attr.st_mode & stat.S_IFDIR
+    assert d_entry.attr.st_nlink == 2
 
-    # File
-    # Need a volume parent first
-    vol = manager.add_entry(pyfuse3.ROOT_INODE, "v", TYPE_VOLUME) 
-    f_entry = manager.add_entry(vol.inode, "file.txt", TYPE_FILE)
+    # Realistic file path:
+    cat_entry = manager.add_entry(pyfuse3.ROOT_INODE, "c", is_dir=True, attr=dir_entry_attr)
+    sch_entry = manager.add_entry(cat_entry.inode, "s", is_dir=True, attr=dir_entry_attr)
+    vol_entry = manager.add_entry(sch_entry.inode, "v", is_dir=True, attr=dir_entry_attr)
+    f_entry = manager.add_entry(vol_entry.inode, "file.txt", is_dir=False, attr=file_entry_attr)
     
-    assert f_entry.attr['st_mode'] & stat.S_IFREG
-    assert f_entry.attr['st_nlink'] == 1
+    assert f_entry.attr.st_mode & stat.S_IFREG
+    assert f_entry.attr.st_nlink == 1
 
-def test_idempotency_with_attribute_merge(manager):
+def test_idempotency_with_attribute_merge(manager, dir_entry_attr):
     """
     If add_entry is called for an existing inode, it should update 
     the attributes (merge) instead of ignoring them.
     """
+    # Realistic file path:
+    cat_entry = manager.add_entry(pyfuse3.ROOT_INODE, "c", is_dir=True, attr=dir_entry_attr)
+    sch_entry = manager.add_entry(cat_entry.inode, "s", is_dir=True, attr=dir_entry_attr)
+    vol_entry = manager.add_entry(sch_entry.inode, "v", is_dir=True, attr=dir_entry_attr)
     # 1. Create a file with size 100
-    attr_v1 = {"st_size": 100, "st_mtime": 1000}
-    entry_v1 = manager.add_entry(pyfuse3.ROOT_INODE, "data.csv", TYPE_FILE, attr_v1)
+    f_attr = InodeEntryAttr(st_mode=0, st_nlink=2, st_size=100,st_ctime=0, st_mtime=1000, st_atime=0, st_uid=0, st_gid=0)
+    entry_v1 = manager.add_entry(vol_entry.inode, "data.csv", is_dir=False, attr=f_attr)
+
     
-    assert entry_v1.attr["st_size"] == 100
+    assert entry_v1.attr.st_size == 100
     inode_id = entry_v1.inode
 
     # 2. Simulate readdir finding a newer version (size 200)
-    attr_v2 = {"st_size": 200, "st_mtime": 2000}
-    entry_v2 = manager.add_entry(pyfuse3.ROOT_INODE, "data.csv", TYPE_FILE, attr_v2)
+    f_attr_v2 = InodeEntryAttr(st_mode=0, st_nlink=2, st_size=200,st_ctime=0, st_mtime=2000, st_atime=0, st_uid=0, st_gid=0)
+    entry_v2 = manager.add_entry(vol_entry.inode, "data.csv", is_dir=False, attr=f_attr_v2)
 
     # Assertions
     assert entry_v2.inode == inode_id, "Inode ID must remain constant"
-    assert entry_v2.attr["st_size"] == 200, "Attributes should be updated in memory"
-    assert entry_v2.attr["st_mtime"] == 2000
+    assert entry_v2.attr.st_size == 200, "Attributes should be updated in memory"
+    assert entry_v2.attr.st_mtime == 2000
 
-def test_type_collision_creates_zombie(manager):
+def test_type_collision_creates_zombie(manager, dir_entry_attr):
     """
     If a directory is replaced by a file, the old directory inode 
     should become a 'Zombie' (stale) but remain in memory if ref_count > 0.
     """
     # 1. Create a directory and simulate Kernel holding it
-    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", TYPE_DIRECTORY)
+    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", is_dir=True, attr=dir_entry_attr)
     manager.increment_lookup_count(dir_entry.inode)  # ref_count = 1
     
     old_inode = dir_entry.inode
 
     # 2. Replace it with a file (Type Mismatch)
-    file_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", TYPE_FILE)
+    file_entry = manager.add_entry(pyfuse3.ROOT_INODE, "workspace", is_dir=False, attr=dir_entry_attr)
     
     # Assertions
     assert file_entry.inode != old_inode, "New inode must be created for type change"
@@ -164,17 +186,17 @@ def test_type_collision_creates_zombie(manager):
     assert old_entry_fetched.is_stale is True, "Old inode must be marked as stale"
     assert old_entry_fetched.ref_count == 1
 
-def test_zombie_reaping_on_forget(manager):
+def test_zombie_reaping_on_forget(manager, dir_entry_attr, file_entry_attr):
     """
     Verifies that a Zombie inode is physically deleted once 
     the Kernel releases the last reference (forget).
     """
     # Setup: Create zombie
-    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp", TYPE_DIRECTORY)
+    dir_entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp", is_dir=True, attr=dir_entry_attr)
     manager.increment_lookup_count(dir_entry.inode) # ref=1
     
     # Overwrite to make it stale
-    manager.add_entry(pyfuse3.ROOT_INODE, "temp", TYPE_FILE)
+    manager.add_entry(pyfuse3.ROOT_INODE, "temp", is_dir=False, attr=file_entry_attr)
     
     # Confirm it still exists
     assert manager.get_entry(dir_entry.inode) is not None
@@ -185,22 +207,22 @@ def test_zombie_reaping_on_forget(manager):
     # Assert: Should be gone from memory
     assert manager.get_entry(dir_entry.inode) is None
 
-def test_recursive_pruning(manager):
+def test_recursive_pruning(manager, dir_entry_attr, file_entry_attr):
     """
     Deleting/Replacing a parent folder should recursively mark 
     children as stale and free up the path map.
     """
     # 1. Build hierarchy: /catalog/schema/volume
-    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", TYPE_CATALOG)
-    sch = manager.add_entry(cat.inode, "sch", TYPE_SCHEMA)
-    vol = manager.add_entry(sch.inode, "vol", TYPE_VOLUME)
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", is_dir=True, attr=dir_entry_attr)
+    sch = manager.add_entry(cat.inode, "sch", is_dir=True, attr=dir_entry_attr)
+    vol = manager.add_entry(sch.inode, "vol", is_dir=True, attr=dir_entry_attr)
     
     # 2. Hold reference to the deepest child (Volume)
     manager.increment_lookup_count(vol.inode) # vol ref=1
     
     # 3. Replace the TOP level catalog with a file (drastic change)
     # This triggers _prune_subtree starting at 'cat'
-    new_file = manager.add_entry(pyfuse3.ROOT_INODE, "cat", TYPE_FILE)
+    new_file = manager.add_entry(pyfuse3.ROOT_INODE, "cat", is_dir=False, attr=file_entry_attr)
     
     # Assertions
     
@@ -223,43 +245,24 @@ def test_recursive_pruning(manager):
     # because the parent was removed or the key deleted.
     assert manager.get_inode_by_path("/cat/sch/vol") is None
 
-def test_infer_child_type_hierarchy(manager):
-    """Verify the mapping logic for API calls."""
-    root = manager.get_entry(pyfuse3.ROOT_INODE)
-    
-    # Root -> Catalog
-    assert manager.infer_child_type(root.inode) == TYPE_CATALOG
-    
-    # Catalog -> Schema
-    cat = manager.add_entry(root.inode, "c", TYPE_CATALOG)
-    assert manager.infer_child_type(cat.inode) == TYPE_SCHEMA
-    
-    # Schema -> Volume
-    sch = manager.add_entry(cat.inode, "s", TYPE_SCHEMA)
-    assert manager.infer_child_type(sch.inode) == TYPE_VOLUME
-    
-    # Volume -> Directory (Physical Storage)
-    vol = manager.add_entry(sch.inode, "v", TYPE_VOLUME)
-    assert manager.infer_child_type(vol.inode) == TYPE_DIRECTORY
-
-def test_path_construction_edge_cases(manager):
+def test_path_construction_edge_cases(manager, dir_entry_attr):
     """Ensure no double slashes in paths."""
     root = manager.get_entry(pyfuse3.ROOT_INODE)
-    assert root.full_path == "/" # Or "" depending on implementation, let's check behavior
+    assert root.fs_path == "/" # Or "" depending on implementation, let's check behavior
     
     # If root.full_path is "/", constructing child shouldn't be "//child"
-    child = manager.add_entry(pyfuse3.ROOT_INODE, "child", TYPE_CATALOG)
-    assert child.full_path == "/child"
+    child = manager.add_entry(pyfuse3.ROOT_INODE, "child", is_dir=True, attr=dir_entry_attr)
+    assert child.fs_path == "/child"
     
-    grandchild = manager.add_entry(child.inode, "grand", TYPE_SCHEMA)
-    assert grandchild.full_path == "/child/grand"
+    grandchild = manager.add_entry(child.inode, "grand", is_dir=True, attr=dir_entry_attr)
+    assert grandchild.fs_path == "/child/grand"
 
-def test_strict_garbage_collection(manager):
+def test_strict_garbage_collection(manager, file_entry_attr):
     """
     Verify that entries are deleted immediately when ref_count hits 0,
     even if they are not stale (Standard eviction).
     """
-    entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp_file", TYPE_FILE)
+    entry = manager.add_entry(pyfuse3.ROOT_INODE, "temp_file", is_dir=False, attr=file_entry_attr)
     manager.increment_lookup_count(entry.inode) # ref=1
     
     # Kernel forgets it

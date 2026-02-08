@@ -1,7 +1,6 @@
 import pytest
 import httpx
-from unittest.mock import MagicMock, AsyncMock, patch
-from email.utils import formatdate
+from unittest.mock import MagicMock, AsyncMock
 from datetime import datetime, timezone
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
@@ -87,9 +86,9 @@ async def test_get_file_metadata_parsing(client):
 
     meta = await client.get_file_metadata("/data.csv")
 
-    assert meta["size"] == 1024
+    assert meta.size == 1024
     expected_dt = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert meta["mtime"] == expected_dt.timestamp()
+    assert meta.mtime == expected_dt.timestamp()
 
 @pytest.mark.trio
 async def test_get_file_metadata_404(client):

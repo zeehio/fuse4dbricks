@@ -4,16 +4,19 @@ import sys
 import logging
 import argparse
 import trio
-import pyfuse3
+try:
+    import pyfuse3
+except ImportError:
+    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from identity.keyring_store import LinuxKeyringManager
-from identity.provider import EntraIDAuthProvider
-from api.uc_client import UnityCatalogClient
-from storage.persistence import DiskPersistence
-from fs.inode_manager import InodeManager
-from fs.metadata_manager import MetadataManager
-from fs.data_manager import DataManager
-from fs.operations import UnityCatalogFS
+from fuse4dbricks.identity.keyring_store import LinuxKeyringManager
+from fuse4dbricks.identity.provider import EntraIDAuthProvider
+from fuse4dbricks.api.uc_client import UnityCatalogClient
+from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
+from fuse4dbricks.fs.inode_manager import InodeManager
+from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.fs.data_manager import DataManager
+from fuse4dbricks.fs.operations import UnityCatalogFS
 
 # Default Azure Databricks App ID (Standard Public Client)
 DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459" 
@@ -65,6 +68,8 @@ async def async_main():
         sys.exit(1)
 
     cache_dir = os.path.abspath(args.cache_dir)
+    if args.clear_cache:
+        clear_cache(cache_dir)
     os.makedirs(cache_dir, exist_ok=True, mode=0o700)
 
     # Auth
@@ -82,10 +87,7 @@ async def async_main():
     # Init Components
     uc_client = UnityCatalogClient(args.workspace, auth_provider)
     persistence = DiskPersistence(cache_dir, max_size_gb=10,max_age_days=30)
-    
-    if args.clear_cache:
-        logging.info("Clearing cache...")
-        persistence.evict(persistence.current_size + 1)
+
 
     inode_manager = InodeManager()
     data_manager = DataManager(uc_client, persistence)

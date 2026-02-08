@@ -3,7 +3,7 @@ Authentication provider for Azure Databricks using Microsoft Entra ID.
 Thread-safe implementation using Double-Checked Locking.
 """
 import time
-import msal
+import msal  # type: ignore[import-untyped]
 import logging
 import threading
 
@@ -33,7 +33,7 @@ class EntraIDAuthProvider:
         )
         
         self._access_token = None
-        self._expires_at = 0
+        self._expires_at = 0.
         
         # Lock to prevent race conditions during token refresh
         self._lock = threading.Lock()
@@ -76,7 +76,7 @@ class EntraIDAuthProvider:
     def _is_token_valid(self):
         """Helper to check validity buffer."""
         # Buffer of 60 seconds before actual expiration
-        return self._access_token and time.time() < (self._expires_at - 60)
+        return self._access_token and time.time() < (self._expires_at - 60.)
 
     def _refresh_silently(self):
         """
@@ -139,7 +139,7 @@ class EntraIDAuthProvider:
         self._access_token = msal_result["access_token"]
         # Buffer of 60 seconds is handled in _is_token_valid, 
         # but we store the raw expiration here.
-        self._expires_at = time.time() + int(msal_result.get("expires_in", 3600))
+        self._expires_at = time.time() + float(msal_result.get("expires_in", 3600.0))
         
         # Persist the new refresh token in the keyring
         if "refresh_token" in msal_result:

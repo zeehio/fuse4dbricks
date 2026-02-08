@@ -4,14 +4,51 @@ Handles pagination, robust authentication, and asynchronous streaming for FUSE.
 """
 import httpx
 import logging
+import os
 import urllib.parse
 from typing import AsyncGenerator
 from email.utils import formatdate, parsedate_to_datetime
+from dataclasses import dataclass
+
+from fuse4dbricks.identity.provider import EntraIDAuthProvider
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+class UcNodeType(Enum):
+    """Unity Catalog node types, with the root node"""
+    ROOT = 0
+    CATALOG = 1
+    SCHEMA = 2
+    VOLUME = 3
+    DIRECTORY = 4
+    FILE = 5
+
+
+UC_NODE_IS_DIR = {
+    UcNodeType.ROOT: True,
+    UcNodeType.CATALOG: True,
+    UcNodeType.SCHEMA: True,
+    UcNodeType.VOLUME: True,
+    UcNodeType.DIRECTORY: True,
+    UcNodeType.FILE: False,
+}
+
+@dataclass
+class UnityCatalogEntry:
+    name: str
+    uc_path: str
+    "The databricks path /Volumes/catalog/schema..."
+    entry_type: UcNodeType
+    size: int = 0
+    ctime: float | None = None
+    mtime: float | None = None
+
+    def is_dir(self):
+        return UC_NODE_IS_DIR[self.entry_type]
+
 class UnityCatalogClient:
-    def __init__(self, workspace_url, auth_provider):
+    def __init__(self, workspace_url: str, auth_provider: EntraIDAuthProvider):
         self.base_url = workspace_url.rstrip("/")
         self.auth_provider = auth_provider
 
@@ -20,7 +57,7 @@ class UnityCatalogClient:
             base_url=self.base_url,
             timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=30.0),
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-            follow_redirects=True 
+            follow_redirects=True,
         )
 
     async def close(self):
@@ -72,11 +109,11 @@ class UnityCatalogClient:
             if method == "HEAD":
                 return response
             return response.json()
-        
+
         # For streams, we return the response object to be used in a context manager
         if response.status_code >= 400:
-             await response.aclose()
-             response.raise_for_status()
+            await response.aclose()
+            response.raise_for_status()
         return response
 
     # --- Discovery Layer (Pagination Support) ---
@@ -99,22 +136,88 @@ class UnityCatalogClient:
             next_token = data.get('next_page_token')
             if not next_token:
                 break
-
         return results
 
-    async def list_catalogs(self):
-        return await self._fetch_all_pages("/api/2.1/unity-catalog/catalogs", "catalogs")
+    async def get_catalogs(self) -> list[UnityCatalogEntry]:
+        catalogs = await self._fetch_all_pages("/api/2.1/unity-catalog/catalogs", "catalogs")
+        return [
+            UnityCatalogEntry(
+                name = x["name"],
+                uc_path = "/Volumes/" + x["name"],
+                entry_type = UcNodeType.CATALOG,
+                ctime=float(x["created_at"])/1000.,
+                mtime=float(x["updated_at"])/1000.,
+            ) for x in catalogs
+        ]
 
-    async def list_schemas(self, catalog_name):
-        return await self._fetch_all_pages(
+    async def get_catalog(self, catalog_name: str) -> UnityCatalogEntry|None:
+        endpoint = f"/api/2.1/unity-catalog/catalogs/{catalog_name}"
+        catalog = await self._request("GET", endpoint)
+        if not catalog:
+            return None
+        return UnityCatalogEntry(
+            name = catalog["name"],
+            uc_path = "/Volumes/" + catalog["name"],
+            entry_type = UcNodeType.CATALOG,
+            ctime=float(catalog["created_at"])/1000.,
+            mtime=float(catalog["updated_at"])/1000.,
+        )
+
+    async def get_schemas(self, catalog_name: str) -> list[UnityCatalogEntry]:
+        schemas = await self._fetch_all_pages(
             "/api/2.1/unity-catalog/schemas", "schemas", 
             params={"catalog_name": catalog_name}
         )
+        return [
+            UnityCatalogEntry(
+                name = x["name"],
+                uc_path = "/Volumes/" + x["catalog"] + "/" + x["name"],
+                entry_type = UcNodeType.SCHEMA,
+                ctime=float(x["created_at"])/1000.,
+                mtime=float(x["updated_at"])/1000.,
+            ) for x in schemas
+        ]
 
-    async def list_volumes(self, catalog_name, schema_name):
-        return await self._fetch_all_pages(
+    async def get_schema(self, catalog_name, schema_name) -> UnityCatalogEntry|None:
+        endpoint = f"/api/2.1/unity-catalog/schemas/{catalog_name}.{schema_name}"
+        schema = await self._request("GET", endpoint)
+        if not schema:
+            return None
+        return UnityCatalogEntry(
+            name = schema["name"],
+            uc_path = "/Volumes/" + schema["catalog_name"] + "/" + schema["name"],
+            entry_type = UcNodeType.SCHEMA,
+            ctime=float(schema["created_at"])/1000.,
+            mtime=float(schema["updated_at"])/1000.,
+        )
+
+    async def get_volumes(self, catalog_name, schema_name):
+        volumes = await self._fetch_all_pages(
             "/api/2.1/unity-catalog/volumes", "volumes", 
             params={"catalog_name": catalog_name, "schema_name": schema_name}
+        )
+        return [
+            UnityCatalogEntry(
+                name = x["name"],
+                uc_path = "/Volumes/" + x["catalog"] + "/" + x["schema"] + "/" + x["name"],
+                entry_type = UcNodeType.VOLUME,
+                ctime=float(x["created_at"])/1000.,
+                mtime=float(x["updated_at"])/1000.,
+            ) for x in volumes
+        ]
+
+
+    async def get_volume(self, catalog_name, schema_name, volume_name) -> UnityCatalogEntry|None:
+        endpoint = f"/api/2.1/unity-catalog/schemas/{catalog_name}.{schema_name}.{volume_name}"
+        volume = await self._request("GET", endpoint)
+        if not volume:
+            return None
+        return UnityCatalogEntry(
+            name = volume["name"],
+            uc_path = "/Volumes/" + volume["catalog_name"] + "/" + volume["schema_name"] + "/" + volume["name"],
+            entry_type = UcNodeType.VOLUME,
+            ctime=float(volume["created_at"])/1000.,
+            mtime=float(volume["updated_at"])/1000.,
         )
 
     # --- File System Layer (Files API 2.0) ---
@@ -124,7 +227,7 @@ class UnityCatalogClient:
             path = "/" + path
         return urllib.parse.quote(path)
 
-    async def get_file_metadata(self, path):
+    async def get_file_metadata(self, path: str) -> UnityCatalogEntry|None:
         """HEAD request for size/mtime."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
@@ -144,27 +247,97 @@ class UnityCatalogClient:
             except Exception:
                 logger.warning(f"Failed to parse Last-Modified: {last_modified}")
                 pass
+        return UnityCatalogEntry(
+            name = os.path.basename(path),
+            uc_path = path,
+            entry_type= UcNodeType.FILE,
+            size = size,
+            mtime = mtime,
+        )
 
-        return {"size": size, "mtime": mtime, "is_dir": False}
+    async def get_directory_metadata(self, path: str) -> UnityCatalogEntry|None:
+        """HEAD request, checks for existance."""
+        encoded_path = self._quote_path(path)
+        endpoint = f"/api/2.0/fs/directories{encoded_path}"
+        
+        response = await self._request("HEAD", endpoint)
+        if response is None:
+            return None
+        return UnityCatalogEntry(
+            name = os.path.basename(path),
+            uc_path = path,
+            entry_type= UcNodeType.DIRECTORY,
+        )
 
-    async def list_directory_contents(self, path, limit=None):
+    async def get_path_metadata(self, uc_path: str, expected_type: UcNodeType|None = None) -> UnityCatalogEntry|None:
+        """
+        Gets the catalog entry. None if not found. expected_type is optional
+
+        :param uc_path: The /Volumes/catalog/Schema/volume/path/to/file.txt
+        :param expected_type: You may set this to UcNodeType.DIRECTORY if you expect the path to be a
+           folder. You save one request if you do it. defaults to None.
+        :raises ValueError: When the path is not valid
+        :return: A UnityCatalogEntry holding path metadata
+        """
+        if not uc_path.startswith("/"):
+            raise ValueError("uc_path should start with /Volumes")
+        parts = uc_path.split('/')
+        if len(parts) < 2 or parts[1] != "Volumes":
+            raise ValueError("uc_path should start with /Volumes")
+        if len(parts) == 2:
+            raise ValueError("'/Volumes' is not a unity catalog entry.")
+        catalog = parts[2]
+        if len(parts) == 3:
+            return await self.get_catalog(catalog)
+        schema = parts[3]
+        if len(parts) == 4:
+            return await self.get_schema(catalog, schema)
+        volume = parts[4]
+        if len(parts) == 5:
+            return await self.get_volume(catalog, schema, volume)
+        if expected_type == UcNodeType.DIRECTORY:
+            entry = await self.get_directory_metadata(uc_path)
+            if entry is None:
+                # File not found, check if that path is now a directory (because
+                # someone created a folder with that same name)
+                entry = await self.get_file_metadata(uc_path)
+                # Returns either the folder or None if not found
+                return entry
+        entry = await self.get_file_metadata(uc_path)
+        if entry is None:
+            entry = await self.get_directory_metadata(uc_path)
+        return entry
+
+    async def list_directory_contents(self, path, limit=None) -> list[UnityCatalogEntry] | None:
         """Lists directory contents."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
         
         results = []
         next_token = None
-        
+        first_page = True
         while True:
-            params = {}
+            params: dict[str, str] = {}
             if next_token:
                 params['page_token'] = next_token
                 
             data = await self._request("GET", endpoint, params=params)
+            if first_page and data is None:
+                return None # Possibly not a directory
             if data is None:
-                break 
-    
-            results.extend(data.get("contents", []))
+                break  # Possibly an empty directory (or no new files)
+            first_page = False
+            contents = data.get("contents", [])
+            for x in contents:
+                results.append(
+                    UnityCatalogEntry(
+                        name = x["name"],
+                        uc_path=x["path"],
+                        entry_type=UcNodeType.DIRECTORY if x["is_directory"] else UcNodeType.FILE,
+                        size = x.get("file_size", 0),
+                        mtime= float(x.get("last_modified", 0.0))/1000.,
+                    )
+                )
             next_token = data.get("next_page_token")
             if not next_token:
                 break
@@ -172,7 +345,30 @@ class UnityCatalogClient:
                 break
         return results
 
-    async def download_chunk_stream(self, path: str, offset: int, length: int, if_unmodified_since: float = None) -> AsyncGenerator[bytes, None]:
+    async def get_path_contents(self, uc_path: str) -> list[UnityCatalogEntry] | None:
+        """
+        Lists the path contents, or returns None if not a catalog/schema/volume/directory
+
+        :param uc_path: The unity catalog path /Volumes/catalog/schema/...
+        :raises ValueError: path is malformed
+        :return: A list of unity catalog entries with the metadata of the path contents
+        """
+        if not uc_path.startswith("/"):
+            raise ValueError("path should start with /Volumes")
+        parts = uc_path.split('/')
+        if len(parts) < 2 or parts[1] != "Volumes":
+            raise ValueError("path should start with /Volumes")
+        if len(parts) == 2:
+            return await self.get_catalogs()
+        catalog = parts[2]
+        if len(parts) == 3:
+            return await self.get_schemas(catalog_name = catalog)
+        schema = parts[3]
+        if len(parts) == 4:
+            return await self.get_volumes(catalog, schema)
+        return await self.list_directory_contents(uc_path)
+
+    async def download_chunk_stream(self, path: str, offset: int, length: int, if_unmodified_since: float|None = None) -> AsyncGenerator[bytes, None]:
         """
         Asynchronously streams binary data from Unity Catalog.
         Yields bytes in 64KB chunks to keep memory usage constant.
