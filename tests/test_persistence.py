@@ -177,11 +177,16 @@ async def test_lazy_promotion(cache_dir):
 async def test_graceful_init_discovery(cache_dir):
     """Ensure existing files are discovered on startup."""
     # 1. Manually create a file structure simulating a previous run
-    shard = hashlib.md5(b"old_0").hexdigest()[:2]
-    shard_path = os.path.join(cache_dir, shard)
-    os.makedirs(shard_path, exist_ok=True)
-    
-    file_path = os.path.join(shard_path, "old_0.bin")
+    fs_path = "old"
+    chunk_index = 0
+    mtime = 0.0
+    sha256_hash = hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
+    shard1 = sha256_hash[:2]
+    shard2 = f"{(chunk_index // 1000):07d}" # Secondary shard to prevent too many files in one dir
+    shard_dir = os.path.join(cache_dir, shard1, shard2)
+    os.makedirs(shard_dir, exist_ok=True)
+    mtime_ms = int(mtime*1000)
+    file_path = os.path.join(shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin")
     with open(file_path, "wb") as f:
         f.write(b"existing_data") # 13 bytes
     
@@ -199,7 +204,7 @@ async def test_graceful_init_discovery(cache_dir):
     assert p.access_map[file_path] > 0
     
     # 4. Verify we can read it via the API
-    data = await p.retrieve_chunk("old", 0)
+    data = await p.retrieve_chunk("old", 0, 0.0)
     assert data == b"existing_data"
 
 @pytest.mark.trio
@@ -239,7 +244,7 @@ async def test_gc_removes_old_files(persistence):
     
     # Store file at T=0
     with patch("time.time", return_value=0):
-        await persistence.store_chunk_from_stream("old_file", 0, async_byte_generator(b"data"))
+        await persistence.store_chunk_from_stream("old_file", 0, 0.0, async_byte_generator(b"data"))
         
     # Verify it exists
     assert persistence.current_size > 0
@@ -279,7 +284,7 @@ async def test_gc_panic_mode_disk_full(persistence):
     """Test aggressive cleanup when physical disk is full."""
     # Write a "fresh" file (T=1000)
     with patch("time.time", return_value=1000.0):
-        await persistence.store_chunk_from_stream("fresh", 0, async_byte_generator(b"data"))
+        await persistence.store_chunk_from_stream("fresh", 0, 0.0, async_byte_generator(b"data"))
         
     # Simulate current time T=1001 (File is NOT expired)
     # But Simulate Disk Full (1% free)
@@ -323,17 +328,17 @@ async def test_concurrent_store_triggers_eviction(cache_dir):
     p = DiskPersistence(cache_dir, max_size_gb=(100 / 1024**3))
     
     # 1. Store A (60 bytes)
-    await p.store_chunk_from_stream("A", 0, async_byte_generator(b"A" * 60))
+    await p.store_chunk_from_stream("A", 0, 0.0, async_byte_generator(b"A" * 60))
     assert p.current_size == 60
     
     # 2. Store B (60 bytes) - Triggers Eviction of A
     # This call previously caused the recursion deadlock
-    await p.store_chunk_from_stream("B", 0, async_byte_generator(b"B" * 60))
+    await p.store_chunk_from_stream("B", 0, 0.0, async_byte_generator(b"B" * 60))
     
     # 3. Verify State
     assert p.current_size == 60  # A was evicted, B took its place
-    assert await p.retrieve_chunk("A", 0) is None
-    assert await p.retrieve_chunk("B", 0) is not None
+    assert await p.retrieve_chunk("A", 0, 0.0) is None
+    assert await p.retrieve_chunk("B", 0, 0.0) is not None
 
 @pytest.mark.trio
 async def test_self_healing_on_retrieve(persistence):
@@ -347,7 +352,7 @@ async def test_self_healing_on_retrieve(persistence):
     
     # 1. Manually create the file on disk (Bypassing persistence logic)
     # We use the internal helper to get the path, but don't update map/heap
-    path = persistence._get_chunk_path(file_id, chunk_index)
+    path = persistence._get_chunk_path(file_id, chunk_index, 0.0)
     with open(path, "wb") as f:
         f.write(data)
         
@@ -357,7 +362,7 @@ async def test_self_healing_on_retrieve(persistence):
     
     # 2. Retrieve the chunk using the API
     # This should trigger the "Self-Healing" block in retrieve_chunk
-    retrieved_data = await persistence.retrieve_chunk(file_id, chunk_index)
+    retrieved_data = await persistence.retrieve_chunk(file_id, chunk_index, 0.0)
     
     # 3. Assertions
     assert retrieved_data == data
@@ -379,8 +384,8 @@ async def test_background_maintenance_non_blocking(persistence):
     persistence.max_age_seconds = 0.1 # Expire very fast
     
     # 1. Store a file
-    await persistence.store_chunk_from_stream("fast_expire", 0, async_byte_generator(b"data"))
-    path = persistence._get_chunk_path("fast_expire", 0)
+    await persistence.store_chunk_from_stream("fast_expire", 0, 0.0, async_byte_generator(b"data"))
+    path = persistence._get_chunk_path("fast_expire", 0, 0.0)
     
     # 2. Wait for expiration
     await trio.sleep(0.2)
