@@ -29,7 +29,7 @@ class DataManager:
         return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
 
     def _read_chunk(self, fs_path: str, chunk_id: int, mtime: float) -> bytes:
-
+        pass
 
     async def read_file(self, fs_path: str, offset: int, length: int, mtime: float) -> bytes:
         """
