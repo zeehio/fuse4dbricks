@@ -1,145 +1,180 @@
 """
 Core FUSE operations module.
 """
-import os
-import stat
 import errno
 import logging
-import pyfuse3
+try:
+    import pyfuse3
+except ImportError:
+    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from fs.inode_manager import (
-    TYPE_ROOT, TYPE_CATALOG, TYPE_SCHEMA, TYPE_VOLUME, TYPE_DIRECTORY, TYPE_FILE
-)
+from fuse4dbricks.fs.inode_manager import InodeManager, InodeEntry
+from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.fs.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
 class UnityCatalogFS(pyfuse3.Operations):
-    def __init__(self, inode_manager, metadata_manager, data_manager):
+    def __init__(self, inode_manager: InodeManager, metadata_manager: MetadataManager, data_manager: DataManager):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
-        self.data_manager = data_manager
         self.metadata_manager = metadata_manager
+        self.data_manager = data_manager
+        self._readdir_state: dict[int,dict] = {}
+        self._readdir_fh_count = 0
 
-    async def getattr(self, inode, ctx=None):
+    async def getattr(self, inode: int, ctx: pyfuse3.RequestContext) -> pyfuse3.EntryAttributes:
         entry = self.inodes.get_entry(inode)
-        if not entry:
+        if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
-            # check ttl and update
-            await self.metadata_manager.get_attr(entry)
+            # check ttl and update entry in-place
+            attr = await self.metadata_manager.get_attributes(entry, ctx)
+            if attr is None:
+                # File was deleted or is now a folder or... inode not valid anyway
+                raise pyfuse3.FUSEError(errno.ENOENT)
             return self._entry_to_fuse_attr(entry)
         except Exception:
             raise pyfuse3.FUSEError(errno.EIO)
 
-    async def lookup(self, parent_inode, name_b, ctx=None):
+    async def lookup(self, parent_inode: int, name_b: bytes, ctx: pyfuse3.RequestContext) -> pyfuse3.EntryAttributes:
         name = name_b.decode('utf-8')
         parent_entry = self.inodes.get_entry(parent_inode)
         if not parent_entry:
             raise pyfuse3.FUSEError(errno.ENOENT)
             
         # 1. Check Local Inodes
-        full_path = f"{parent_entry.full_path}/{name}"
-        if parent_entry.full_path == "/":
+        if parent_entry.fs_path == "/":
             full_path = f"/{name}"
-            
+        else:
+            full_path = f"{parent_entry.fs_path}/{name}"
+
         existing = self.inodes.get_inode_by_path(full_path)
         if existing:
-            return await self.getattr(existing)
+            return await self.getattr(existing, ctx=ctx)
 
         # 2. Ask Cache/API
-        found = await self.metadata_manager.lookup_child(parent_entry, name)
-        if not found:
+        found = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        if found is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        (attr, is_dir) = found
+        # 3. Create Inode
+        entry = self.inodes.add_entry(parent_inode, name, is_dir, attr)
+        return await self.getattr(entry.inode, ctx)
+
+    async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
+        entry = self.inodes.get_entry(inode)
+        if not entry:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        # 3. Create Inode
-        attr = None
-        if 'size' in found:
-            # Physical file Attr Construction
-            is_dir = found['type'] != TYPE_FILE
-            mode = (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644)
-            attr = {
-                "st_mode": mode,
-                "st_nlink": 2 if is_dir else 1,
-                "st_size": found['size'],
-                "st_mtime": found['mtime'],
-                "st_ctime": found['mtime'],
-                "st_atime": found['mtime'],
-                "st_uid": os.getuid(),
-                "st_gid": os.getgid(),
-            }
-            
-        entry = self.inodes.add_entry(parent_inode, name, found['type'], attr)
-        return await self.getattr(entry.inode)
+        if not entry.is_dir:
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
 
-    async def readdir(self, inode, start_id, token):
+        fh = self._readdir_fh_count
+        # Here I assume integers are infinite
+        self._readdir_fh_count += 1
+        self._readdir_state[fh] = {
+            "inode": inode,
+            "ctx": ctx,
+        }
+        return pyfuse3.FileHandleT(fh)
+
+    async def releasedir(self, fh: pyfuse3.FileHandleT) -> None:
+        if fh in self._readdir_state:
+            del self._readdir_state[fh]
+
+    async def readdir(self, fh: pyfuse3.FileHandleT, start_id: int, token) -> None:
+        if fh not in self._readdir_state:
+            raise pyfuse3.FUSEError(errno.EIO)
+
+        inode = self._readdir_state[fh]["inode"]
+        ctx = self._readdir_state[fh]["ctx"]
+
         entry = self.inodes.get_entry(inode)
         if not entry:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         # Yield . and ..
         if start_id == 0:
-            attr = await self.getattr(inode)
-            pyfuse3.readdir_reply(token, b".", attr, inode)
-            
-            p_attr = await self.getattr(entry.parent_inode)
-            pyfuse3.readdir_reply(token, b"..", p_attr, entry.parent_inode)
+            attr = await self.getattr(inode, ctx)
+            ret = pyfuse3.readdir_reply(token, b".", attr, 1)
+            if not ret:
+                return
+        
+        if start_id <= 1:
+            p_attr = await self.getattr(entry.parent_inode, ctx)
+            ret = pyfuse3.readdir_reply(token, b"..", p_attr, 2)
+            if not ret:
+                return
         
         # Get Children from Cache/API
-        items = await self.cache.list_children(entry)
-        
-        for item in items:
-            # Construct Attr for Inode creation
-            attr = None
-            if item['type'] in [TYPE_FILE, TYPE_DIRECTORY]:
-                 is_dir = item['type'] == TYPE_DIRECTORY
-                 attr = {
-                    "st_mode": (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644),
-                    "st_size": item.get('size', 0),
-                    "st_mtime": item.get('mtime', 0),
-                    "st_ctime": item.get('mtime', 0),
-                    "st_atime": item.get('mtime', 0),
-                    "st_nlink": 2 if is_dir else 1,
-                    "st_uid": os.getuid(), "st_gid": os.getgid()
-                }
+        if start_id <= 2:
+            items = await self.metadata_manager.list_directory(entry, ctx)
+            if items is None:
+                raise pyfuse3.FUSEError(errno.EIO)
+            self._readdir_state[fh]["children"] = items
+        else:
+            items = self._readdir_state[fh]["children"]
 
-            child_entry = self.inodes.add_entry(inode, item['name'], item['type'], attr)
-            
-            # Simple check to skip already-sent entries if pagination was implemented in kernel
-            # Since we don't track offset perfectly here, we rely on pyfuse3 buffering
-            child_attr = self._entry_to_fuse_attr(child_entry)
-            pyfuse3.readdir_reply(token, item['name'].encode(), child_attr, child_entry.inode)
+        to_skip = min(0, start_id - 2)
+        for i, child in enumerate(items[to_skip:]):
+            child_entry = self.inodes.add_entry(
+                parent_inode = inode,
+                name = child.name,
+                is_dir = child.is_dir,
+                attr = child.attr,
+            )
+            ret = pyfuse3.readdir_reply(
+                token,
+                name=child_entry.name.encode("utf-8"),
+                attr=child_entry.attr,
+                next_id=3 + to_skip + i,
+            )
+            if ret:
+                self.inodes.increment_lookup_count(child_entry.inode)
+            else:
+                return
 
     async def open(self, inode, flags, ctx):
         entry = self.inodes.get_entry(inode)
-        if entry.entry_type != TYPE_FILE:
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
-        return pyfuse3.FileInfo(fh=inode)
+        # inode manager increment refcount? increment_lookup_count
+        fileinfo = pyfuse3.FileInfo()
+        fileinfo.fh = inode
+        return fileinfo
 
     async def read(self, fh, offset, length):
         entry = self.inodes.get_entry(fh)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if entry.is_dir:
+            raise pyfuse3.FUSEError(errno.EISDIR)
         try:
-            return await self.cache.read_file(
-                entry.full_path, offset, length, entry.attr['st_mtime']
+            return await self.data_manager.read_file(
+                entry.fs_path, offset, length, entry.attr.st_mtime
             )
         except Exception as e:
-            logger.error(f"Read error: {e}")
+            logger.error(f"Read error reading {entry.fs_path}: {e}")
             raise pyfuse3.FUSEError(errno.EIO)
 
     async def forget(self, inode_list):
         for (inode, nlookup) in inode_list:
             self.inodes.forget(inode, nlookup)
 
-    def _entry_to_fuse_attr(self, entry):
+    def _entry_to_fuse_attr(self, entry: InodeEntry) -> pyfuse3.EntryAttributes:
         attr = pyfuse3.EntryAttributes()
-        attr.st_mode = entry.attr['st_mode']
-        attr.st_nlink = entry.attr['st_nlink']
-        attr.st_uid = entry.attr['st_uid']
-        attr.st_gid = entry.attr['st_gid']
-        attr.st_size = entry.attr['st_size']
-        attr.st_atime_ns = int(entry.attr['st_atime'] * 1e9)
-        attr.st_ctime_ns = int(entry.attr['st_ctime'] * 1e9)
-        attr.st_mtime_ns = int(entry.attr['st_mtime'] * 1e9)
+        attr.st_mode = entry.attr.st_mode
+        attr.st_nlink = entry.attr.st_nlink
+        attr.st_uid = entry.attr.st_uid
+        attr.st_gid = entry.attr.st_gid
+        attr.st_size = entry.attr.st_size
+        attr.st_atime_ns = int(entry.attr.st_atime * 1e9)
+        attr.st_ctime_ns = int(entry.attr.st_ctime * 1e9)
+        attr.st_mtime_ns = int(entry.attr.st_mtime * 1e9)
         attr.st_ino = entry.inode
         attr.st_blksize = 4096 
         attr.st_blocks = (attr.st_size + 511) // 512

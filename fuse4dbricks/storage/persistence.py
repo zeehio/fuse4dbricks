@@ -13,6 +13,16 @@ from typing import AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
+def clear_cache(cache_dir: str):
+    """Removes *.tmp and *.bin files from cache_dir recursively"""
+    logging.info("Clearing cache...")
+    for root, _, files in os.walk(cache_dir):
+        for f in files:
+            path = os.path.join(root, f)
+            if path.endswith(".tmp") or path.endswith(".bin"):
+                os.unlink(path)
+
+
 class DiskPersistence:
     def __init__(self, cache_dir: str, max_size_gb: int = 2048, max_age_days: int = 7):
         self.cache_dir = cache_dir
@@ -63,7 +73,7 @@ class DiskPersistence:
                 except OSError:
                     continue
 
-    async def retrieve_chunk(self, file_id: str, chunk_index: int) -> bytes:
+    async def retrieve_chunk(self, file_id: str, chunk_index: int) -> bytes | None:
         """
         Retrieves a chunk from disk.
         Updates LRU access time BEFORE reading to prevent concurrent eviction.
@@ -101,8 +111,7 @@ class DiskPersistence:
         with open(path, "rb") as f:
             return f.read()
 
-    async def store_chunk_from_stream(self, file_id: str, chunk_index: int, 
-                                     stream: AsyncGenerator[bytes, None]):
+    async def store_chunk_from_stream(self, file_id: str, chunk_index: int, stream: AsyncGenerator[bytes, None]):
         """Consumes a stream and writes it to disk."""
         path = self._get_chunk_path(file_id, chunk_index)
         temp_path = f"{path}.{os.getpid()}.tmp"
@@ -118,8 +127,7 @@ class DiskPersistence:
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, path)
             
-            # 1. EVICT (Manage Lock Internally)
-            # FIX: Called OUTSIDE the main lock because evict() acquires the lock itself.
+            # 1. EVICT (Manages Lock Internally)
             await self.evict(bytes_written)
 
             # 2. UPDATE METADATA (Acquire Lock)

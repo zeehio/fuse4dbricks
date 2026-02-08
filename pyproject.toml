@@ -23,7 +23,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
-    "pyfuse3>=3.2.0",
+    'pyfuse3>=3.2.0 ; platform_system != "Windows"',
     "trio>=0.22.0",
     "msal>=1.20.0",
     "httpx>=0.24.0",
@@ -31,6 +31,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pyfuse3-stubs",
     "pytest>=7.4.0",
     "pytest-trio>=0.8.0",  # Critical for async tests
     "pytest-mock>=3.11.0", # For mocking UCClient/Persistence
@@ -51,3 +52,7 @@ packages = ["fuse4dbricks"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=fuse4dbricks --cov-report=html --cov-report=term-missing"
+
+[[tool.mypy.overrides]]
+module = "fuse4dbricks.*"
+check_untyped_defs = true
