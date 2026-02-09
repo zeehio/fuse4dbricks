@@ -97,6 +97,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             del self._readdir_state[fh]
 
     async def readdir(self, fh: pyfuse3.FileHandleT, start_id: int, token) -> None:
+        logger.debug(f"readdir(fh={fh}, start_id={start_id})")
         if fh not in self._readdir_state:
             raise pyfuse3.FUSEError(errno.EIO)
 
@@ -108,7 +109,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         # Yield . and ..
-        if start_id == 0:
+        if start_id <= 0:
             attr = await self.getattr(inode, ctx)
             ret = pyfuse3.readdir_reply(token, b".", attr, 1)  # type:ignore[arg-type]
             if not ret:
@@ -129,7 +130,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         else:
             items = self._readdir_state[fh]["children"]
 
-        to_skip = min(0, start_id - 2)
+        to_skip = max(0, start_id - 2)
         for i, child in enumerate(items[to_skip:]):
             child_entry = self.inodes.add_entry(
                 parent_inode=inode,
@@ -140,7 +141,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             ret = pyfuse3.readdir_reply(
                 token,
                 name=child_entry.name.encode("utf-8"),
-                attr=child_entry.attr,
+                attr=self._entry_to_fuse_attr(child_entry),
                 next_id=3 + to_skip + i,
             )
             if ret:

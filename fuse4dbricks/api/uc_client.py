@@ -181,7 +181,7 @@ class UnityCatalogClient:
         return [
             UnityCatalogEntry(
                 name=x["name"],
-                uc_path="/Volumes/" + x["catalog"] + "/" + x["name"],
+                uc_path="/Volumes/" + x["catalog_name"] + "/" + x["name"],
                 entry_type=UcNodeType.SCHEMA,
                 ctime=float(x["created_at"]) / 1000.0,
                 mtime=float(x["updated_at"]) / 1000.0,
@@ -212,9 +212,9 @@ class UnityCatalogClient:
             UnityCatalogEntry(
                 name=x["name"],
                 uc_path="/Volumes/"
-                + x["catalog"]
+                + x["catalog_name"]
                 + "/"
-                + x["schema"]
+                + x["schema_name"]
                 + "/"
                 + x["name"],
                 entry_type=UcNodeType.VOLUME,
@@ -307,6 +307,7 @@ class UnityCatalogClient:
         :raises ValueError: When the path is not valid
         :return: A UnityCatalogEntry holding path metadata
         """
+        logger.debug(f"uc_client.get_path_metadata for {uc_path}")
         if not uc_path.startswith("/"):
             raise ValueError("uc_path should start with /Volumes")
         parts = uc_path.split("/")
@@ -387,6 +388,7 @@ class UnityCatalogClient:
         :raises ValueError: path is malformed
         :return: A list of unity catalog entries with the metadata of the path contents
         """
+        logger.debug(f"uc_client.get_path_contents for {uc_path}")
         if not uc_path.startswith("/"):
             raise ValueError("path should start with /Volumes")
         parts = uc_path.split("/")
@@ -413,6 +415,7 @@ class UnityCatalogClient:
         Asynchronously streams binary data from Unity Catalog.
         Yields bytes in 64KB chunks to keep memory usage constant.
         """
+        logger.debug(f"uc_client.download_chunk_stream for {path}")
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
 

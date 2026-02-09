@@ -126,8 +126,18 @@ async def async_main():
     metadata_manager = MetadataManager(uc_client, ttl=30)
     operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager)
 
-    async with trio.open_nursery() as nursery:
-        nursery.start_soon(start_fuse, operations, mountpoint, args.debug)
+    try:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(start_fuse, operations, mountpoint, args.debug)
+    except ExceptionGroup as eg:
+        import traceback
+        # eg is the top-level ExceptionGroup
+        print("Top-level group message:", eg)
+        for i, exc in enumerate(eg.exceptions, 1):
+            print(f"[{i}] type={type(exc).__name__} -> {exc}")
+            print(traceback.format_exc())
+
+
 
 
 def cli_entry_point():
