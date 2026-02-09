@@ -17,7 +17,7 @@ from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
 from fuse4dbricks.identity.keyring_store import LinuxKeyringManager
-from fuse4dbricks.identity.provider import EntraIDAuthProvider
+from fuse4dbricks.identity.provider import EntraIDAuthProvider, AccessTokenAuthProvider, AuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 # Default Azure Databricks App ID (Standard Public Client)
@@ -29,11 +29,12 @@ def parse_args():
         description="Mount Databricks Unity Catalog volumes."
     )
     parser.add_argument(
-        "--workspace", required=True, help="https://adb-xxxx.azuredatabricks.net"
+        "--workspace", default="", help="https://adb-xxxx.azuredatabricks.net"
     )
-    parser.add_argument("--tenant-id", required=True, help="Azure Tenant ID")
+    parser.add_argument("--auth-provider", default="pat", const="auto", nargs="?", help="Auth provider", choices=["pat", "device"])
+    parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)")
     parser.add_argument(
-        "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID"
+        "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID (required for device auth)"
     )
     parser.add_argument("mountpoint", help="Local directory to mount")
     parser.add_argument(
@@ -90,10 +91,24 @@ async def async_main():
         clear_cache(cache_dir)
     os.makedirs(cache_dir, exist_ok=True, mode=0o700)
 
+    if args.workspace != "":
+        workspace = args.workspace
+    else:
+        workspace = os.getenv("DATABRICKS_HOST")
+        if workspace is None:
+            logging.critical("Mising databricks workspace. Either pass --workspace or set DATABRICKS_HOST to 'https://adb-xxxx.azuredatabricks.net'")
+            sys.exit(1)
+
     # Auth
     logging.info("Initializing Authentication...")
-    keyring = LinuxKeyringManager(service_prefix="fuse4dbricks")
-    auth_provider = EntraIDAuthProvider(args.tenant_id, args.client_id, keyring)
+    if args.auth_provider == "pat":
+        auth_provider: AuthProvider = AccessTokenAuthProvider()
+        if auth_provider.get_access_token():
+            logging.critical("Could not get personal access token from DATABICKS_TOKEN environment variable")
+            sys.exit(1)
+    else:
+        keyring = LinuxKeyringManager(service_prefix="fuse4dbricks")
+        auth_provider = EntraIDAuthProvider(args.tenant_id, args.client_id, keyring)
 
     try:
         auth_provider.get_access_token()
@@ -103,7 +118,7 @@ async def async_main():
         sys.exit(1)
 
     # Init Components
-    uc_client = UnityCatalogClient(args.workspace, auth_provider)
+    uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(cache_dir, max_size_gb=10, max_age_days=30)
 
     inode_manager = InodeManager()

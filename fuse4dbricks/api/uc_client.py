@@ -13,7 +13,7 @@ from typing import AsyncGenerator
 
 import httpx
 
-from fuse4dbricks.identity.provider import EntraIDAuthProvider
+from fuse4dbricks.identity.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class UnityCatalogEntry:
 
 
 class UnityCatalogClient:
-    def __init__(self, workspace_url: str, auth_provider: EntraIDAuthProvider):
+    def __init__(self, workspace_url: str, auth_provider: AuthProvider):
         self.base_url = workspace_url.rstrip("/")
         self.auth_provider = auth_provider
 

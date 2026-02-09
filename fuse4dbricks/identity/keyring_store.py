@@ -3,6 +3,8 @@ Secure storage for Refresh Tokens using the Linux Kernel Keyring.
 Includes concurrency protection and explicit C-type definitions.
 """
 
+# This is all LLM generated code
+
 import ctypes
 import ctypes.util
 import logging
