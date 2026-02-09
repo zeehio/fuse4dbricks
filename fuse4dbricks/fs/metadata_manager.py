@@ -18,6 +18,7 @@ except ImportError:
 
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
 from fuse4dbricks.api.uc_client import UnityCatalogClient, UnityCatalogEntry, UcNodeType
+from fuse4dbricks.fs.utils import fs_to_uc_path, uc_to_fs_path, join_or_lead_request, notify_followers
 logger = logging.getLogger(__name__)
 
 def uc_node_type_from_entry(entry: InodeEntry) -> UcNodeType:
@@ -106,7 +107,7 @@ class MetadataManager:
                 return cached
 
         # 2. Request Coalescing
-        wait_event = await self._join_or_lead_request(self._inflight_attr, entry.fs_path)
+        wait_event = await join_or_lead_request(self._inflight_lock, self._inflight_attr, entry.fs_path)
         
         if wait_event:
             await wait_event.wait()
@@ -119,7 +120,7 @@ class MetadataManager:
         try:
             attr = await self._refresh_entry_metadata(entry, ctx)
         finally:
-            await self._notify_followers(self._inflight_attr, entry.fs_path)
+            await notify_followers(self._inflight_lock, self._inflight_attr, entry.fs_path)
         return attr
 
     async def lookup_child(self, parent_entry: InodeEntry, name: str, ctx) -> Tuple[InodeEntryAttr, bool]|None:
@@ -141,7 +142,7 @@ class MetadataManager:
                     return (cached, is_dir)
             
         # 2. Coalescing (Reuse attr inflight tracker)
-        wait_event = await self._join_or_lead_request(self._inflight_attr, child_fs_path)
+        wait_event = await join_or_lead_request(self._inflight_lock, self._inflight_attr, child_fs_path)
 
         if wait_event:
             await wait_event.wait()
@@ -153,7 +154,7 @@ class MetadataManager:
 
         # 3. Real API Lookup
         try:
-            uc_path = self._fs_to_uc_path(child_fs_path)
+            uc_path = fs_to_uc_path(child_fs_path)
             uc_entry = await self.uc_client.get_path_metadata(uc_path)
             if uc_entry is None:
                 # Not found (negative cache could be implemented here if desired)
@@ -163,7 +164,7 @@ class MetadataManager:
             await self._update_attr_cache(child_fs_path, attr, is_dir, ttl=self.get_ttl(uc_entry.entry_type))
             return (attr, is_dir)
         finally:
-            await self._notify_followers(self._inflight_attr, child_fs_path)
+            await notify_followers(self._inflight_lock, self._inflight_attr, child_fs_path)
 
     @staticmethod
     def _uc_to_inode_entry_attr(uc_entry: UnityCatalogEntry, ctx: pyfuse3.RequestContext) -> InodeEntryAttr:
@@ -195,7 +196,7 @@ class MetadataManager:
                 return cached
 
         # 2. Coalescing
-        wait_event = await self._join_or_lead_request(self._inflight_dir, entry.fs_path)
+        wait_event = join_or_lead_request(self._inflight_lock, self._inflight_dir, entry.fs_path)
 
         if wait_event:
             await wait_event.wait()
@@ -206,7 +207,7 @@ class MetadataManager:
         # 3. Real API Call
         try:
             # Fetch raw metadata (size, mtime, etc.) along with names
-            uc_path = self._fs_to_uc_path(entry.fs_path)
+            uc_path = fs_to_uc_path(entry.fs_path)
             uc_entries = await self.uc_client.get_path_contents(uc_path)
             if uc_entries is None:  # May this happen because of any other reason as not a directory?
                 raise pyfuse3.FUSEError(errno.ENOTDIR)
@@ -225,7 +226,7 @@ class MetadataManager:
                 # read ahead: Cache attributes of children to speed up subsequent getattr and lookups
                 async with self._cache_lock:
                     await self._update_attr_cache(
-                        fs_path = self._uc_to_fs_path(uc_entry.uc_path),
+                        fs_path = uc_to_fs_path(uc_entry.uc_path),
                         attr = attr,
                         is_dir = uc_entry.is_dir(),
                         ttl = self.get_ttl(uc_entry.entry_type),
@@ -238,7 +239,7 @@ class MetadataManager:
             logger.error(f"List directory failed for {entry.fs_path}: {e}")
             return None
         finally:
-            await self._notify_followers(self._inflight_dir, entry.fs_path)
+            await notify_followers(self._inflight_lock, self._inflight_dir, entry.fs_path)
 
     def invalidate(self, fs_path: str, is_dir: bool):
         """
@@ -281,26 +282,6 @@ class MetadataManager:
             if len(self._attr_cache) > self.max_entries:
                 self._attr_cache.popitem(last=False)
 
-    async def _join_or_lead_request(self, inflight_dict: dict[str, trio.Event], key: str) -> trio.Event|None:
-        """
-        Helper for Request Coalescing.
-        Returns trio.Event if we need to wait, or None if we are the leader.
-        """
-        async with self._inflight_lock:
-            if key in inflight_dict:
-                return inflight_dict[key]
-            else:
-                inflight_dict[key] = trio.Event()
-                return None
-
-    async def _notify_followers(self, inflight_dict, key):
-        """Wake up waiting threads and cleanup."""
-        async with self._inflight_lock:
-            if key in inflight_dict:
-                inflight_dict[key].set()
-                del inflight_dict[key]
-
-
     # --- API Interaction & Validation ---
 
     async def _refresh_entry_metadata(self, entry: InodeEntry, ctx) -> InodeEntryAttr|None:
@@ -312,7 +293,7 @@ class MetadataManager:
         if node_type == UcNodeType.ROOT:
             return entry.attr
         # Refresh
-        uc_path = self._fs_to_uc_path(entry.fs_path)
+        uc_path = fs_to_uc_path(entry.fs_path)
         uc_entry = await self.uc_client.get_path_metadata(uc_path, expected_type=node_type)
         if uc_entry is None:
             # Not found, was probably deleted. Invalidate cache to trigger ENOENT on next access.
@@ -334,37 +315,3 @@ class MetadataManager:
         # All good, cache and return
         await self._update_attr_cache(entry.fs_path, attr, entry.is_dir, ttl=self.get_ttl(uc_entry.entry_type))
         return attr
-
-    @staticmethod
-    def _fs_to_uc_path(fs_path: str):
-        """
-        Translates FUSE path /cat/sch/vol/path to UC /Volumes/cat/sch/vol/path.
-        """
-        parts = fs_path.strip('/').split('/')
-        catalog = parts[0]
-        if len(parts) == 1:
-            if catalog == "":
-                return "/Volumes"
-            else:
-                return f"/Volumes/{catalog}"
-        schema = parts[1]
-        if len(parts) == 2:
-            return f"/Volumes/{catalog}/{schema}"
-        volume = parts[2]
-        vol_prefix = f"/Volumes/{catalog}/{schema}/{volume}"
-        if len(parts) == 3:
-            return vol_prefix
-        rest = "/".join(parts[3:])
-        return f"{vol_prefix}/{rest}"
-
-    @staticmethod
-    def _uc_to_fs_path(uc_path: str) -> str:
-        """
-        Translates UC path /Volumes/cat/sch/vol/path to FUSE /cat/sch/vol/path.
-        """
-        if not uc_path.startswith("/Volumes"):
-            raise ValueError("Unexpected UC path format")
-        if uc_path == "/Volumes":
-            return "/"
-        parts = uc_path[len("/Volumes/"):].split('/')
-        return "/" + "/".join(parts)

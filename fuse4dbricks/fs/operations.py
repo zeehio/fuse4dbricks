@@ -155,7 +155,11 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EISDIR)
         try:
             return await self.data_manager.read_file(
-                entry.fs_path, offset, length, entry.attr.st_mtime
+                entry.fs_path,
+                offset,
+                length,
+                entry.attr.st_mtime,
+                entry.attr.st_size,
             )
         except Exception as e:
             logger.error(f"Read error reading {entry.fs_path}: {e}")
