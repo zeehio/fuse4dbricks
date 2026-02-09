@@ -2,6 +2,7 @@
 Authentication provider for Azure Databricks using Microsoft Entra ID.
 Thread-safe implementation using Double-Checked Locking.
 """
+
 import time
 import msal  # type: ignore[import-untyped]
 import logging
@@ -9,11 +10,12 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+
 class EntraIDAuthProvider:
     """
     Handles OAuth2 Device Code Flow and silent token refreshment.
     """
-    
+
     # Static ID for Azure Databricks resource (Standard Azure Public Cloud)
     DATABRICKS_RESOURCE_ID = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
@@ -26,15 +28,12 @@ class EntraIDAuthProvider:
         self.keyring = keyring_manager
         self.scopes = [f"{self.DATABRICKS_RESOURCE_ID}/.default"]
         self.authority = f"https://login.microsoftonline.com/{tenant_id}"
-        
-        self.app = msal.PublicClientApplication(
-            client_id, 
-            authority=self.authority
-        )
-        
+
+        self.app = msal.PublicClientApplication(client_id, authority=self.authority)
+
         self._access_token = None
-        self._expires_at = 0.
-        
+        self._expires_at = 0.0
+
         # Lock to prevent race conditions during token refresh
         self._lock = threading.Lock()
 
@@ -52,7 +51,7 @@ class EntraIDAuthProvider:
         # If we reach here, the token has expired (or is about to).
         # We acquire the lock to ensure ONLY ONE thread performs the refresh.
         with self._lock:
-            
+
             # 3. DOUBLE-CHECK
             # Why? Because while we were waiting for the lock, another thread
             # might have already entered and refreshed the token.
@@ -62,7 +61,7 @@ class EntraIDAuthProvider:
 
             # 4. ACTUAL REFRESH
             # We are now certain we are the chosen one to perform the refresh.
-            
+
             # Attempt 1: Silent (Cache / Refresh Token)
             token_res = self._refresh_silently()
             if token_res:
@@ -76,7 +75,7 @@ class EntraIDAuthProvider:
     def _is_token_valid(self):
         """Helper to check validity buffer."""
         # Buffer of 60 seconds before actual expiration
-        return self._access_token and time.time() < (self._expires_at - 60.)
+        return self._access_token and time.time() < (self._expires_at - 60.0)
 
     def _refresh_silently(self):
         """
@@ -92,19 +91,21 @@ class EntraIDAuthProvider:
                     return result["access_token"]
             except Exception as e:
                 logger.warning(f"Silent refresh failed: {e}")
-        
+
         # Check Keyring for persistent refresh token
         refresh_token = self.keyring.get_refresh_token()
         if refresh_token:
             logger.info("Found refresh token in Keyring. Attempting exchange...")
             try:
-                result = self.app.acquire_token_by_refresh_token(refresh_token, scopes=self.scopes)
+                result = self.app.acquire_token_by_refresh_token(
+                    refresh_token, scopes=self.scopes
+                )
                 if "access_token" in result:
                     self._update_internal_state(result)
                     return result["access_token"]
             except Exception as e:
                 logger.error(f"Refresh token exchange failed: {e}")
-        
+
         return None
 
     def _run_device_code_flow(self):
@@ -116,17 +117,17 @@ class EntraIDAuthProvider:
             if "message" not in flow:
                 raise RuntimeError("Failed to initiate Device Code Flow.")
 
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print(flow["message"])
-            print("="*60 + "\n")
+            print("=" * 60 + "\n")
 
             result = self.app.acquire_token_by_device_flow(flow)
-            
+
             if "access_token" in result:
                 self._update_internal_state(result)
                 return result["access_token"]
             else:
-                error = result.get('error_description', 'Unknown error')
+                error = result.get("error_description", "Unknown error")
                 raise PermissionError(f"Auth failed: {error}")
         except Exception as e:
             logger.error(f"Device flow crashed: {e}")
@@ -137,10 +138,10 @@ class EntraIDAuthProvider:
         Updates the in-memory cache and persists the refresh token.
         """
         self._access_token = msal_result["access_token"]
-        # Buffer of 60 seconds is handled in _is_token_valid, 
+        # Buffer of 60 seconds is handled in _is_token_valid,
         # but we store the raw expiration here.
         self._expires_at = time.time() + float(msal_result.get("expires_in", 3600.0))
-        
+
         # Persist the new refresh token in the keyring
         if "refresh_token" in msal_result:
             self.keyring.save_refresh_token(msal_result["refresh_token"])

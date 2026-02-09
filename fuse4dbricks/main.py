@@ -4,6 +4,7 @@ import sys
 import logging
 import argparse
 import trio
+
 try:
     import pyfuse3
 except ImportError:
@@ -19,25 +20,40 @@ from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
 
 # Default Azure Databricks App ID (Standard Public Client)
-DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459" 
+DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459"
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Mount Databricks Unity Catalog volumes.")
-    parser.add_argument("--workspace", required=True, help="https://adb-xxxx.azuredatabricks.net")
+    parser = argparse.ArgumentParser(
+        description="Mount Databricks Unity Catalog volumes."
+    )
+    parser.add_argument(
+        "--workspace", required=True, help="https://adb-xxxx.azuredatabricks.net"
+    )
     parser.add_argument("--tenant-id", required=True, help="Azure Tenant ID")
-    parser.add_argument("--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID")
+    parser.add_argument(
+        "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID"
+    )
     parser.add_argument("mountpoint", help="Local directory to mount")
-    parser.add_argument("--cache-dir", default="/tmp/db_fuse_cache", help="Local disk cache location")
-    parser.add_argument("--clear-cache", action="store_true", help="Clear disk cache on startup")
+    parser.add_argument(
+        "--cache-dir", default="/tmp/db_fuse_cache", help="Local disk cache location"
+    )
+    parser.add_argument(
+        "--clear-cache", action="store_true", help="Clear disk cache on startup"
+    )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
     return parser.parse_args()
 
+
 def setup_logging(debug_mode):
     level = logging.DEBUG if debug_mode else logging.INFO
-    logging.basicConfig(format='%(asctime)s [%(name)s] %(levelname)s: %(message)s', level=level)
+    logging.basicConfig(
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", level=level
+    )
     if not debug_mode:
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
+
 
 async def start_fuse(ops, mountpoint, debug_mode):
     mount_options = ["ro", "fsname=fuse4dbricks", "noatime", "default_permissions"]
@@ -57,6 +73,7 @@ async def start_fuse(ops, mountpoint, debug_mode):
         pass
     finally:
         pyfuse3.close()
+
 
 async def async_main():
     args = parse_args()
@@ -86,8 +103,7 @@ async def async_main():
 
     # Init Components
     uc_client = UnityCatalogClient(args.workspace, auth_provider)
-    persistence = DiskPersistence(cache_dir, max_size_gb=10,max_age_days=30)
-
+    persistence = DiskPersistence(cache_dir, max_size_gb=10, max_age_days=30)
 
     inode_manager = InodeManager()
     data_manager = DataManager(uc_client, persistence)
@@ -106,6 +122,7 @@ def cli_entry_point():
     except Exception as e:
         logging.critical(f"Fatal error: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     cli_entry_point()
