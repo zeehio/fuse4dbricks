@@ -6,7 +6,7 @@ try:
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from fuse4dbricks.fs.inode_manager import InodeManager, InodeEntry, InodeEntryAttr
+from fuse4dbricks.fs.inode_manager import InodeManager, InodeEntryAttr
 
 
 @pytest.fixture
@@ -52,7 +52,7 @@ def test_root_initialization(manager):
     assert root.inode == pyfuse3.ROOT_INODE
     assert root.name == "/"
     assert root.fs_path == "/"
-    assert root.is_dir == True
+    assert root.is_dir is True
     assert root.ref_count == 1  # Root should have 1 ref by default
 
 
