@@ -110,13 +110,13 @@ class UnityCatalogFS(pyfuse3.Operations):
         # Yield . and ..
         if start_id == 0:
             attr = await self.getattr(inode, ctx)
-            ret = pyfuse3.readdir_reply(token, b".", attr, 1)
+            ret = pyfuse3.readdir_reply(token, b".", attr, 1)  # type:ignore[arg-type]
             if not ret:
                 return
 
         if start_id <= 1:
             p_attr = await self.getattr(entry.parent_inode, ctx)
-            ret = pyfuse3.readdir_reply(token, b"..", p_attr, 2)
+            ret = pyfuse3.readdir_reply(token, b"..", p_attr, 2)  # type:ignore[arg-type]
             if not ret:
                 return
 
@@ -166,7 +166,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
         try:
-            return await self.data_manager.read_file(
+            return await self.data_manager.read(
                 entry.fs_path,
                 offset,
                 length,

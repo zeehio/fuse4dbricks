@@ -9,7 +9,7 @@ import os
 import shutil
 import time
 from heapq import heappop, heappush
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Tuple
 
 import trio
 
@@ -35,8 +35,8 @@ class DiskPersistence:
 
         self.current_size = 0
         self.lock = trio.Lock()
-        self.access_log = []  # Heap: (timestamp, path, size)
-        self.access_map = {}  # Map: {path: latest_timestamp}
+        self.access_log: list[Tuple[float, str, int]] = []  # Heap: (now, cache_path, bytes_written)
+        self.access_map: dict[str, float] = {}  # {cache_path: latest_use_timestamp}
 
     async def run_services(self, nursery):
         """Starts background maintenance and discovery."""
@@ -51,6 +51,7 @@ class DiskPersistence:
         shard_dir = os.path.join(self.cache_dir, shard1, shard2)
         os.makedirs(shard_dir, exist_ok=True)
         mtime_ms = int(mtime * 1000)
+        # the cache_path
         return os.path.join(
             shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin"
         )
@@ -65,18 +66,18 @@ class DiskPersistence:
         """Synchronous recursive walk to rebuild state."""
         for root, _, files in os.walk(self.cache_dir):
             for f in files:
-                path = os.path.join(root, f)
+                cache_path = os.path.join(root, f)
                 try:
-                    stat = os.stat(path)
+                    stat = os.stat(cache_path)
 
                     if f.endswith(".tmp"):
                         if stat.st_mtime < self.start_time:
-                            os.remove(path)
+                            os.remove(cache_path)
                         continue
 
                     self.current_size += stat.st_size
-                    self.access_map[path] = stat.st_atime
-                    heappush(self.access_log, (stat.st_atime, path, stat.st_size))
+                    self.access_map[cache_path] = stat.st_atime
+                    heappush(self.access_log, (stat.st_atime, cache_path, stat.st_size))
                 except OSError:
                     continue
 
@@ -87,29 +88,29 @@ class DiskPersistence:
         Retrieves a chunk from disk.
         Updates LRU access time BEFORE reading to prevent concurrent eviction.
         """
-        path = self._get_chunk_path(fs_path, chunk_index, mtime)
+        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime)
 
         # 1. OPTIMISTIC PROMOTION (Pinning)
         # Mark as accessed so GC doesn't delete it while we read.
         # Double-check pattern is not strictly needed here for safety,
         # but the lock is needed to update the map safely.
         async with self.lock:
-            if path in self.access_map:
-                self.access_map[path] = time.time()
+            if cache_path in self.access_map:
+                self.access_map[cache_path] = time.time()
 
         try:
             # 2. READ (Safe now)
-            data = await trio.to_thread.run_sync(self._read_file, path)
+            data = await trio.to_thread.run_sync(self._read_file, cache_path)
 
             # 3. SELF-HEALING
             # If file exists but wasn't in map (race condition or init miss)
-            if path not in self.access_map:
+            if cache_path not in self.access_map:
                 async with self.lock:
-                    if path not in self.access_map:
+                    if cache_path not in self.access_map:
                         self.current_size += len(data)
                         now = time.time()
-                        self.access_map[path] = now
-                        heappush(self.access_log, (now, path, len(data)))
+                        self.access_map[cache_path] = now
+                        heappush(self.access_log, (now, cache_path, len(data)))
 
             return data
 
@@ -128,8 +129,8 @@ class DiskPersistence:
         stream: AsyncGenerator[bytes, None],
     ):
         """Consumes a stream and writes it to disk. Returns the bytes written."""
-        path = self._get_chunk_path(fs_path, chunk_index, mtime)
-        temp_path = f"{path}.{os.getpid()}.tmp"
+        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime)
+        temp_path = f"{cache_path}.{os.getpid()}.tmp"
         result = bytearray()
         bytes_written = 0
         try:
@@ -141,7 +142,7 @@ class DiskPersistence:
                     result.extend(chunk)
 
             # Atomic Rename (No lock needed)
-            await trio.to_thread.run_sync(os.rename, temp_path, path)
+            await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
 
             # 1. EVICT (Manages Lock Internally)
             await self.evict(bytes_written)
@@ -151,8 +152,8 @@ class DiskPersistence:
                 # If overwriting, logic could go here to subtract old size
                 self.current_size += bytes_written
                 now = time.time()
-                self.access_map[path] = now
-                heappush(self.access_log, (now, path, bytes_written))
+                self.access_map[cache_path] = now
+                heappush(self.access_log, (now, cache_path, bytes_written))
             return bytes(result)
         except Exception as e:
             if os.path.exists(temp_path):
