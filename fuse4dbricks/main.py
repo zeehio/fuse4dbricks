@@ -104,7 +104,7 @@ async def async_main():
     if args.auth_provider == "pat":
         auth_provider: AuthProvider = AccessTokenAuthProvider()
         if auth_provider.get_access_token():
-            logging.critical("Could not get personal access token from DATABICKS_TOKEN environment variable")
+            logging.critical("Could not get personal access token from DATABRICKS_TOKEN environment variable")
             sys.exit(1)
     else:
         keyring = LinuxKeyringManager(service_prefix="fuse4dbricks")

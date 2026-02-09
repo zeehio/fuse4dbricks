@@ -1,5 +1,5 @@
 import errno
-from typing import TYPE_CHECKING, Tuple
+from typing import Tuple
 
 import trio
 
@@ -11,9 +11,8 @@ except ImportError:
 from fuse4dbricks.fs.utils import (fs_to_uc_path, join_or_lead_request,
                                    notify_followers)
 
-if TYPE_CHECKING:
-    from fuse4dbricks.api.uc_client import UnityCatalogClient
-    from fuse4dbricks.storage.persistence import DiskPersistence
+from fuse4dbricks.api.uc_client import UnityCatalogClient
+from fuse4dbricks.storage.persistence import DiskPersistence
 
 
 class DataManager:
