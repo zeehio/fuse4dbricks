@@ -59,13 +59,13 @@ async def test_live_404_handling(live_client):
     """Valida que un path inexistente devuelva None o [] según corresponda."""
     try:
         # Metadatos de archivo fantasma -> None
-        meta = await live_client.get_file_metadata(
+        meta = await live_client._get_file_metadata(
             "/Volumes/main/default/non_existent/ghost.txt"
         )
         assert meta is None
 
         # Lista de carpeta fantasma -> []
-        contents = await live_client.list_directory_contents(
+        contents = await live_client._list_directory_contents(
             "/Volumes/main/default/non_existent_folder"
         )
         assert contents == []
