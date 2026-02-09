@@ -1,6 +1,6 @@
 import ctypes
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import patch
 
 # We need to patch ctypes.util.find_library and ctypes.CDLL BEFORE importing the module
 # to prevent it from crashing on non-Linux systems or containers missing libkeyutils.

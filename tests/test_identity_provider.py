@@ -1,6 +1,5 @@
 import time
 import pytest
-import threading
 from unittest.mock import MagicMock, patch
 from concurrent.futures import ThreadPoolExecutor
 

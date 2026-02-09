@@ -31,7 +31,7 @@ def uc_to_fs_path(uc_path: str) -> str:
         raise ValueError("Unexpected UC path format")
     if uc_path == "/Volumes":
         return "/"
-    parts = uc_path[len("/Volumes/") :].split("/")
+    parts = uc_path[len("/Volumes/"):].split("/")
     return "/" + "/".join(parts)
 
 

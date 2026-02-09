@@ -28,7 +28,7 @@ async def persistence(cache_dir):
 async def async_byte_generator(content: bytes, chunk_size: int = 10):
     """Helper to simulate an async stream from the network."""
     for i in range(0, len(content), chunk_size):
-        yield content[i : i + chunk_size]
+        yield content[i:(i + chunk_size)]
         await trio.sleep(0)  # Yield control to simulate network latency
 
 
