@@ -1,8 +1,10 @@
 """
 Core FUSE operations module.
 """
+
 import errno
 import logging
+
 try:
     import pyfuse3
 except ImportError:
@@ -14,16 +16,24 @@ from fuse4dbricks.fs.data_manager import DataManager
 
 logger = logging.getLogger(__name__)
 
+
 class UnityCatalogFS(pyfuse3.Operations):
-    def __init__(self, inode_manager: InodeManager, metadata_manager: MetadataManager, data_manager: DataManager):
+    def __init__(
+        self,
+        inode_manager: InodeManager,
+        metadata_manager: MetadataManager,
+        data_manager: DataManager,
+    ):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
         self.metadata_manager = metadata_manager
         self.data_manager = data_manager
-        self._readdir_state: dict[int,dict] = {}
+        self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
 
-    async def getattr(self, inode: int, ctx: pyfuse3.RequestContext) -> pyfuse3.EntryAttributes:
+    async def getattr(
+        self, inode: int, ctx: pyfuse3.RequestContext
+    ) -> pyfuse3.EntryAttributes:
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -38,12 +48,14 @@ class UnityCatalogFS(pyfuse3.Operations):
         except Exception:
             raise pyfuse3.FUSEError(errno.EIO)
 
-    async def lookup(self, parent_inode: int, name_b: bytes, ctx: pyfuse3.RequestContext) -> pyfuse3.EntryAttributes:
-        name = name_b.decode('utf-8')
+    async def lookup(
+        self, parent_inode: int, name_b: bytes, ctx: pyfuse3.RequestContext
+    ) -> pyfuse3.EntryAttributes:
+        name = name_b.decode("utf-8")
         parent_entry = self.inodes.get_entry(parent_inode)
         if not parent_entry:
             raise pyfuse3.FUSEError(errno.ENOENT)
-            
+
         # 1. Check Local Inodes
         if parent_entry.fs_path == "/":
             full_path = f"/{name}"
@@ -58,7 +70,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         found = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
         if found is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        (attr, is_dir) = found
+        attr, is_dir = found
         # 3. Create Inode
         entry = self.inodes.add_entry(parent_inode, name, is_dir, attr)
         return await self.getattr(entry.inode, ctx)
@@ -101,13 +113,13 @@ class UnityCatalogFS(pyfuse3.Operations):
             ret = pyfuse3.readdir_reply(token, b".", attr, 1)
             if not ret:
                 return
-        
+
         if start_id <= 1:
             p_attr = await self.getattr(entry.parent_inode, ctx)
             ret = pyfuse3.readdir_reply(token, b"..", p_attr, 2)
             if not ret:
                 return
-        
+
         # Get Children from Cache/API
         if start_id <= 2:
             items = await self.metadata_manager.list_directory(entry, ctx)
@@ -120,10 +132,10 @@ class UnityCatalogFS(pyfuse3.Operations):
         to_skip = min(0, start_id - 2)
         for i, child in enumerate(items[to_skip:]):
             child_entry = self.inodes.add_entry(
-                parent_inode = inode,
-                name = child.name,
-                is_dir = child.is_dir,
-                attr = child.attr,
+                parent_inode=inode,
+                name=child.name,
+                is_dir=child.is_dir,
+                attr=child.attr,
             )
             ret = pyfuse3.readdir_reply(
                 token,
@@ -166,7 +178,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO)
 
     async def forget(self, inode_list):
-        for (inode, nlookup) in inode_list:
+        for inode, nlookup in inode_list:
             self.inodes.forget(inode, nlookup)
 
     def _entry_to_fuse_attr(self, entry: InodeEntry) -> pyfuse3.EntryAttributes:
@@ -180,7 +192,6 @@ class UnityCatalogFS(pyfuse3.Operations):
         attr.st_ctime_ns = int(entry.attr.st_ctime * 1e9)
         attr.st_mtime_ns = int(entry.attr.st_mtime * 1e9)
         attr.st_ino = entry.inode
-        attr.st_blksize = 4096 
+        attr.st_blksize = 4096
         attr.st_blocks = (attr.st_size + 511) // 512
         return attr
-

@@ -5,6 +5,7 @@ Manages the mapping between Linux Inodes and Unity Catalog Paths.
 import stat
 import time
 import logging
+
 try:
     import pyfuse3
 except ImportError:
@@ -12,6 +13,7 @@ except ImportError:
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class InodeEntryAttr:
@@ -34,6 +36,7 @@ class InodeEntryAttr:
         self.st_uid = other.st_uid
         self.st_gid = other.st_gid
 
+
 @dataclass
 class InodeEntry:
     inode: int
@@ -45,6 +48,7 @@ class InodeEntry:
     attr: InodeEntryAttr
     ref_count: int = 0
     is_stale: bool = False
+
 
 class InodeManager:
     def __init__(self):
@@ -63,14 +67,14 @@ class InodeManager:
     def _create_root(self):
         now = time.time()
         root_attr = InodeEntryAttr(
-            st_mode = (stat.S_IFDIR | 0o755),
-            st_nlink = 2,
-            st_size = 4096,
-            st_ctime = now,
-            st_mtime = now,
-            st_atime = now,
-            st_uid = 0,
-            st_gid = 0,
+            st_mode=(stat.S_IFDIR | 0o755),
+            st_nlink=2,
+            st_size=4096,
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_uid=0,
+            st_gid=0,
         )
         entry = InodeEntry(
             inode=pyfuse3.ROOT_INODE,
@@ -79,16 +83,16 @@ class InodeManager:
             is_dir=True,
             fs_path="/",
             attr=root_attr,
-            ref_count=1
+            ref_count=1,
         )
         self._inode_map[pyfuse3.ROOT_INODE] = entry
         self._path_map["/"] = pyfuse3.ROOT_INODE
         self._children_map[pyfuse3.ROOT_INODE] = set()
 
-    def get_entry(self, inode: int) -> InodeEntry|None:
+    def get_entry(self, inode: int) -> InodeEntry | None:
         return self._inode_map.get(inode)
 
-    def get_inode_by_path(self, path: str) -> int|None:
+    def get_inode_by_path(self, path: str) -> int | None:
         return self._path_map.get(path)
 
     def _delete_inode_internal(self, inode: int):
@@ -120,7 +124,7 @@ class InodeManager:
 
         entry.is_stale = True
 
-        # do this now to let the fs reuse the path for another inode 
+        # do this now to let the fs reuse the path for another inode
         if entry.fs_path in self._path_map:
             if self._path_map[entry.fs_path] == inode:
                 del self._path_map[entry.fs_path]
@@ -128,7 +132,9 @@ class InodeManager:
         if entry.ref_count <= 0:
             self._delete_inode_internal(inode)
 
-    def add_entry(self, parent_inode: int, name: str, is_dir: bool, attr: InodeEntryAttr):
+    def add_entry(
+        self, parent_inode: int, name: str, is_dir: bool, attr: InodeEntryAttr
+    ):
         parent = self.get_entry(parent_inode)
         if not parent:
             raise ValueError(f"Parent inode {parent_inode} not found.")
@@ -148,7 +154,9 @@ class InodeManager:
                 return existing_entry
             # path changed fron dir to file or viceversa.
             # we need a new inode.
-            logger.debug(f"Type change detected for {fs_path} (Old Inode {existing_inode}). Pruning...")
+            logger.debug(
+                f"Type change detected for {fs_path} (Old Inode {existing_inode}). Pruning..."
+            )
 
             self._prune_subtree(existing_inode)
 
@@ -156,12 +164,12 @@ class InodeManager:
         self._next_inode += 1
 
         entry = InodeEntry(
-            inode = inode,
-            parent_inode = parent_inode,
-            name = name,
-            is_dir = is_dir,
-            fs_path = fs_path,
-            attr = attr
+            inode=inode,
+            parent_inode=parent_inode,
+            name=name,
+            is_dir=is_dir,
+            fs_path=fs_path,
+            attr=attr,
         )
         self._inode_map[inode] = entry
         self._path_map[fs_path] = inode
@@ -180,7 +188,6 @@ class InodeManager:
             self._delete_inode_internal(inode)
 
     def increment_lookup_count(self, inode: int, count=1):
-        """ increments the reference counter that prevents inode deletion when the kernel asks to forget it
-        """
+        """increments the reference counter that prevents inode deletion when the kernel asks to forget it"""
         if inode in self._inode_map:
             self._inode_map[inode].ref_count += count
