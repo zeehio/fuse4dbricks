@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--workspace", default="", help="https://adb-xxxx.azuredatabricks.net"
     )
-    parser.add_argument("--auth-provider", default="pat", const="auto", nargs="?", help="Auth provider", choices=["pat", "device"])
+    parser.add_argument("--auth-provider", default="pat", const="pat", nargs="?", help="Auth provider", choices=["pat", "device"])
     parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)")
     parser.add_argument(
         "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID (required for device auth)"
@@ -103,7 +103,7 @@ async def async_main():
     logging.info("Initializing Authentication...")
     if args.auth_provider == "pat":
         auth_provider: AuthProvider = AccessTokenAuthProvider()
-        if auth_provider.get_access_token():
+        if auth_provider.get_access_token() is None:
             logging.critical("Could not get personal access token from DATABRICKS_TOKEN environment variable")
             sys.exit(1)
     else:
