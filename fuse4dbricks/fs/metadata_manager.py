@@ -270,13 +270,12 @@ class MetadataManager:
                     )
                 )
                 # read ahead: Cache attributes of children to speed up subsequent getattr and lookups
-                async with self._cache_lock:
-                    await self._update_attr_cache(
-                        fs_path=uc_to_fs_path(uc_entry.uc_path),
-                        attr=attr,
-                        is_dir=uc_entry.is_dir(),
-                        ttl=self.get_ttl(uc_entry.entry_type),
-                    )
+                await self._update_attr_cache(
+                    fs_path=uc_to_fs_path(uc_entry.uc_path),
+                    attr=attr,
+                    is_dir=uc_entry.is_dir(),
+                    ttl=self.get_ttl(uc_entry.entry_type),
+                )
 
                 # Store Directory Listing
                 self._dir_cache[entry.fs_path] = (now + self._ttl, results)
