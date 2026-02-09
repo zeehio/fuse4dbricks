@@ -4,15 +4,39 @@ Thread-safe implementation using Double-Checked Locking.
 """
 
 import logging
+import os
 import threading
 import time
+from abc import ABC, abstractmethod
 
 import msal  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
+class AuthProvider(ABC):
+    @abstractmethod
+    def get_access_token(self, force_refresh: bool = False):
+        """
+        Abstract method to retrieve an access token.
+        :param force_refresh: If True, forces a token refresh.
+        """
+        pass
 
-class EntraIDAuthProvider:
+class AccessTokenAuthProvider(AuthProvider):
+    def __init__(self, access_token: str | None = None):
+        if access_token is None:
+            access_token = self._fetch_access_token()
+        self._access_token = access_token
+
+    def get_access_token(self, force_refresh: bool = False):
+        return self._access_token
+
+    def _fetch_access_token(self) -> str|None:
+        token = os.getenv("DATABRICKS_TOKEN")
+        return token
+
+
+class EntraIDAuthProvider(AuthProvider):
     """
     Handles OAuth2 Device Code Flow and silent token refreshment.
     """
