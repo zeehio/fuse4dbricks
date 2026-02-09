@@ -114,10 +114,10 @@ class DiskPersistence:
             return f.read()
 
     async def store_chunk_from_stream(self, fs_path: str, chunk_index: int, mtime: float, stream: AsyncGenerator[bytes, None]):
-        """Consumes a stream and writes it to disk."""
+        """Consumes a stream and writes it to disk. Returns the bytes written."""
         path = self._get_chunk_path(fs_path, chunk_index, mtime)
         temp_path = f"{path}.{os.getpid()}.tmp"
-        
+        result = bytearray()
         bytes_written = 0
         try:
             # Write to .tmp (No lock needed)
@@ -125,6 +125,7 @@ class DiskPersistence:
                 async for chunk in stream:
                     await f.write(chunk)
                     bytes_written += len(chunk)
+                    result.extend(chunk)
             
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, path)
@@ -139,7 +140,7 @@ class DiskPersistence:
                 now = time.time()
                 self.access_map[path] = now
                 heappush(self.access_log, (now, path, bytes_written))
-                
+            return bytes(result)
         except Exception as e:
             if os.path.exists(temp_path):
                 await trio.to_thread.run_sync(os.remove, temp_path)
