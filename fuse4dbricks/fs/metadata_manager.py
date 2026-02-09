@@ -230,6 +230,7 @@ class MetadataManager:
         """
         Returns a list of children for a given entry.
         """
+        logger.debug(f"metadata_manager.list_directory for {entry.fs_path}")
         # 1. Fast Check
         async with self._cache_lock:
             cached = self._get_valid_cache(self._dir_cache, entry.fs_path)
@@ -277,11 +278,14 @@ class MetadataManager:
                     ttl=self.get_ttl(uc_entry.entry_type),
                 )
 
-                # Store Directory Listing
+            # Store Directory Listing
+            async with self._cache_lock:
                 self._dir_cache[entry.fs_path] = (now + self._ttl, results)
             return results
         except Exception as e:
+            import traceback
             logger.error(f"List directory failed for {entry.fs_path}: {e}")
+            print(traceback.format_exc())
             return None
         finally:
             await notify_followers(
