@@ -228,7 +228,7 @@ class UnityCatalogClient:
         self, catalog_name, schema_name, volume_name
     ) -> UnityCatalogEntry | None:
         endpoint = (
-            f"/api/2.1/unity-catalog/schemas/{catalog_name}.{schema_name}.{volume_name}"
+            f"/api/2.1/unity-catalog/volumes/{catalog_name}.{schema_name}.{volume_name}"
         )
         volume = await self._request("GET", endpoint)
         if not volume:
