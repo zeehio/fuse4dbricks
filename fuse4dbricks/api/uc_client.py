@@ -29,16 +29,6 @@ class UcNodeType(Enum):
     FILE = 5
 
 
-UC_NODE_IS_DIR = {
-    UcNodeType.ROOT: True,
-    UcNodeType.CATALOG: True,
-    UcNodeType.SCHEMA: True,
-    UcNodeType.VOLUME: True,
-    UcNodeType.DIRECTORY: True,
-    UcNodeType.FILE: False,
-}
-
-
 @dataclass
 class UnityCatalogEntry:
     name: str
@@ -50,6 +40,14 @@ class UnityCatalogEntry:
     mtime: float | None = None
 
     def is_dir(self):
+        UC_NODE_IS_DIR = {
+            UcNodeType.ROOT: True,
+            UcNodeType.CATALOG: True,
+            UcNodeType.SCHEMA: True,
+            UcNodeType.VOLUME: True,
+            UcNodeType.DIRECTORY: True,
+            UcNodeType.FILE: False,
+        }
         return UC_NODE_IS_DIR[self.entry_type]
 
 

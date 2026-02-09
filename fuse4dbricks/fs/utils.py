@@ -1,5 +1,5 @@
 import trio
-
+from typing import TypeVar
 
 def fs_to_uc_path(fs_path: str):
     """
@@ -34,11 +34,12 @@ def uc_to_fs_path(uc_path: str) -> str:
     parts = uc_path[len("/Volumes/"):].split("/")
     return "/" + "/".join(parts)
 
+_InflightKey = TypeVar("_InflightKey")
 
 async def join_or_lead_request(
     lock: trio.Lock,
-    inflight_dict: dict[str, trio.Event],
-    key: str,
+    inflight_dict: dict[_InflightKey, trio.Event],
+    key: _InflightKey,
 ) -> trio.Event | None:
     """
     Helper for Request Coalescing.
@@ -53,7 +54,7 @@ async def join_or_lead_request(
 
 
 async def notify_followers(
-    lock: trio.Lock, inflight_dict: dict[str, trio.Event], key: str
+    lock: trio.Lock, inflight_dict: dict[_InflightKey, trio.Event], key: _InflightKey
 ):
     """Wake up waiting threads and cleanup."""
     async with lock:

@@ -238,7 +238,7 @@ class MetadataManager:
                 return cached
 
         # 2. Coalescing
-        wait_event = join_or_lead_request(
+        wait_event = await join_or_lead_request(
             self._inflight_lock, self._inflight_dir, entry.fs_path
         )
 

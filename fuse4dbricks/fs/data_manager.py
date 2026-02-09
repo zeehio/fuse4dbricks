@@ -1,5 +1,4 @@
 import errno
-import hashlib
 from typing import TYPE_CHECKING, Tuple
 
 import trio
@@ -7,7 +6,7 @@ import trio
 try:
     import pyfuse3
 except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3
+    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
 from fuse4dbricks.fs.utils import (fs_to_uc_path, join_or_lead_request,
                                    notify_followers)
@@ -60,7 +59,7 @@ class DataManager:
             chunk = await self.persistence.store_chunk_from_stream(
                 fs_path=fs_path,
                 chunk_index=chunk_id,
-                mti=mtime,
+                mtime=mtime,
                 stream=stream,
             )
         finally:
