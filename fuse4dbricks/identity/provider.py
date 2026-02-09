@@ -3,10 +3,11 @@ Authentication provider for Azure Databricks using Microsoft Entra ID.
 Thread-safe implementation using Double-Checked Locking.
 """
 
-import time
-import msal  # type: ignore[import-untyped]
 import logging
 import threading
+import time
+
+import msal  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 

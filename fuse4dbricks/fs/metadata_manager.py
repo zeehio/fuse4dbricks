@@ -4,27 +4,25 @@ Handles attribute caching, directory listings, and request coalescing to minimiz
 """
 
 import errno
-import time
-import trio
 import logging
 import stat
-from typing import Tuple, TypeVar
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Tuple, TypeVar
+
+import trio
 
 try:
     import pyfuse3
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
+from fuse4dbricks.api.uc_client import (UcNodeType, UnityCatalogClient,
+                                        UnityCatalogEntry)
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
-from fuse4dbricks.api.uc_client import UnityCatalogClient, UnityCatalogEntry, UcNodeType
-from fuse4dbricks.fs.utils import (
-    fs_to_uc_path,
-    uc_to_fs_path,
-    join_or_lead_request,
-    notify_followers,
-)
+from fuse4dbricks.fs.utils import (fs_to_uc_path, join_or_lead_request,
+                                   notify_followers, uc_to_fs_path)
 
 logger = logging.getLogger(__name__)
 

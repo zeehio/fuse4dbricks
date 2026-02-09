@@ -3,14 +3,15 @@ Disk Persistence Layer for FUSE.
 Implements streaming writes, single-level sharding, and lazy LRU eviction.
 """
 
-import os
-import time
 import hashlib
 import logging
-import trio
+import os
 import shutil
-from heapq import heappush, heappop
+import time
+from heapq import heappop, heappush
 from typing import AsyncGenerator
+
+import trio
 
 logger = logging.getLogger(__name__)
 

@@ -1,7 +1,8 @@
 import time
-import pytest
-from unittest.mock import MagicMock, patch
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from fuse4dbricks.identity.provider import EntraIDAuthProvider
 

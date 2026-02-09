@@ -1,7 +1,8 @@
-import pytest
-import httpx
-from unittest.mock import MagicMock, AsyncMock
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import httpx
+import pytest
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 

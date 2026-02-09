@@ -2,14 +2,15 @@
 Manages the mapping between Linux Inodes and Unity Catalog Paths.
 """
 
+import logging
 import stat
 import time
-import logging
 
 try:
     import pyfuse3
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)

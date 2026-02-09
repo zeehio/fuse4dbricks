@@ -1,4 +1,5 @@
 import os
+
 import pytest
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient

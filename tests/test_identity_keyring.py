@@ -1,6 +1,7 @@
 import ctypes
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 # We need to patch ctypes.util.find_library and ctypes.CDLL BEFORE importing the module
 # to prevent it from crashing on non-Linux systems or containers missing libkeyutils.
