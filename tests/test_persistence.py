@@ -1,10 +1,11 @@
+import hashlib
 import os
-import time
 import shutil
+import time
+from unittest.mock import MagicMock, patch
+
 import pytest
 import trio
-import hashlib
-from unittest.mock import MagicMock, patch
 
 from fuse4dbricks.storage.persistence import DiskPersistence
 

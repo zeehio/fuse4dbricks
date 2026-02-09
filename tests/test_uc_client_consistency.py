@@ -1,9 +1,10 @@
-import pytest
-import respx
-import httpx
 from datetime import datetime, timezone
 from email.utils import formatdate
 from unittest.mock import MagicMock
+
+import httpx
+import pytest
+import respx
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 

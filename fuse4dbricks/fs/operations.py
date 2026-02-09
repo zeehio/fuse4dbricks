@@ -10,9 +10,9 @@ try:
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from fuse4dbricks.fs.inode_manager import InodeManager, InodeEntry
-from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.data_manager import DataManager
+from fuse4dbricks.fs.inode_manager import InodeEntry, InodeManager
+from fuse4dbricks.fs.metadata_manager import MetadataManager
 
 logger = logging.getLogger(__name__)
 

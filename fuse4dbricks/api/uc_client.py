@@ -3,16 +3,17 @@ Async client for Databricks Unity Catalog & Files API (v2.0).
 Handles pagination, robust authentication, and asynchronous streaming for FUSE.
 """
 
-import httpx
 import logging
 import os
 import urllib.parse
-from typing import AsyncGenerator
-from email.utils import formatdate, parsedate_to_datetime
 from dataclasses import dataclass
+from email.utils import formatdate, parsedate_to_datetime
+from enum import Enum
+from typing import AsyncGenerator
+
+import httpx
 
 from fuse4dbricks.identity.provider import EntraIDAuthProvider
-from enum import Enum
 
 logger = logging.getLogger(__name__)
 

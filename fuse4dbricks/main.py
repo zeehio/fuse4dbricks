@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+import argparse
+import logging
 import os
 import sys
-import logging
-import argparse
+
 import trio
 
 try:
@@ -10,14 +11,14 @@ try:
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from fuse4dbricks.identity.keyring_store import LinuxKeyringManager
-from fuse4dbricks.identity.provider import EntraIDAuthProvider
 from fuse4dbricks.api.uc_client import UnityCatalogClient
-from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
+from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
-from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
+from fuse4dbricks.identity.keyring_store import LinuxKeyringManager
+from fuse4dbricks.identity.provider import EntraIDAuthProvider
+from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 # Default Azure Databricks App ID (Standard Public Client)
 DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459"
