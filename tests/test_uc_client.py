@@ -92,7 +92,7 @@ async def test_get_file_metadata_parsing(client):
     }
     client.client.send.return_value = mock_response
 
-    meta = await client.get_file_metadata("/data.csv")
+    meta = await client._get_file_metadata("/data.csv")
 
     assert meta.size == 1024
     expected_dt = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -106,7 +106,7 @@ async def test_get_file_metadata_404(client):
     mock_response.status_code = 404
     client.client.send.return_value = mock_response
 
-    result = await client.get_file_metadata("/missing")
+    result = await client._get_file_metadata("/missing")
     assert result is None
 
 
