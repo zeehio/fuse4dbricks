@@ -66,13 +66,12 @@ class EntraIDAuthProvider(AuthProvider):
     # Static ID for Azure Databricks resource (Standard Azure Public Cloud)
     DATABRICKS_RESOURCE_ID = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
-    def __init__(self, tenant_id, client_id, keyring_manager):
+    def __init__(self, tenant_id, client_id):
         """
         :param tenant_id: Azure Tenant ID.
         :param client_id: Azure Application Client ID.
-        :param keyring_manager: Instance of LinuxKeyringManager.
         """
-        self.keyring = keyring_manager
+        self._refresh_token = ""
         self.scopes = [f"{self.DATABRICKS_RESOURCE_ID}/.default"]
         self.authority = f"https://login.microsoftonline.com/{tenant_id}"
 
@@ -140,7 +139,7 @@ class EntraIDAuthProvider(AuthProvider):
                 logger.warning(f"Silent refresh failed: {e}")
 
         # Check Keyring for persistent refresh token
-        refresh_token = self.keyring.get_refresh_token()
+        refresh_token = self._refresh_token
         if refresh_token:
             logger.info("Found refresh token in Keyring. Attempting exchange...")
             try:
@@ -191,4 +190,4 @@ class EntraIDAuthProvider(AuthProvider):
 
         # Persist the new refresh token in the keyring
         if "refresh_token" in msal_result:
-            self.keyring.save_refresh_token(msal_result["refresh_token"])
+            self._refresh_token = msal_result["refresh_token"]
