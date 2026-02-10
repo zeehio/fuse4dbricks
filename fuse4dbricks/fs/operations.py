@@ -30,6 +30,21 @@ class UnityCatalogFS(pyfuse3.Operations):
         self.data_manager = data_manager
         self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
+        self._open_fh_count = 0
+        self._open_state: dict[int, dict] = {}
+
+    async def _check_permissions(self, inode: int, mode: int, ctx):
+        entry = self.inodes.get_entry(inode)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        # Check permissions
+        if not await self.metadata_manager.check_access(entry, mode, ctx):
+            raise pyfuse3.FUSEError(errno.EACCES)
+        return  True
+
+
+    async def access(self, inode: int, mode: int, ctx: pyfuse3.RequestContext) -> bool:
+        return await self._check_permissions(inode, mode, ctx)
 
     async def getattr(
         self, inode: int, ctx: pyfuse3.RequestContext
@@ -51,6 +66,7 @@ class UnityCatalogFS(pyfuse3.Operations):
     async def lookup(
         self, parent_inode: int, name_b: bytes, ctx: pyfuse3.RequestContext
     ) -> pyfuse3.EntryAttributes:
+        await self._check_permissions(parent_inode, mode=4, ctx=ctx)  # R_OK
         name = name_b.decode("utf-8")
         parent_entry = self.inodes.get_entry(parent_inode)
         if not parent_entry:
@@ -76,6 +92,8 @@ class UnityCatalogFS(pyfuse3.Operations):
         return await self.getattr(entry.inode, ctx)
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
+        R_OK = 4
+        await self._check_permissions(inode, mode=R_OK, ctx=ctx)
         entry = self.inodes.get_entry(inode)
         if not entry:
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -84,7 +102,6 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
 
         fh = self._readdir_fh_count
-        # Here I assume integers are infinite
         self._readdir_fh_count += 1
         self._readdir_state[fh] = {
             "inode": inode,
@@ -150,18 +167,44 @@ class UnityCatalogFS(pyfuse3.Operations):
                 return
 
     async def open(self, inode, flags, ctx):
+        R_OK = 4
+        W_OK = 2
+        O_RDWR = 2
+        O_WRONLY = 1
+        #O_RDONLY = 0
+        if flags & O_RDWR:
+            required_mode = R_OK | W_OK
+        elif flags & O_WRONLY:
+            required_mode = W_OK
+        else:
+            required_mode = R_OK
+        if not await self._check_permissions(inode, required_mode, ctx):
+            raise pyfuse3.FUSEError(errno.EACCES)
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
-        # inode manager increment refcount? increment_lookup_count
-        fileinfo = pyfuse3.FileInfo()
-        fileinfo.fh = inode
-        return fileinfo
+        fh = self._open_fh_count
+        self._open_fh_count += 1
+        self._open_state[fh] = {
+            "inode": inode,
+            "ctx": ctx,
+        }
+        return pyfuse3.FileInfo(fh=fh)
+
+    async def close(self, fh: pyfuse3.FileHandleT) -> None:
+        if fh in self._open_state:
+            del self._open_state[fh]
 
     async def read(self, fh, offset, length):
-        entry = self.inodes.get_entry(fh)
+        if fh not in self._open_state:
+            raise pyfuse3.FUSEError(errno.EIO)
+
+        inode = self._open_state[fh]["inode"]
+        ctx = self._open_state[fh]["ctx"]
+
+        entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
@@ -173,6 +216,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                 length,
                 entry.attr.st_mtime,
                 entry.attr.st_size,
+                ctx_uid=ctx.uid,
             )
         except Exception as e:
             logger.error(f"Read error reading {entry.fs_path}: {e}")

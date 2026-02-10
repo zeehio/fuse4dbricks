@@ -4,37 +4,59 @@ Thread-safe implementation using Double-Checked Locking.
 """
 
 import logging
-import os
 import threading
 import time
 from abc import ABC, abstractmethod
 
 import msal  # type: ignore[import-untyped]
+import pyfuse3
+import errno
+
 
 logger = logging.getLogger(__name__)
 
 class AuthProvider(ABC):
     @abstractmethod
-    def get_access_token(self, force_refresh: bool = False):
+    def get_access_token(self, ctx_uid: int, force_refresh: bool = False):
         """
         Abstract method to retrieve an access token.
         :param force_refresh: If True, forces a token refresh.
         """
         pass
 
+    @abstractmethod
+    def get_principal(self, ctx_uid: int) -> str:
+        # get the principal for a uid
+        pass
+
+    @abstractmethod
+    def set_credentials(self, ctx_uid: int, *, principal: str|None = None, access_token: str|None=None):
+        pass
+
 class AccessTokenAuthProvider(AuthProvider):
-    def __init__(self, access_token: str | None = None):
-        if access_token is None:
-            access_token = self._fetch_access_token()
-        self._access_token = access_token
+    def __init__(self):
+        self._uid_to_principal: dict[int, str] = {}
+        "uid -> principal"
+        self._uid_to_access_token: dict[int, str] = {}
+        "uid -> access_token"
 
-    def get_access_token(self, force_refresh: bool = False):
-        return self._access_token
+    def get_access_token(self, ctx_uid: int, force_refresh: bool = False) -> str:
+        try:
+            return self._uid_to_access_token[ctx_uid]
+        except KeyError as exc:
+            raise pyfuse3.FUSEError(errno.EACCES) from exc
 
-    def _fetch_access_token(self) -> str|None:
-        token = os.getenv("DATABRICKS_TOKEN")
-        return token
+    def get_principal(self, ctx_uid: int) -> str:
+        try:
+            return self._uid_to_principal[ctx_uid]
+        except KeyError as exc:
+            raise pyfuse3.FUSEError(errno.EACCES) from exc
 
+    def set_credentials(self, ctx_uid: int, *, principal: str|None = None, access_token: str|None = None):
+        if principal is not None:
+            self._uid_to_principal[ctx_uid] = principal
+        if access_token is not None:
+            self._uid_to_access_token[ctx_uid] = access_token
 
 class EntraIDAuthProvider(AuthProvider):
     """
@@ -62,7 +84,7 @@ class EntraIDAuthProvider(AuthProvider):
         # Lock to prevent race conditions during token refresh
         self._lock = threading.Lock()
 
-    def get_access_token(self, force_refresh=False):
+    def get_access_token(self, ctx_uid: int, force_refresh=False):
         """
         Main entry point to get a valid token. Thread-safe.
         """
