@@ -21,7 +21,8 @@ except ImportError:
 from fuse4dbricks.api.uc_client import (UcNodeType, UnityCatalogClient,
                                         UnityCatalogEntry)
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
-from fuse4dbricks.fs.utils import (fs_to_uc_path, join_or_lead_request,
+from fuse4dbricks.fs.utils import (fs_to_uc_path,  fs_to_securable,
+                                   join_or_lead_request,
                                    notify_followers, uc_to_fs_path)
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,23 @@ class MetadataManager:
     # Public API
     # =========================================================================
 
+    async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
+        #R_OK = 4
+        W_OK = 2
+        if (mode & W_OK):
+            raise pyfuse3.FUSEError(errno.EACCES)
+        (securable, securable_type) = fs_to_securable(entry.fs_path)
+        if securable == "":
+            return True
+        if securable_type == "catalog":
+            req_privileges = ["USE_CATALOG"]
+        elif securable_type == "schema":
+            req_privileges = ["USE_SCHEMA"]
+        elif securable_type == "volume":
+            req_privileges = ["READ_VOLUME"]
+        permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, ctx_uid=ctx.uid)
+        return permissions_fullfilled
+
     async def get_attributes(self, entry: InodeEntry, ctx) -> InodeEntryAttr | None:
         """
         Retrieves attributes for an entry.
@@ -189,7 +207,7 @@ class MetadataManager:
         # 3. Real API Lookup
         try:
             uc_path = fs_to_uc_path(child_fs_path)
-            uc_entry = await self.uc_client.get_path_metadata(uc_path)
+            uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx_uid=ctx.uid)
             if uc_entry is None:
                 # Not found (negative cache could be implemented here if desired)
                 return None
@@ -253,7 +271,7 @@ class MetadataManager:
         try:
             # Fetch raw metadata (size, mtime, etc.) along with names
             uc_path = fs_to_uc_path(entry.fs_path)
-            uc_entries = await self.uc_client.get_path_contents(uc_path)
+            uc_entries = await self.uc_client.get_path_contents(uc_path, ctx_uid=ctx.uid)
             if (
                 uc_entries is None
             ):  # May this happen because of any other reason as not a directory?
@@ -353,7 +371,9 @@ class MetadataManager:
         # Refresh
         uc_path = fs_to_uc_path(entry.fs_path)
         uc_entry = await self.uc_client.get_path_metadata(
-            uc_path, expected_type=node_type
+            uc_path,
+            ctx_uid=ctx.uid,
+            expected_type=node_type
         )
         if uc_entry is None:
             # Not found, was probably deleted. Invalidate cache to trigger ENOENT on next access.

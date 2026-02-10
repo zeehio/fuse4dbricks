@@ -1,5 +1,19 @@
 import trio
-from typing import TypeVar
+from typing import TypeVar, Tuple
+
+def fs_to_securable(fs_path: str) -> Tuple[str, str]:
+    
+    parts = fs_path.strip("/").split("/")
+    catalog = parts[0]
+    if len(parts) == 1:
+        if catalog == "":
+            return (catalog, "root")
+        return (catalog, "catalog")
+    schema = parts[1]
+    if len(parts) == 2:
+        return (f"{catalog}.{schema}", "schema")
+    volume = parts[2]
+    return (f"{catalog}.{schema}.{volume}", "volume")
 
 def fs_to_uc_path(fs_path: str):
     """

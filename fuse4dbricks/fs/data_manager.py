@@ -25,7 +25,8 @@ class DataManager:
         self._inflight_lock = trio.Lock()
 
     async def _read_chunk(
-        self, fs_path: str, chunk_id: int, mtime: float, chunk_size: int, out_dict
+        self, fs_path: str, chunk_id: int, mtime: float, chunk_size: int, 
+        ctx_uid: int, out_dict
     ):
         # get chunk from ram? no need, the kernel file cache does that already :)
         # get chunk from disk
@@ -53,6 +54,7 @@ class DataManager:
                 path=uc_path,
                 offset=offset,
                 length=length,
+                ctx_uid=ctx_uid,
                 if_unmodified_since=mtime,
             )
             chunk = await self.persistence.store_chunk_from_stream(
@@ -71,7 +73,8 @@ class DataManager:
         out_dict[chunk_id] = chunk
 
     async def read(
-        self, fs_path: str, offset: int, length: int, mtime: float, file_size: int
+        self, fs_path: str, offset: int, length: int, mtime: float, file_size: int,
+        ctx_uid: int
     ) -> bytes:
         """
         Reads file contents
@@ -101,7 +104,7 @@ class DataManager:
                 else:
                     chunk_size = self.chunk_size
                 nursery.start_soon(
-                    self._read_chunk, fs_path, chunk_id, mtime, chunk_size, chunks
+                    self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks
                 )
         # Assemble chunks
         result = bytearray()

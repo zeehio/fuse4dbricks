@@ -16,8 +16,7 @@ from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
-from fuse4dbricks.identity.keyring_store import LinuxKeyringManager
-from fuse4dbricks.identity.provider import EntraIDAuthProvider, AccessTokenAuthProvider, AuthProvider
+from fuse4dbricks.identity.provider import AccessTokenAuthProvider, AuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 # Default Azure Databricks App ID (Standard Public Client)
@@ -58,7 +57,7 @@ def setup_logging(debug_mode):
 
 
 async def start_fuse(ops, mountpoint, debug_mode):
-    mount_options = ["ro", "fsname=fuse4dbricks", "noatime", "default_permissions"]
+    mount_options = ["ro", "fsname=fuse4dbricks", "noatime"]
     if debug_mode:
         mount_options.append("debug")
 
@@ -101,24 +100,30 @@ async def async_main():
 
     # Auth
     logging.info("Initializing Authentication...")
-    if args.auth_provider == "pat":
-        auth_provider: AuthProvider = AccessTokenAuthProvider()
-        if auth_provider.get_access_token() is None:
-            logging.critical("Could not get personal access token from DATABRICKS_TOKEN environment variable")
-            sys.exit(1)
-    else:
-        keyring = LinuxKeyringManager(service_prefix="fuse4dbricks")
-        auth_provider = EntraIDAuthProvider(args.tenant_id, args.client_id, keyring)
+    auth_provider: AuthProvider = AccessTokenAuthProvider()
+    # Init Components
+    uc_client = UnityCatalogClient(workspace, auth_provider)
 
+    # FIXME: Provide uid->access_token via fake file write
+    # This should be set dynamically via writing to some fake file
+    # using:
+    # echo "dbapi...." > /Volumes/.access_token
+    # Or even use:
+    # cat /Volumes/.login
+    # to trigger a device oauth flow
+    token = os.getenv("DATABRICKS_TOKEN")
+    uid = os.getuid()
+    auth_provider.set_credentials(ctx_uid = uid, access_token = token)
+    principal = await uc_client.get_current_user_info(uid)
+    auth_provider.set_credentials(ctx_uid = uid, principal=principal)
     try:
-        auth_provider.get_access_token()
+        # TODO: Once we support multiple access tokens this check won't be here
+        auth_provider.get_access_token(ctx_uid=uid)
         logging.info("Authentication successful.")
     except Exception as e:
         logging.critical(f"Authentication failed: {e}")
         sys.exit(1)
 
-    # Init Components
-    uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(cache_dir, max_size_gb=10, max_age_days=30)
 
     inode_manager = InodeManager()
