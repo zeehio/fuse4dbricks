@@ -37,19 +37,25 @@ class InodeEntryAttr:
         self.st_uid = other.st_uid
         self.st_gid = other.st_gid
 
+    @property
+    def is_dir(self):
+        return self.st_mode & stat.S_IFDIR == stat.S_IFDIR
+
 
 @dataclass
 class InodeEntry:
     inode: int
     parent_inode: int
     name: str
-    is_dir: bool
     fs_path: str
     "The filesystem path /catalog/schema/volume/folder/file..."
     attr: InodeEntryAttr
     ref_count: int = 0
     is_stale: bool = False
 
+    @property
+    def is_dir(self):
+        return self.attr.is_dir
 
 class InodeManager:
     def __init__(self):
@@ -81,7 +87,6 @@ class InodeManager:
             inode=pyfuse3.ROOT_INODE,
             parent_inode=pyfuse3.ROOT_INODE,
             name="/",
-            is_dir=True,
             fs_path="/",
             attr=root_attr,
             ref_count=1,
@@ -134,7 +139,7 @@ class InodeManager:
             self._delete_inode_internal(inode)
 
     def add_entry(
-        self, parent_inode: int, name: str, is_dir: bool, attr: InodeEntryAttr
+        self, parent_inode: int, name: str, attr: InodeEntryAttr
     ):
         parent = self.get_entry(parent_inode)
         if not parent:
@@ -149,7 +154,7 @@ class InodeManager:
             existing_inode = self._path_map[fs_path]
             existing_entry = self._inode_map[existing_inode]
 
-            if existing_entry.is_dir == is_dir:
+            if existing_entry.is_dir == attr.is_dir:
                 if attr is not None:
                     existing_entry.attr.update(attr)
                 return existing_entry
@@ -168,7 +173,6 @@ class InodeManager:
             inode=inode,
             parent_inode=parent_inode,
             name=name,
-            is_dir=is_dir,
             fs_path=fs_path,
             attr=attr,
         )

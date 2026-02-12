@@ -89,7 +89,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         attr, is_dir = found
         # 3. Create Inode
-        entry = self.inodes.add_entry(parent_inode, name, is_dir, attr)
+        entry = self.inodes.add_entry(parent_inode, name, attr)
         return await self.getattr(entry.inode, ctx)
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
@@ -153,7 +153,6 @@ class UnityCatalogFS(pyfuse3.Operations):
             child_entry = self.inodes.add_entry(
                 parent_inode=inode,
                 name=name,
-                is_dir=(attr.st_mode & stat.S_IFDIR) == stat.S_IFDIR,
                 attr=attr,
             )
             ret = pyfuse3.readdir_reply(
