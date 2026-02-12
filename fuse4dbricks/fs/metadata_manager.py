@@ -54,7 +54,7 @@ class MetadataManager:
     def __init__(
         self,
         uc_client: UnityCatalogClient,
-        ttl=30.0,
+        ttl: float=30.0,
         max_entries=20000,
         ttl_catalog=600.0,
     ):
@@ -64,7 +64,7 @@ class MetadataManager:
         :param max_entries: Maximum number of metadata entries to keep in RAM.
         """
         self.uc_client = uc_client
-        self._ttl = ttl
+        self._ttl: float = ttl
         self._ttl_catalog = ttl_catalog
         self.max_entries = max_entries
 
