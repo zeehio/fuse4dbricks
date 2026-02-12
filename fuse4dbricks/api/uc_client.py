@@ -363,7 +363,7 @@ class UnityCatalogClient:
     async def _list_directory_contents(
         self, path, *, ctx_uid: int, limit=None
     ) -> list[UnityCatalogEntry] | None:
-        """Lists directory contents."""
+        """Lists directory contents, or None if not a directory"""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
 
