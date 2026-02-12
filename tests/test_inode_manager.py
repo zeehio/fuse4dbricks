@@ -63,7 +63,6 @@ def test_add_catalog_entry(manager, dir_entry_attr):
     entry = manager.add_entry(
         parent_inode=pyfuse3.ROOT_INODE,
         name="my_catalog",
-        is_dir=True,
         attr=dir_entry_attr,
     )
 
@@ -82,15 +81,15 @@ def test_deep_path_construction(manager, dir_entry_attr):
     """Verify full_path is constructed correctly for nested items."""
     # 1. Create Catalog
     cat = manager.add_entry(
-        pyfuse3.ROOT_INODE, "cat1", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "cat1", attr=dir_entry_attr
     )
 
     # 2. Create Schema
-    sch = manager.add_entry(cat.inode, "sch1", is_dir=True, attr=dir_entry_attr)
+    sch = manager.add_entry(cat.inode, "sch1", attr=dir_entry_attr)
     assert sch.fs_path == "/cat1/sch1"
 
     # 3. Create Volume
-    vol = manager.add_entry(sch.inode, "vol1", is_dir=True, attr=dir_entry_attr)
+    vol = manager.add_entry(sch.inode, "vol1", attr=dir_entry_attr)
     assert vol.fs_path == "/cat1/sch1/vol1"
 
 
@@ -98,9 +97,9 @@ def test_lookup_by_path(manager, dir_entry_attr):
     """Test retrieving an inode using its string path."""
     # Setup
     cat = manager.add_entry(
-        pyfuse3.ROOT_INODE, "finance", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "finance", attr=dir_entry_attr
     )
-    sch = manager.add_entry(cat.inode, "reports", is_dir=True, attr=dir_entry_attr)
+    sch = manager.add_entry(cat.inode, "reports", attr=dir_entry_attr)
 
     # Action
     found_inode = manager.get_inode_by_path("/finance/reports")
@@ -113,7 +112,7 @@ def test_lookup_by_path(manager, dir_entry_attr):
 def test_forget_logic(manager, dir_entry_attr):
     """Test reference counting and eviction."""
     entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "temp", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "temp", attr=dir_entry_attr
     )
     inode = entry.inode
 
@@ -129,10 +128,10 @@ def test_forget_logic(manager, dir_entry_attr):
 def test_duplicate_add_returns_existing(manager, dir_entry_attr):
     """Adding the same entry twice should return the same inode."""
     entry1 = manager.add_entry(
-        pyfuse3.ROOT_INODE, "shared", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "shared", attr=dir_entry_attr
     )
     entry2 = manager.add_entry(
-        pyfuse3.ROOT_INODE, "shared", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "shared", attr=dir_entry_attr
     )
 
     assert entry1.inode == entry2.inode
@@ -143,23 +142,23 @@ def test_directory_vs_file_attributes(manager, dir_entry_attr, file_entry_attr):
     """Verify default attributes differ for directories and files."""
     # Directory (Catalog)
     d_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "d", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "d", attr=dir_entry_attr
     )
     assert d_entry.attr.st_mode & stat.S_IFDIR
     assert d_entry.attr.st_nlink == 2
 
     # Realistic file path:
     cat_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "c", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "c",  attr=dir_entry_attr
     )
     sch_entry = manager.add_entry(
-        cat_entry.inode, "s", is_dir=True, attr=dir_entry_attr
+        cat_entry.inode, "s", attr=dir_entry_attr
     )
     vol_entry = manager.add_entry(
-        sch_entry.inode, "v", is_dir=True, attr=dir_entry_attr
+        sch_entry.inode, "v", attr=dir_entry_attr
     )
     f_entry = manager.add_entry(
-        vol_entry.inode, "file.txt", is_dir=False, attr=file_entry_attr
+        vol_entry.inode, "file.txt", attr=file_entry_attr
     )
 
     assert f_entry.attr.st_mode & stat.S_IFREG
@@ -173,18 +172,18 @@ def test_idempotency_with_attribute_merge(manager, dir_entry_attr):
     """
     # Realistic file path:
     cat_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "c", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "c", attr=dir_entry_attr
     )
     sch_entry = manager.add_entry(
-        cat_entry.inode, "s", is_dir=True, attr=dir_entry_attr
+        cat_entry.inode, "s", attr=dir_entry_attr
     )
     vol_entry = manager.add_entry(
-        sch_entry.inode, "v", is_dir=True, attr=dir_entry_attr
+        sch_entry.inode, "v", attr=dir_entry_attr
     )
     # 1. Create a file with size 100
     f_attr = InodeEntryAttr(
-        st_mode=0,
-        st_nlink=2,
+        st_mode=(stat.S_IFREG | 0o644),
+        st_nlink=1,
         st_size=100,
         st_ctime=0,
         st_mtime=1000,
@@ -192,15 +191,15 @@ def test_idempotency_with_attribute_merge(manager, dir_entry_attr):
         st_uid=0,
         st_gid=0,
     )
-    entry_v1 = manager.add_entry(vol_entry.inode, "data.csv", is_dir=False, attr=f_attr)
+    entry_v1 = manager.add_entry(vol_entry.inode, "data.csv", attr=f_attr)
 
     assert entry_v1.attr.st_size == 100
     inode_id = entry_v1.inode
 
     # 2. Simulate readdir finding a newer version (size 200)
     f_attr_v2 = InodeEntryAttr(
-        st_mode=0,
-        st_nlink=2,
+        st_mode=(stat.S_IFREG | 0o644),
+        st_nlink=1,
         st_size=200,
         st_ctime=0,
         st_mtime=2000,
@@ -209,7 +208,7 @@ def test_idempotency_with_attribute_merge(manager, dir_entry_attr):
         st_gid=0,
     )
     entry_v2 = manager.add_entry(
-        vol_entry.inode, "data.csv", is_dir=False, attr=f_attr_v2
+        vol_entry.inode, "data.csv", attr=f_attr_v2
     )
 
     # Assertions
@@ -218,14 +217,14 @@ def test_idempotency_with_attribute_merge(manager, dir_entry_attr):
     assert entry_v2.attr.st_mtime == 2000
 
 
-def test_type_collision_creates_zombie(manager, dir_entry_attr):
+def test_type_collision_creates_zombie(manager, dir_entry_attr, file_entry_attr):
     """
     If a directory is replaced by a file, the old directory inode
     should become a 'Zombie' (stale) but remain in memory if ref_count > 0.
     """
     # 1. Create a directory and simulate Kernel holding it
     dir_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "workspace", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "workspace", attr=dir_entry_attr
     )
     manager.increment_lookup_count(dir_entry.inode)  # ref_count = 1
 
@@ -233,7 +232,7 @@ def test_type_collision_creates_zombie(manager, dir_entry_attr):
 
     # 2. Replace it with a file (Type Mismatch)
     file_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "workspace", is_dir=False, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "workspace", attr=file_entry_attr
     )
 
     # Assertions
@@ -256,12 +255,12 @@ def test_zombie_reaping_on_forget(manager, dir_entry_attr, file_entry_attr):
     """
     # Setup: Create zombie
     dir_entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "temp", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "temp", attr=dir_entry_attr
     )
     manager.increment_lookup_count(dir_entry.inode)  # ref=1
 
     # Overwrite to make it stale
-    manager.add_entry(pyfuse3.ROOT_INODE, "temp", is_dir=False, attr=file_entry_attr)
+    manager.add_entry(pyfuse3.ROOT_INODE, "temp", attr=file_entry_attr)
 
     # Confirm it still exists
     assert manager.get_entry(dir_entry.inode) is not None
@@ -279,9 +278,9 @@ def test_recursive_pruning(manager, dir_entry_attr, file_entry_attr):
     children as stale and free up the path map.
     """
     # 1. Build hierarchy: /catalog/schema/volume
-    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", is_dir=True, attr=dir_entry_attr)
-    sch = manager.add_entry(cat.inode, "sch", is_dir=True, attr=dir_entry_attr)
-    vol = manager.add_entry(sch.inode, "vol", is_dir=True, attr=dir_entry_attr)
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=dir_entry_attr)
+    sch = manager.add_entry(cat.inode, "sch", attr=dir_entry_attr)
+    vol = manager.add_entry(sch.inode, "vol", attr=dir_entry_attr)
 
     # 2. Hold reference to the deepest child (Volume)
     manager.increment_lookup_count(vol.inode)  # vol ref=1
@@ -289,7 +288,7 @@ def test_recursive_pruning(manager, dir_entry_attr, file_entry_attr):
     # 3. Replace the TOP level catalog with a file (drastic change)
     # This triggers _prune_subtree starting at 'cat'
     new_file = manager.add_entry(
-        pyfuse3.ROOT_INODE, "cat", is_dir=False, attr=file_entry_attr
+        pyfuse3.ROOT_INODE, "cat", attr=file_entry_attr
     )
 
     # Assertions
@@ -323,12 +322,12 @@ def test_path_construction_edge_cases(manager, dir_entry_attr):
 
     # If root.full_path is "/", constructing child shouldn't be "//child"
     child = manager.add_entry(
-        pyfuse3.ROOT_INODE, "child", is_dir=True, attr=dir_entry_attr
+        pyfuse3.ROOT_INODE, "child", attr=dir_entry_attr
     )
     assert child.fs_path == "/child"
 
     grandchild = manager.add_entry(
-        child.inode, "grand", is_dir=True, attr=dir_entry_attr
+        child.inode, "grand", attr=dir_entry_attr
     )
     assert grandchild.fs_path == "/child/grand"
 
@@ -339,7 +338,7 @@ def test_strict_garbage_collection(manager, file_entry_attr):
     even if they are not stale (Standard eviction).
     """
     entry = manager.add_entry(
-        pyfuse3.ROOT_INODE, "temp_file", is_dir=False, attr=file_entry_attr
+        pyfuse3.ROOT_INODE, "temp_file", attr=file_entry_attr
     )
     manager.increment_lookup_count(entry.inode)  # ref=1
 

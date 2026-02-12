@@ -4,7 +4,6 @@ Core FUSE operations module.
 
 import errno
 import logging
-import stat
 from itertools import islice
 try:
     import pyfuse3
@@ -84,10 +83,9 @@ class UnityCatalogFS(pyfuse3.Operations):
             return await self.getattr(existing, ctx=ctx)
 
         # 2. Ask Cache/API
-        found = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
-        if found is None:
+        attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        if attr is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        attr, is_dir = found
         # 3. Create Inode
         entry = self.inodes.add_entry(parent_inode, name, attr)
         return await self.getattr(entry.inode, ctx)

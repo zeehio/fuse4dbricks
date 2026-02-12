@@ -55,7 +55,7 @@ async def test_consistency_precondition_failed_with_respx(auth_mock):
         # Execution: Intentar descargar. El error debe saltar al iniciar el stream.
         with pytest.raises(httpx.HTTPStatusError) as excinfo:
             stream = client.download_chunk_stream(
-                file_path, offset=0, length=10, if_unmodified_since=t1_old.timestamp()
+                file_path, offset=0, length=10, ctx_uid=0, if_unmodified_since=t1_old.timestamp()
             )
             await consume_stream(stream)
 
@@ -85,7 +85,7 @@ async def test_consistency_success_with_respx(auth_mock):
 
         # Action: Consumir el stream
         stream = client.download_chunk_stream(
-            file_path, offset=0, length=15, if_unmodified_since=t_now.timestamp()
+            file_path, offset=0, length=15, ctx_uid=0, if_unmodified_since=t_now.timestamp()
         )
         data = await consume_stream(stream)
 
@@ -113,7 +113,7 @@ async def test_download_without_conditional_header(auth_mock):
             return_value=httpx.Response(200, content=b"just data")
         )
 
-        stream = client.download_chunk_stream(file_path, 0, 9)
+        stream = client.download_chunk_stream(file_path, 0, 9, ctx_uid=0)
         data = await consume_stream(stream)
 
         sent_request = respx_mock.calls.last.request
