@@ -161,7 +161,7 @@ class MetadataManager:
 
     async def lookup_child(
         self, parent_entry: InodeEntry, name: str, ctx
-    ) -> Tuple[InodeEntryAttr, bool] | None:
+    ) -> InodeEntryAttr | None:
         """
         Efficiently checks if a specific child exists without listing the whole parent.
         Returns: attributes_dict
@@ -179,7 +179,7 @@ class MetadataManager:
                     self._attr_cache, (child_fs_path, is_dir)
                 )
                 if cached:
-                    return (cached, is_dir)
+                    return cached
 
         # 2. Coalescing (Reuse attr inflight tracker)
         wait_event = await join_or_lead_request(
@@ -194,7 +194,7 @@ class MetadataManager:
                         self._attr_cache, (child_fs_path, is_dir)
                     )
                     if cached:
-                        return (cached, is_dir)
+                        return cached
 
         # 3. Real API Lookup
         try:
@@ -208,7 +208,7 @@ class MetadataManager:
             await self._update_attr_cache(
                 child_fs_path, attr, is_dir, ttl=self.get_ttl(uc_entry.entry_type)
             )
-            return (attr, is_dir)
+            return attr
         finally:
             await notify_followers(
                 self._inflight_lock, self._inflight_attr, child_fs_path

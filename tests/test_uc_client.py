@@ -43,10 +43,10 @@ async def test_request_success_200(client, mock_auth_provider):
     mock_response.json.return_value = {"key": "value"}
     client.client.send.return_value = mock_response
 
-    result = await client._request("GET", "/test")
+    result = await client._request("GET", "/test", ctx_uid=0)
 
     assert result == {"key": "value"}
-    mock_auth_provider.get_access_token.assert_called_with()
+    mock_auth_provider.get_access_token.assert_called_with(ctx_uid=0)
 
     # Verify headers
     call_kwargs = client.client.build_request.call_args[1]
@@ -65,11 +65,11 @@ async def test_request_401_retry_success(client, mock_auth_provider):
 
     client.client.send.side_effect = [response_401, response_200]
 
-    result = await client._request("GET", "/test")
+    result = await client._request("GET", "/test", ctx_uid=0)
 
     assert result == {"success": True}
     assert client.client.send.call_count == 2
-    mock_auth_provider.get_access_token.assert_any_call(force_refresh=True)
+    mock_auth_provider.get_access_token.assert_any_call(force_refresh=True, ctx_uid=0)
 
 
 # --- TESTS: PATH & METADATA ---
@@ -92,7 +92,7 @@ async def test_get_file_metadata_parsing(client):
     }
     client.client.send.return_value = mock_response
 
-    meta = await client._get_file_metadata("/data.csv")
+    meta = await client._get_file_metadata("/data.csv", ctx_uid=0)
 
     assert meta.size == 1024
     expected_dt = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -106,7 +106,7 @@ async def test_get_file_metadata_404(client):
     mock_response.status_code = 404
     client.client.send.return_value = mock_response
 
-    result = await client._get_file_metadata("/missing")
+    result = await client._get_file_metadata("/missing", ctx_uid=0)
     assert result is None
 
 
@@ -128,7 +128,7 @@ async def test_download_chunk_stream_headers(client):
     client.client.send.return_value = mock_response
 
     chunks = []
-    async for chunk in client.download_chunk_stream("/file.bin", offset=0, length=100):
+    async for chunk in client.download_chunk_stream("/file.bin", offset=0, length=100, ctx_uid=0):
         chunks.append(chunk)
 
     assert b"".join(chunks) == b"chunk1chunk2"
@@ -151,7 +151,7 @@ async def test_download_chunk_stream_412_precondition_failed(client):
     client.client.send.return_value = mock_response
 
     with pytest.raises(httpx.HTTPStatusError) as excinfo:
-        async for _ in client.download_chunk_stream("/file.bin", 0, 100):
+        async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx_uid=0):
             pass
 
     assert excinfo.value.response.status_code == 412
