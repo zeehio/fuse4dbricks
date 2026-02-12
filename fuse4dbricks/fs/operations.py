@@ -40,7 +40,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         # Check permissions
         if not await self.metadata_manager.check_access(entry, mode, ctx):
             raise pyfuse3.FUSEError(errno.EACCES)
-        return  True
+        return True
 
 
     async def access(self, inode: int, mode: int, ctx: pyfuse3.RequestContext) -> bool:
