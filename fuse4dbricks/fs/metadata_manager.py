@@ -222,26 +222,6 @@ class MetadataManager:
                 self._inflight_lock, self._inflight_attr, child_fs_path
             )
 
-    @staticmethod
-    def _uc_to_inode_entry_attr(
-        uc_entry: UnityCatalogEntry, ctx: pyfuse3.RequestContext
-    ) -> InodeEntryAttr:
-        is_dir = uc_entry.is_dir()
-        mode = (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644)
-        ctime = uc_entry.ctime if uc_entry.ctime is not None else 0
-        mtime = uc_entry.mtime if uc_entry.mtime is not None else 0
-        attr = InodeEntryAttr(
-            st_mode=mode,
-            st_nlink=2 if is_dir else 1,
-            st_size=uc_entry.size,
-            st_ctime=ctime,
-            st_mtime=mtime,
-            st_atime=0,
-            st_uid=ctx.uid,
-            st_gid=ctx.gid,
-        )
-        return attr
-
     async def list_directory(
         self, entry: InodeEntry, ctx: pyfuse3.RequestContext
     ) -> list[DirCacheEntry] | None:
@@ -343,6 +323,26 @@ class MetadataManager:
             else:
                 del cache_dict[key]  # Expired
         return None
+
+    @staticmethod
+    def _uc_to_inode_entry_attr(
+        uc_entry: UnityCatalogEntry, ctx: pyfuse3.RequestContext
+    ) -> InodeEntryAttr:
+        is_dir = uc_entry.is_dir()
+        mode = (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644)
+        ctime = uc_entry.ctime if uc_entry.ctime is not None else 0
+        mtime = uc_entry.mtime if uc_entry.mtime is not None else 0
+        attr = InodeEntryAttr(
+            st_mode=mode,
+            st_nlink=2 if is_dir else 1,
+            st_size=uc_entry.size,
+            st_ctime=ctime,
+            st_mtime=mtime,
+            st_atime=0,
+            st_uid=ctx.uid,
+            st_gid=ctx.gid,
+        )
+        return attr
 
     async def _update_attr_cache(
         self, fs_path: str, attr: InodeEntryAttr, is_dir: bool, ttl=None
