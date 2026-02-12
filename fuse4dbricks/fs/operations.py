@@ -4,7 +4,8 @@ Core FUSE operations module.
 
 import errno
 import logging
-
+import stat
+from itertools import islice
 try:
     import pyfuse3
 except ImportError:
@@ -148,12 +149,12 @@ class UnityCatalogFS(pyfuse3.Operations):
             items = self._readdir_state[fh]["children"]
 
         to_skip = max(0, start_id - 2)
-        for i, child in enumerate(items[to_skip:]):
+        for i, (name, attr) in enumerate(islice(items.items(), to_skip, None)):
             child_entry = self.inodes.add_entry(
                 parent_inode=inode,
-                name=child.name,
-                is_dir=child.is_dir,
-                attr=child.attr,
+                name=name,
+                is_dir=(attr.st_mode & stat.S_IFDIR) == stat.S_IFDIR,
+                attr=attr,
             )
             ret = pyfuse3.readdir_reply(
                 token,
