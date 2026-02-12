@@ -8,7 +8,6 @@ import logging
 import stat
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
 from typing import Tuple, TypeVar
 
 import trio
@@ -51,13 +50,6 @@ def uc_node_type_from_entry(entry: InodeEntry) -> UcNodeType:
         return UcNodeType.FILE
 
 
-@dataclass
-class DirCacheEntry:
-    name: str
-    is_dir: bool
-    attr: InodeEntryAttr
-
-
 class MetadataManager:
     def __init__(
         self,
@@ -85,11 +77,11 @@ class MetadataManager:
         """
 
         # { fs_path: (expiration_ts, list_of_children_names) }
-        self._dir_cache: OrderedDict[str, Tuple[float, list[DirCacheEntry]]] = (
+        self._dir_cache: OrderedDict[str, Tuple[float, OrderedDict[str, InodeEntryAttr]]] = (
             OrderedDict()
         )
         """
-        fs_path -> (expires_at, list[DirCacheEntry])
+        fs_path -> (expires_at, OrderedDict[name, InodeEntryAttr])
         fs_path uniquely identifies a unity catalog directory.
         """
 
@@ -224,9 +216,9 @@ class MetadataManager:
 
     async def list_directory(
         self, entry: InodeEntry, ctx: pyfuse3.RequestContext
-    ) -> list[DirCacheEntry] | None:
+    ) -> OrderedDict[str, InodeEntryAttr] | None:
         """
-        Returns a list of children for a given entry.
+        Returns a list of children for a given entry or None if given entry is not a directory
         """
         logger.debug(f"metadata_manager.list_directory for {entry.fs_path}")
         # 1. Fast Check
@@ -245,6 +237,7 @@ class MetadataManager:
             await wait_event.wait()
             async with self._cache_lock:
                 cached = self._get_valid_cache(self._dir_cache, entry.fs_path)
+                # if cache is None it is because was just refilled and not found
                 return cached
 
         # 3. Real API Call
@@ -257,17 +250,11 @@ class MetadataManager:
             ):  # May this happen because of any other reason as not a directory?
                 raise pyfuse3.FUSEError(errno.ENOTDIR)
 
-            results = []
+            results = OrderedDict()
             now = time.time()
             for uc_entry in uc_entries:
                 attr = self._uc_to_inode_entry_attr(uc_entry, ctx)
-                results.append(
-                    DirCacheEntry(
-                        name=uc_entry.name,
-                        is_dir=uc_entry.is_dir(),
-                        attr=attr,
-                    )
-                )
+                results[uc_entry.name] = attr
                 # read ahead: Cache attributes of children to speed up subsequent getattr and lookups
                 await self._update_attr_cache(
                     fs_path=uc_to_fs_path(uc_entry.uc_path),
