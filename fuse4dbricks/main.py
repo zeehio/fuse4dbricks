@@ -15,13 +15,24 @@ from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
-from fuse4dbricks.identity.provider import AccessTokenAuthProvider, AuthProvider
+from fuse4dbricks.auth.provider import AuthProvider
+from fuse4dbricks.auth.entra_id import EntraIDPublicAuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 # Default Azure Databricks App ID (Standard Public Client)
 DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459"
 
+
+def _get_default_cache_dir():
+    # Assume POSIX system. if uid is root return /var/cache/fuse4dbricks else return something xdg compliant else $HOME/.cache/fuse4dbricks
+    if os.geteuid() == 0:
+        return "/var/cache/fuse4dbricks"
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return os.path.join(xdg_cache_home, "fuse4dbricks")
+    return os.path.expanduser("~/.cache/fuse4dbricks")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -30,14 +41,13 @@ def parse_args():
     parser.add_argument(
         "--workspace", default="", help="https://adb-xxxx.azuredatabricks.net"
     )
-    parser.add_argument("--auth-provider", default="pat", const="pat", nargs="?", help="Auth provider", choices=["pat", "device"])
-    parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)")
+    parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)", required=False, default="")
     parser.add_argument(
         "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID (required for device auth)"
     )
     parser.add_argument("mountpoint", help="Local directory to mount")
     parser.add_argument(
-        "--cache-dir", default="/tmp/db_fuse_cache", help="Local disk cache location"
+        "--cache-dir", default=_get_default_cache_dir(), help="Local disk cache location"
     )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
@@ -57,7 +67,7 @@ def setup_logging(debug_mode):
 
 
 async def start_fuse(ops, mountpoint, debug_mode):
-    mount_options = ["ro", "fsname=fuse4dbricks", "noatime"]
+    mount_options = ["fsname=fuse4dbricks", "noatime", "allow_other"]
     if debug_mode:
         mount_options.append("debug")
 
@@ -85,10 +95,18 @@ async def async_main():
         logging.error(f"Mountpoint does not exist: {mountpoint}")
         sys.exit(1)
 
-    cache_dir = os.path.abspath(args.cache_dir)
+    root_cache_dir = os.path.abspath(args.cache_dir)
+    os.makedirs(root_cache_dir, exist_ok=True, mode=0o700)
+    os.chmod(root_cache_dir, mode=0o700)
+    # auth cache and data cache
+    auth_cache_dir = os.path.join(root_cache_dir, "auth")
+    data_cache_dir = os.path.join(root_cache_dir, "data")
     if args.clear_cache:
-        clear_cache(cache_dir)
-    os.makedirs(cache_dir, exist_ok=True, mode=0o700)
+        clear_cache(data_cache_dir)
+    os.makedirs(auth_cache_dir, exist_ok=True, mode=0o700)
+    os.chmod(auth_cache_dir, mode=0o700)
+    os.makedirs(data_cache_dir, exist_ok=True, mode=0o700)
+    os.chmod(data_cache_dir, mode=0o700)
 
     if args.workspace != "":
         workspace = args.workspace
@@ -100,36 +118,20 @@ async def async_main():
 
     # Auth
     logging.info("Initializing Authentication...")
-    auth_provider: AuthProvider = AccessTokenAuthProvider()
+    external_provider = None
+    if args.tenant_id and args.client_id:
+        external_provider = EntraIDPublicAuthProvider(tenant_id=args.tenant_id, client_id = args.client_id, cache_dir=auth_cache_dir)
+
+    auth_provider: AuthProvider = AuthProvider(provider=external_provider)
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
-
-    # FIXME: Provide uid->access_token via fake file write
-    # This should be set dynamically via writing to some fake file
-    # using:
-    # echo "dbapi...." > /Volumes/.access_token
-    # Or even use:
-    # cat /Volumes/.login
-    # to trigger a device oauth flow
-    token = os.getenv("DATABRICKS_TOKEN")
-    uid = os.getuid()
-    auth_provider.set_credentials(ctx_uid = uid, access_token = token)
-    principal = await uc_client.get_current_user_info(uid)
-    auth_provider.set_credentials(ctx_uid = uid, principal=principal)
-    try:
-        # TODO: Once we support multiple access tokens this check won't be here
-        auth_provider.get_access_token(ctx_uid=uid)
-        logging.info("Authentication successful.")
-    except Exception as e:
-        logging.critical(f"Authentication failed: {e}")
-        sys.exit(1)
-
-    persistence = DiskPersistence(cache_dir, max_size_gb=10, max_age_days=30)
+    persistence = DiskPersistence(data_cache_dir, max_size_gb=10, max_age_days=30)
 
     inode_manager = InodeManager()
-    data_manager = DataManager(uc_client, persistence)
-    metadata_manager = MetadataManager(uc_client, ttl=30)
-    operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager)
+    data_manager = DataManager(uc_client, persistence, ram_cache_mb=512)
+    metadata_manager = MetadataManager(uc_client, ttl=30, max_entries=20000, ttl_catalog=600)
+    auth_manager = AuthManager(uc_client, auth_provider)
+    operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
 
     try:
         async with trio.open_nursery() as nursery:

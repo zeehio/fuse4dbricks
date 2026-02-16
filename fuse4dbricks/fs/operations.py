@@ -5,11 +5,13 @@ Core FUSE operations module.
 import errno
 import logging
 from itertools import islice
+
 try:
     import pyfuse3
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
+from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
@@ -23,22 +25,34 @@ class UnityCatalogFS(pyfuse3.Operations):
         inode_manager: InodeManager,
         metadata_manager: MetadataManager,
         data_manager: DataManager,
+        auth_manager: AuthManager,
     ):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
         self.metadata_manager = metadata_manager
         self.data_manager = data_manager
+        self.auth_manager = auth_manager
         self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
         self._open_fh_count = 0
         self._open_state: dict[int, dict] = {}
+
+    async def _dispatch(self, fs_path: str) -> str:
+        if fs_path.startswith("/.auth"):
+            return "auth"
+        else:
+            return "unity_catalog"
 
     async def _check_permissions(self, inode: int, mode: int, ctx):
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         # Check permissions
-        if not await self.metadata_manager.check_access(entry, mode, ctx):
+        if self._dispatch(entry.fs_path) == "auth":
+            granted = await self.auth_manager.check_access(entry, mode, ctx)
+        else:
+            granted = await self.metadata_manager.check_access(entry, mode, ctx)
+        if not granted:
             raise pyfuse3.FUSEError(errno.EACCES)
         return True
 
@@ -54,8 +68,11 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
-            # check ttl and update entry in-place
-            attr = await self.metadata_manager.get_attributes(entry, ctx)
+            if self._dispatch(entry.fs_path) == "auth":
+                attr = await self.auth_manager.get_attributes(entry, ctx)
+            else:
+                # check ttl and update entry in-place
+                attr = await self.metadata_manager.get_attributes(entry, ctx)
             if attr is None:
                 # File was deleted or is now a folder or... inode not valid anyway
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -83,7 +100,10 @@ class UnityCatalogFS(pyfuse3.Operations):
             return await self.getattr(existing, ctx=ctx)
 
         # 2. Ask Cache/API
-        attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        if self._dispatch(full_path) == "auth":
+            attr = await self.auth_manager.lookup_child(parent_entry, name, ctx)
+        else:
+            attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
         if attr is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         # 3. Create Inode
@@ -139,7 +159,10 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         # Get Children from Cache/API
         if start_id <= 2:
-            items = await self.metadata_manager.list_directory(entry, ctx)
+            if self._dispatch(entry.fs_path) == "auth":
+                items = await self.auth_manager.list_directory(entry, ctx)
+            else:
+                items = await self.metadata_manager.list_directory(entry, ctx)
             if items is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             self._readdir_state[fh]["children"] = items
@@ -208,17 +231,54 @@ class UnityCatalogFS(pyfuse3.Operations):
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
         try:
-            return await self.data_manager.read(
-                entry.fs_path,
-                offset,
-                length,
-                entry.attr.st_mtime,
-                entry.attr.st_size,
-                ctx_uid=ctx.uid,
-            )
+            if self._dispatch(entry.fs_path) == "auth":
+                return await self.auth_manager.read(
+                    entry.fs_path,
+                    offset,
+                    length,
+                    entry.attr.st_mtime,
+                    entry.attr.st_size,
+                    ctx_uid=ctx.uid,
+                )
+            else:
+                return await self.data_manager.read(
+                    entry.fs_path,
+                    offset,
+                    length,
+                    entry.attr.st_mtime,
+                    entry.attr.st_size,
+                    ctx_uid=ctx.uid,
+                )
         except Exception as e:
             logger.error(f"Read error reading {entry.fs_path}: {e}")
             raise pyfuse3.FUSEError(errno.EIO)
+
+    async def write(self, fh, offset, buffer) -> int:
+        if fh not in self._open_state:
+            raise pyfuse3.FUSEError(errno.EIO)
+
+        inode = self._open_state[fh]["inode"]
+        ctx = self._open_state[fh]["ctx"]
+
+        entry = self.inodes.get_entry(inode)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if entry.is_dir:
+            raise pyfuse3.FUSEError(errno.EISDIR)
+        try:
+            if self._dispatch(entry.fs_path) == "auth":
+                return await self.auth_manager.write(
+                    entry.fs_path,
+                    offset,
+                    buffer,
+                    ctx_uid=ctx.uid,
+                )
+            else:
+                raise pyfuse3.FUSEError(errno.EACCES)
+        except Exception as e:
+            logger.error(f"Read error reading {entry.fs_path}: {e}")
+            raise pyfuse3.FUSEError(errno.EIO)
+
 
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:

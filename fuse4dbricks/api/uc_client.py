@@ -13,7 +13,7 @@ from typing import AsyncGenerator
 
 import httpx
 
-from fuse4dbricks.identity.provider import AuthProvider
+from fuse4dbricks.auth.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class UnityCatalogClient:
         await self.client.aclose()
 
     async def _get_headers(self, ctx_uid):
-        token = self.auth_provider.get_access_token(ctx_uid=ctx_uid)
+        token = await self.auth_provider.get_access_token(ctx_uid=ctx_uid)
         return {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json, application/octet-stream",
@@ -95,7 +95,7 @@ class UnityCatalogClient:
         # 401 Retry Logic (Token Expiration)
         if response.status_code == 401:
             logger.warning("Token expired (401). Refreshing and retrying...")
-            self.auth_provider.get_access_token(ctx_uid=ctx_uid, force_refresh=True)
+            await self.auth_provider.get_access_token(ctx_uid=ctx_uid, force_refresh=True)
 
             headers.update(await self._get_headers(ctx_uid=ctx_uid))
             # For stream=True, we must ensure the first response is closed before retrying
@@ -165,9 +165,8 @@ class UnityCatalogClient:
         return resp["userName"]
 
     async def check_permissions(self, securable: str, securable_type: str,
-                                privileges: list[str], ctx_uid: int) -> bool:
+                                privileges: list[str], principal: str, ctx_uid: int) -> bool:
         endpoint = f"/api/2.1/unity-catalog/effective-permissions/{securable_type}/{securable}"
-        principal = self.auth_provider.get_principal(ctx_uid)
         priv_assignments = await self._fetch_all_pages(
             endpoint, "privilege_assignments", ctx_uid=ctx_uid,
             params={"principal": principal},

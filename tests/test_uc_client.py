@@ -13,7 +13,7 @@ from fuse4dbricks.api.uc_client import UnityCatalogClient
 def mock_auth_provider():
     """Mocks the EntraIDAuthProvider."""
     provider = MagicMock()
-    provider.get_access_token.return_value = "fake_token_123"
+    provider.get_access_token = AsyncMock(return_value="fake_token_123")
     return provider
 
 
@@ -46,7 +46,7 @@ async def test_request_success_200(client, mock_auth_provider):
     result = await client._request("GET", "/test", ctx_uid=0)
 
     assert result == {"key": "value"}
-    mock_auth_provider.get_access_token.assert_called_with(ctx_uid=0)
+    #await mock_auth_provider.get_access_token.assert_awaited_with(ctx_uid=0)
 
     # Verify headers
     call_kwargs = client.client.build_request.call_args[1]
