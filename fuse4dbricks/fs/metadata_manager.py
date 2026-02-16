@@ -353,6 +353,10 @@ class MetadataManager:
                 self._dir_cache[entry.fs_path] = (now + self._ttl, results)
             return results
         except Exception as e:
+            # Many errors may happen. An access denied error should be raised.
+            if isinstance(e, pyfuse3.FUSEError) and e.errno == errno.EACCES:
+                raise
+            # Other errors should be logged and we should return None?
             import traceback
             logger.error(f"List directory failed for {entry.fs_path}: {e}")
             print(traceback.format_exc())

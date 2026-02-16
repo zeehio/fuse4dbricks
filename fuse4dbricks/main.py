@@ -49,6 +49,11 @@ def parse_args():
     parser.add_argument(
         "--cache-dir", default=_get_default_cache_dir(), help="Local disk cache location"
     )
+    
+    parser.add_argument("--allow-other", action="store_true",
+        help="Use -o allow_other only if /etc/fuse.conf has user_allow_other"
+    )
+
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
     )
@@ -66,8 +71,10 @@ def setup_logging(debug_mode):
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
 
 
-async def start_fuse(ops, mountpoint, debug_mode):
-    mount_options = ["fsname=fuse4dbricks", "noatime", "allow_other"]
+async def start_fuse(ops, mountpoint, allow_other, debug_mode):
+    mount_options = ["fsname=fuse4dbricks", "noatime"]
+    if allow_other:
+        mount_options.append("allow_other")
     if debug_mode:
         mount_options.append("debug")
 
@@ -135,7 +142,7 @@ async def async_main():
 
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(start_fuse, operations, mountpoint, args.debug)
+            nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug)
     except ExceptionGroup as eg:
         import traceback
         # eg is the top-level ExceptionGroup
