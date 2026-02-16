@@ -94,6 +94,16 @@ class MetadataManager:
         self._inflight_dir: dict[str, trio.Event] = {}
         self._inflight_lock = trio.Lock()
 
+        self._permissions_lock = trio.Lock()
+        self._inflight_permissions: dict[Tuple[int, str], trio.Event] = {}
+        self._permissions_inflight_lock = trio.Lock()
+        self._permissions_cache: OrderedDict[
+            Tuple[int, str], Tuple[float, bool]
+        ] = OrderedDict()
+        """(uid, securable) -> (expires_at, has_permission)
+        Caches permission checks to avoid redundant API calls for the same user and securable.
+        """
+
     def get_ttl(self, uc_type: UcNodeType | None):
         if uc_type in (UcNodeType.FILE, UcNodeType.DIRECTORY):
             return self._ttl
@@ -118,7 +128,43 @@ class MetadataManager:
             req_privileges = ["USE_SCHEMA"]
         elif securable_type == "volume":
             req_privileges = ["READ_VOLUME"]
-        permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, ctx_uid=ctx.uid)
+        else:
+            logger.error(f"Unexpected securable type for path {entry.fs_path}")
+            raise pyfuse3.FUSEError(errno.EACCES)
+        # 1. Permission Check with Caching
+        async with self._permissions_lock:
+            cached = self._get_valid_cache(self._permissions_cache, (ctx.uid, securable))
+            # TODO: We should be able to tell difference between no cache entry and negative cache entry (e.g. path does not exist)
+            if cached is not None:
+                return cached
+        # 2. Request Coalescing
+        wait_event = await join_or_lead_request(
+            self._permissions_inflight_lock, self._inflight_permissions, (ctx.uid, securable)
+        )
+
+        if wait_event:
+            await wait_event.wait()
+            # Wake up: Check cache again (Leader should have filled it)
+            async with self._cache_lock:
+                permissions_fullfilled = self._get_valid_cache(
+                    self._permissions_cache, (ctx.uid, securable)
+                )
+                if permissions_fullfilled is None:
+                    # Cache miss after waiting means the leader did not find the securable or an error occurred. Deny access.
+                    return False
+                return permissions_fullfilled
+        # 3. Real API Call (Leader Only)
+        try:
+            permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, ctx_uid=ctx.uid)
+            # Cache the result
+            async with self._permissions_lock:
+                self._permissions_cache[(ctx.uid, securable)] = (time.time() + self._ttl, permissions_fullfilled)
+                if len(self._permissions_cache) > self.max_entries:
+                    self._permissions_cache.popitem(last=False)
+        finally:
+            await notify_followers(
+                self._permissions_inflight_lock, self._inflight_permissions, (ctx.uid, securable)
+            )
         return permissions_fullfilled
 
     async def get_attributes(self, entry: InodeEntry, ctx) -> InodeEntryAttr | None:
