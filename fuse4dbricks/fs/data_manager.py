@@ -1,6 +1,6 @@
 import errno
 from typing import Tuple
-
+from collections import OrderedDict
 import trio
 
 try:
@@ -16,7 +16,7 @@ from fuse4dbricks.storage.persistence import DiskPersistence
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512):
         self.uc_client = uc_client
         self.persistence = persistence
         self.chunk_size = 8 * 1024 * 1024
@@ -24,14 +24,35 @@ class DataManager:
         "(file_id, chunk_id, mtime) -> trio.Event"
         self._inflight_lock = trio.Lock()
 
+        self._chunk_cache: OrderedDict[Tuple[str, int, float], bytes] = OrderedDict()
+        """(fs_path, chunk_id, mtime) -> chunk_data"""
+        self._chunk_cache_lock = trio.Lock()
+        self._chunk_cache_max_size = int(ram_cache_mb*1024*1024 / self.chunk_size)  # max number of chunks to cache in memory
+
     async def _read_chunk(
         self, fs_path: str, chunk_id: int, mtime: float, chunk_size: int, 
         ctx_uid: int, out_dict
     ):
-        # get chunk from ram? no need, the kernel file cache does that already :)
+        # get chunk from ram
+        cache_key = (fs_path, chunk_id, mtime)
+        async with self._chunk_cache_lock:
+            if cache_key in self._chunk_cache:
+                cached = self._chunk_cache[cache_key]
+                # Move to end to mark as recently used
+                self._chunk_cache.move_to_end(cache_key)
+                out_dict[chunk_id] = cached
+                return
+
         # get chunk from disk
         chunk = await self.persistence.retrieve_chunk(fs_path, chunk_id, mtime)
         if chunk is not None:
+            async with self._chunk_cache_lock:
+                self._chunk_cache[cache_key] = chunk
+                # Move to end to mark as recently used
+                self._chunk_cache.move_to_end(cache_key)
+                # Evict least recently used if cache exceeds max size
+                if len(self._chunk_cache) > self._chunk_cache_max_size:
+                    self._chunk_cache.popitem(last=False)
             out_dict[chunk_id] = chunk
             return
 
@@ -42,6 +63,13 @@ class DataManager:
 
         if wait_event:
             await wait_event.wait()
+            async with self._chunk_cache_lock:
+                if cache_key in self._chunk_cache:
+                    cached = self._chunk_cache[cache_key]
+                    # Move to end to mark as recently used
+                    self._chunk_cache.move_to_end(cache_key)
+                    out_dict[chunk_id] = cached
+                    return
             chunk = await self.persistence.retrieve_chunk(fs_path, chunk_id, mtime)
             out_dict[chunk_id] = chunk
             return
@@ -63,6 +91,14 @@ class DataManager:
                 mtime=mtime,
                 stream=stream,
             )
+            async with self._chunk_cache_lock:
+                self._chunk_cache[cache_key] = chunk
+                # Move to end to mark as recently used
+                self._chunk_cache.move_to_end(cache_key)
+                # Evict least recently used if cache exceeds max size
+                if len(self._chunk_cache) > self._chunk_cache_max_size:
+                    self._chunk_cache.popitem(last=False)
+
         finally:
             await notify_followers(
                 self._inflight_lock,
