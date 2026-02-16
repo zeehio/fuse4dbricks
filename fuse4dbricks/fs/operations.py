@@ -37,7 +37,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         self._open_fh_count = 0
         self._open_state: dict[int, dict] = {}
 
-    async def _dispatch(self, fs_path: str) -> str:
+    def _dispatch(self, fs_path: str) -> str:
         if fs_path.startswith("/.auth"):
             return "auth"
         else:
@@ -111,6 +111,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         return await self.getattr(entry.inode, ctx)
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
+        logger.debug(f"opendir(inode={inode})")
         R_OK = 4
         await self._check_permissions(inode, mode=R_OK, ctx=ctx)
         entry = self.inodes.get_entry(inode)
@@ -129,6 +130,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         return pyfuse3.FileHandleT(fh)
 
     async def releasedir(self, fh: pyfuse3.FileHandleT) -> None:
+        logger.debug(f"releasedir(fh={fh})")
         if fh in self._readdir_state:
             del self._readdir_state[fh]
 
@@ -146,30 +148,64 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         # Yield . and ..
         if start_id <= 0:
+            logger.debug(" - .")
             attr = await self.getattr(inode, ctx)
             ret = pyfuse3.readdir_reply(token, b".", attr, 1)  # type:ignore[arg-type]
             if not ret:
                 return
 
         if start_id <= 1:
+            logger.debug(" - ..")
             p_attr = await self.getattr(entry.parent_inode, ctx)
             ret = pyfuse3.readdir_reply(token, b"..", p_attr, 2)  # type:ignore[arg-type]
             if not ret:
                 return
 
+        if inode == pyfuse3.ROOT_INODE and start_id <= 2:
+            auth_attr = await self.auth_manager.lookup_child(entry, ".auth", ctx)
+            if auth_attr is None:
+                raise RuntimeError("Unexpected error: .auth not found. This should not happen")
+            logger.debug(f" - .auth")
+            child_entry = self.inodes.add_entry(
+                parent_inode=inode,
+                name=".auth",
+                attr=auth_attr,
+            )
+            ret = pyfuse3.readdir_reply(
+                token,
+                name=child_entry.name.encode("utf-8"),
+                attr=self._entry_to_fuse_attr(child_entry),
+                next_id=3,
+            )
+            if ret:
+                self.inodes.increment_lookup_count(child_entry.inode)
+            else:
+                return
+
+        if inode == pyfuse3.ROOT_INODE:
+            meta_attr = 3
+        else:
+            meta_attr = 2
+
         # Get Children from Cache/API
-        if start_id <= 2:
+        if start_id <= meta_attr:
             if self._dispatch(entry.fs_path) == "auth":
                 items = await self.auth_manager.list_directory(entry, ctx)
             else:
-                items = await self.metadata_manager.list_directory(entry, ctx)
+                try:
+                    items = await self.metadata_manager.list_directory(entry, ctx)
+                except pyfuse3.FUSEError as exc:
+                    if exc.errno == errno.EACCES and inode == pyfuse3.ROOT_INODE:
+                        return
+                    raise
             if items is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             self._readdir_state[fh]["children"] = items
         else:
             items = self._readdir_state[fh]["children"]
+        logger.debug(f"items: {list(items.keys())}")
 
-        to_skip = max(0, start_id - 2)
+        to_skip = max(0, start_id - meta_attr)
         for i, (name, attr) in enumerate(islice(items.items(), to_skip, None)):
             child_entry = self.inodes.add_entry(
                 parent_inode=inode,
@@ -180,7 +216,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                 token,
                 name=child_entry.name.encode("utf-8"),
                 attr=self._entry_to_fuse_attr(child_entry),
-                next_id=3 + to_skip + i,
+                next_id=meta_attr + 1 + to_skip + i,
             )
             if ret:
                 self.inodes.increment_lookup_count(child_entry.inode)
@@ -214,7 +250,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         }
         return pyfuse3.FileInfo(fh=fh)
 
-    async def close(self, fh: pyfuse3.FileHandleT) -> None:
+    async def release(self, fh: pyfuse3.FileHandleT) -> None:
         if fh in self._open_state:
             del self._open_state[fh]
 
