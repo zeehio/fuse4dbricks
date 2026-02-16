@@ -100,6 +100,12 @@ class MetadataManager:
         self._permissions_cache: OrderedDict[
             Tuple[int, str], Tuple[float, bool]
         ] = OrderedDict()
+
+        self._principal_cache: OrderedDict[int, str] = OrderedDict()
+        self._principal_cache_lock = trio.Lock()
+        self._principal_inflight: dict[int, trio.Event] = {}
+        self._principal_inflight_lock = trio.Lock()
+
         """(uid, securable) -> (expires_at, has_permission)
         Caches permission checks to avoid redundant API calls for the same user and securable.
         """
@@ -113,6 +119,36 @@ class MetadataManager:
     # =========================================================================
     # Public API
     # =========================================================================
+
+    async def _get_principal(self, ctx) -> str|None:
+        async with self._principal_cache_lock:
+            principal = self._principal_cache.get(ctx.uid)
+            if principal is not None:
+                return principal
+        # 2. Request Coalescing
+        wait_event = await join_or_lead_request(
+            self._principal_inflight_lock, self._principal_inflight, ctx.uid
+        )
+
+        if wait_event:
+            await wait_event.wait()
+            # Wake up: Check cache again (Leader should have filled it)
+            async with self._principal_cache_lock:
+                principal = self._principal_cache.get(ctx.uid)
+                return principal
+
+        # 3. Real API Call (Leader Only)
+        try:
+            principal = await self.uc_client.get_current_user_info(ctx.uid)
+            async with self._principal_cache_lock:
+                self._principal_cache[ctx.uid] = principal
+                if len(self._principal_cache) > self.max_entries:
+                    self._principal_cache.popitem(last=False)
+        finally:
+            await notify_followers(
+                self._principal_inflight_lock, self._principal_inflight, ctx.uid
+            )
+        return principal
 
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
         #R_OK = 4
@@ -155,7 +191,10 @@ class MetadataManager:
                 return permissions_fullfilled
         # 3. Real API Call (Leader Only)
         try:
-            permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, ctx_uid=ctx.uid)
+            principal = await self._get_principal(ctx)
+            if principal is None:
+                raise pyfuse3.FUSEError(errno.EACCES)
+            permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx_uid=ctx.uid)
             # Cache the result
             async with self._permissions_lock:
                 self._permissions_cache[(ctx.uid, securable)] = (time.time() + self._ttl, permissions_fullfilled)

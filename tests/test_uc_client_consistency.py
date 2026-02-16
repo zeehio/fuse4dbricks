@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from email.utils import formatdate
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock
 
 import httpx
 import pytest
@@ -15,7 +15,7 @@ from fuse4dbricks.api.uc_client import UnityCatalogClient
 def auth_mock():
     """Simple mock for the Auth Provider."""
     provider = MagicMock()
-    provider.get_access_token.return_value = "fake_token"
+    provider.get_access_token = AsyncMock(return_value="fake_token")
     return provider
 
 
