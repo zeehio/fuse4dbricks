@@ -21,9 +21,6 @@ from fuse4dbricks.auth.provider import AuthProvider
 from fuse4dbricks.auth.entra_id import EntraIDPublicAuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
-# Default Azure Databricks App ID (Standard Public Client)
-DEFAULT_CLIENT_ID = "96df0c21-d705-4e78-2936-2475e72d2459"
-
 
 def _get_default_cache_dir():
     # Assume POSIX system. if uid is root return /var/cache/fuse4dbricks else return something xdg compliant else $HOME/.cache/fuse4dbricks
@@ -43,7 +40,7 @@ def parse_args():
     )
     parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)", required=False, default="")
     parser.add_argument(
-        "--client-id", default=DEFAULT_CLIENT_ID, help="Azure App Client ID (required for device auth)"
+        "--client-id", default="", required=False, help="Azure App Client ID (required for device auth)"
     )
     parser.add_argument("mountpoint", help="Local directory to mount")
     parser.add_argument(
