@@ -52,7 +52,7 @@ class EntraIDConfidentialAuthProvider:
         self._expires_at: dict[int, float] = {}
 
         self._inflight_refresh: dict[int, trio.Event] = {}
-        self._inflight_lock = trio.Lock()
+        self._inflight_lock: trio.Lock = trio.Lock()
         "uid -> threading.Event for that user's token refresh"
 
     async def get_access_token(self, ctx_uid: int, force_refresh=False) -> str|None:
@@ -68,11 +68,11 @@ class EntraIDConfidentialAuthProvider:
             return self._access_token.get(ctx_uid)
 
         # 2. Request Coalescing
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._inflight_lock, self._inflight_refresh, ctx_uid
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             if self._auth_state.get(ctx_uid) != AuthState.SUCCESS:

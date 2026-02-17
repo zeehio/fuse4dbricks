@@ -126,11 +126,11 @@ class MetadataManager:
             if principal is not None:
                 return principal
         # 2. Request Coalescing
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._principal_inflight_lock, self._principal_inflight, ctx.uid
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             async with self._principal_cache_lock:
@@ -174,11 +174,11 @@ class MetadataManager:
             if cached is not None:
                 return cached
         # 2. Request Coalescing
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._permissions_inflight_lock, self._inflight_permissions, (ctx.uid, securable)
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             async with self._cache_lock:
@@ -222,11 +222,11 @@ class MetadataManager:
                 return cached
 
         # 2. Request Coalescing
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._inflight_lock, self._inflight_attr, entry.fs_path
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             async with self._cache_lock:
@@ -267,11 +267,11 @@ class MetadataManager:
                     return cached
 
         # 2. Coalescing (Reuse attr inflight tracker)
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._inflight_lock, self._inflight_attr, child_fs_path
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             async with self._cache_lock:
                 for is_dir in (False, True):
@@ -314,11 +314,11 @@ class MetadataManager:
                 return cached
 
         # 2. Coalescing
-        wait_event = await join_or_lead_request(
+        (wait_event, leader) = await join_or_lead_request(
             self._inflight_lock, self._inflight_dir, entry.fs_path
         )
 
-        if wait_event:
+        if not leader:
             await wait_event.wait()
             async with self._cache_lock:
                 cached = self._get_valid_cache(self._dir_cache, entry.fs_path)

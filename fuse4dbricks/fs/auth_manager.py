@@ -48,21 +48,6 @@ while true; do
 done
 """
 
-README_CONTENT = b"""README
-=========
-
-The .auth directory is a virtual directory (not an actual Unity Catalog).
-
-If you see errors related to a lack of permissions, it may be that your access token is missing or it has expired.
-
-You may provide an access token for your user by writing it to the personal_access_token:
-
-    echo "dbapidsadkjlsdjalkd" > /Volumes/.auth/personal_access_token
-
-If you see the /Volumes/.auth/login.sh script, you can execute it to obtain a token using a device authorization flow.
-If you don't see it, the device authorization flow is not available.
-"""
-
 class AuthInode(Enum):
     AUTH_DIR = "AUTH_DIR"
     SCRIPT = "SCRIPT"
@@ -77,78 +62,65 @@ _FS_PATH_TO_AUTHINODE = {
     "/.auth/.login_ctrl": AuthInode.CTRL,
     "/.auth/.login_status": AuthInode.STATUS,
     "/.auth/personal_access_token": AuthInode.ACCESS_TOKEN,
-    "/.auth/README.txt": AuthInode.README
+    "/.auth/README.txt": AuthInode.README,
+    "/README.txt": AuthInode.README,
 }
 
-_AUTHINODE_TO_ATTR = {
-    AuthInode.AUTH_DIR: InodeEntryAttr(
-        st_mode=(stat.S_IFDIR | 0o555),
-        st_nlink=2,
-        st_size=4096,
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-    AuthInode.SCRIPT: InodeEntryAttr(
-        st_mode=(stat.S_IFREG | 0o555),
-        st_nlink=1,
-        st_size=len(LOGIN_SCRIPT_CONTENT),
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-    AuthInode.CTRL: InodeEntryAttr(
-        st_mode=(stat.S_IFREG | 0o222),
-        st_nlink=1,
-        st_size=0,
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-    AuthInode.STATUS: InodeEntryAttr(
-        st_mode=(stat.S_IFREG | 0o444),
-        st_nlink=1,
-        st_size=100,  # Arbitrary size for status file
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-    AuthInode.ACCESS_TOKEN: InodeEntryAttr(
-        st_mode=(stat.S_IFREG | 0o222),
-        st_nlink=1,
-        st_size=0,
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-    AuthInode.README: InodeEntryAttr(
-        st_mode=(stat.S_IFREG | 0o444),
-        st_nlink=1,
-        st_size=len(README_CONTENT),
-        st_ctime=0,
-        st_mtime=0,
-        st_atime=0,
-        st_uid=0,
-        st_gid=0,
-    ),
-}
+
 
 class AuthManager:
-    def __init__(self, uc_client, auth_provider):
+    def __init__(self, uc_client, auth_provider, workspace):
         self._uc_client = uc_client
         self._auth_provider = auth_provider
-        self._inode_to_auth: dict[int, AuthInode] = {}
-        self._auth_to_inode: dict[AuthInode, int] = {}
+        self._workspace = workspace
+
+    def _gen_readme(self) -> bytes:
+        readme = f"""README
+=========
+
+If you are not seeing your catalogs or you get permission errors, you may need to provide an access token.
+
+* Visit {self._workspace}/settings/user/developer/access-tokens
+
+* Provide the access token using a command like:
+
+    echo "dapi0000000000000000000-2" > /Volumes/.auth/personal_access_token
+
+Alternatively, if the /Volumes/.auth/login.sh script exists, you can execute
+it to obtain a token using a device authorization flow. If you don't see it,
+the device authorization flow is not available.
+""".encode("utf-8")
+        return readme
+
+    def _gen_attr(self, auth_inode):
+        if auth_inode == AuthInode.AUTH_DIR:
+            mode = (stat.S_IFDIR | 0o555)
+            size = 4096
+        elif auth_inode == AuthInode.SCRIPT:
+            mode = (stat.S_IFREG | 0o555)
+            size = len(LOGIN_SCRIPT_CONTENT)
+        elif auth_inode == AuthInode.CTRL:
+            mode = (stat.S_IFREG | 0o222)
+            size = 0
+        elif auth_inode == AuthInode.STATUS:
+            mode = (stat.S_IFREG | 0o444)
+            size = 1024  # Arbitrary size for status file
+        elif auth_inode == AuthInode.ACCESS_TOKEN:
+            mode = (stat.S_IFREG | 0o222)
+            size = 0
+        elif auth_inode == AuthInode.README:
+            mode = (stat.S_IFREG | 0o444)
+            size = len(self._gen_readme())
+        return InodeEntryAttr(
+            st_mode = mode,
+            st_nlink = 2 if auth_inode == AuthInode.AUTH_DIR else 1,
+            st_size = size,
+            st_ctime = 0,
+            st_mtime = 0,
+            st_atime = 0,
+            st_uid = 0,
+            st_gid = 0,
+        )
 
     def _file_exists(self, fs_path) -> bool:
         if fs_path not in _FS_PATH_TO_AUTHINODE:
@@ -168,7 +140,7 @@ class AuthManager:
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
         if not self._file_exists(entry.fs_path):
             return False
-        existing_permissions = _AUTHINODE_TO_ATTR[_FS_PATH_TO_AUTHINODE[entry.fs_path]].st_mode & 0o777
+        existing_permissions = self._gen_attr(_FS_PATH_TO_AUTHINODE[entry.fs_path]).st_mode & 0o777
         return (mode & existing_permissions) == mode
 
     async def get_attributes(self, entry: InodeEntry, ctx) -> InodeEntryAttr | None:
@@ -195,25 +167,29 @@ class AuthManager:
         if not self._file_exists(child_fs_path):
             return None
         file_type = _FS_PATH_TO_AUTHINODE[child_fs_path]
-        return _AUTHINODE_TO_ATTR[file_type]
+        return self._gen_attr(file_type)
 
     async def list_directory(
         self, entry: InodeEntry, ctx: pyfuse3.RequestContext
     ) -> dict[str, InodeEntryAttr] | None:
         ftype = _FS_PATH_TO_AUTHINODE.get(entry.fs_path)
+        if entry == pyfuse3.ROOT_INODE:
+            return {
+                "README.txt":  self._gen_attr(AuthInode.README),
+            }
         if ftype == AuthInode.AUTH_DIR:
             if self._auth_provider.has_external_provider:
                 return {
-                    "README.txt":  _AUTHINODE_TO_ATTR[AuthInode.README],
-                    "personal_access_token": _AUTHINODE_TO_ATTR[AuthInode.ACCESS_TOKEN],
-                    "login.sh": _AUTHINODE_TO_ATTR[AuthInode.SCRIPT],
-                    ".login_ctrl": _AUTHINODE_TO_ATTR[AuthInode.CTRL],
-                    ".login_status": _AUTHINODE_TO_ATTR[AuthInode.STATUS],
+                    "README.txt":  self._gen_attr(AuthInode.README),
+                    "personal_access_token": self._gen_attr(AuthInode.ACCESS_TOKEN),
+                    "login.sh": self._gen_attr(AuthInode.SCRIPT),
+                    ".login_ctrl": self._gen_attr(AuthInode.CTRL),
+                    ".login_status": self._gen_attr(AuthInode.STATUS),
                 }
             else:
                 return {
-                    "README.txt":  _AUTHINODE_TO_ATTR[AuthInode.README],
-                    "personal_access_token": _AUTHINODE_TO_ATTR[AuthInode.ACCESS_TOKEN],
+                    "README.txt":  self._gen_attr(AuthInode.README),
+                    "personal_access_token": self._gen_attr(AuthInode.ACCESS_TOKEN),
                 }
         return None
 
@@ -229,7 +205,7 @@ class AuthManager:
             raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
         if fs_type == AuthInode.README:
-            file_contents = README_CONTENT
+            file_contents = self._gen_readme()
         elif fs_type == AuthInode.SCRIPT:
             file_contents = LOGIN_SCRIPT_CONTENT
         elif fs_type == AuthInode.STATUS:
@@ -254,6 +230,9 @@ class AuthManager:
     async def write(self, fs_path: str, offset: int, buffer: bytes, ctx_uid: int) -> int:
         if not self._file_exists(fs_path):
             raise pyfuse3.FUSEError(errno.EIO)
+        if offset != 0:
+            # For simplicity, we only allow full overwrites from the start of the file
+            raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
         # All writes are expected to be just text, so we can turn buffer to text
         # We can also strip whitespace since that's probably user error
@@ -270,5 +249,5 @@ class AuthManager:
             return len(buffer)
         if fs_type == AuthInode.ACCESS_TOKEN:
             self._auth_provider.set_access_token(ctx_uid=ctx_uid, access_token=buffer_txt)
-            return len(buffer)        
+            return len(buffer)
         raise pyfuse3.FUSEError(errno.EACCES)

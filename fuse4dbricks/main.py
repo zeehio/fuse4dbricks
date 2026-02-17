@@ -137,12 +137,15 @@ async def async_main():
     inode_manager = InodeManager()
     data_manager = DataManager(uc_client, persistence, ram_cache_mb=512)
     metadata_manager = MetadataManager(uc_client, ttl=30, max_entries=20000, ttl_catalog=600)
-    auth_manager = AuthManager(uc_client, auth_provider)
+    auth_manager = AuthManager(uc_client, auth_provider, workspace=workspace)
     operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
 
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug)
+            nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug)            
+            persistence.run_services(nursery)
+            data_manager.run_services(nursery)
+    
     except ExceptionGroup as eg:
         import traceback
         # eg is the top-level ExceptionGroup

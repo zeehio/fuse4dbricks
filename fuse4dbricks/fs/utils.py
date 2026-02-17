@@ -54,18 +54,16 @@ async def join_or_lead_request(
     lock: trio.Lock,
     inflight_dict: dict[_InflightKey, trio.Event],
     key: _InflightKey,
-) -> trio.Event | None:
+) -> Tuple[trio.Event, bool]:
     """
     Helper for Request Coalescing.
-    Returns trio.Event if we need to wait, or None if we are the leader.
+    Returns trio.Event and whether or not we are leaders
     """
     async with lock:
-        if key in inflight_dict:
-            return inflight_dict[key]
-        else:
+        leader = key not in inflight_dict
+        if leader:
             inflight_dict[key] = trio.Event()
-            return None
-
+        return (inflight_dict[key], leader)
 
 async def notify_followers(
     lock: trio.Lock, inflight_dict: dict[_InflightKey, trio.Event], key: _InflightKey
