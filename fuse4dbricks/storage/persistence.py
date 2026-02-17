@@ -38,7 +38,7 @@ class DiskPersistence:
         self.access_log: list[Tuple[float, str, int]] = []  # Heap: (now, cache_path, bytes_written)
         self.access_map: dict[str, float] = {}  # {cache_path: latest_use_timestamp}
 
-    async def run_services(self, nursery):
+    def run_services(self, nursery):
         """Starts background maintenance and discovery."""
         nursery.start_soon(self._graceful_init)
         nursery.start_soon(self._background_maintenance)
@@ -127,7 +127,7 @@ class DiskPersistence:
         chunk_index: int,
         mtime: float,
         stream: AsyncGenerator[bytes, None],
-    ):
+    ) -> bytes:
         """Consumes a stream and writes it to disk. Returns the bytes written."""
         cache_path = self._get_chunk_path(fs_path, chunk_index, mtime)
         temp_path = f"{cache_path}.{os.getpid()}.tmp"

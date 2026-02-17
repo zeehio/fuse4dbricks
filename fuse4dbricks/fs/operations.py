@@ -38,7 +38,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         self._open_state: dict[int, dict] = {}
 
     def _dispatch(self, fs_path: str) -> str:
-        if fs_path.startswith("/.auth"):
+        if fs_path.startswith("/.auth/") or fs_path in ("/.auth", "/README.txt"):
             return "auth"
         else:
             return "unity_catalog"
@@ -165,7 +165,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             auth_attr = await self.auth_manager.lookup_child(entry, ".auth", ctx)
             if auth_attr is None:
                 raise RuntimeError("Unexpected error: .auth not found. This should not happen")
-            logger.debug(f" - .auth")
+            logger.debug(" - .auth")
             child_entry = self.inodes.add_entry(
                 parent_inode=inode,
                 name=".auth",
@@ -182,8 +182,29 @@ class UnityCatalogFS(pyfuse3.Operations):
             else:
                 return
 
+        if inode == pyfuse3.ROOT_INODE and start_id <= 3:
+            readme_attr = await self.auth_manager.lookup_child(entry, "README.txt", ctx)
+            if readme_attr is None:
+                raise RuntimeError("Unexpected error: README.txt not found. This should not happen")
+            logger.debug(" - .README.txt")
+            child_entry = self.inodes.add_entry(
+                parent_inode=inode,
+                name="README.txt",
+                attr=readme_attr,
+            )
+            ret = pyfuse3.readdir_reply(
+                token,
+                name=child_entry.name.encode("utf-8"),
+                attr=self._entry_to_fuse_attr(child_entry),
+                next_id=4,
+            )
+            if ret:
+                self.inodes.increment_lookup_count(child_entry.inode)
+            else:
+                return
+
         if inode == pyfuse3.ROOT_INODE:
-            meta_attr = 3
+            meta_attr = 4
         else:
             meta_attr = 2
 
