@@ -228,19 +228,22 @@ class DataManager:
                 nursery.start_soon(
                     self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks
                 )
-        # fetch ahead next 5 chunks once we are beyond chunk 0 (avoid prefetching on `head *` command)
-        if end_chunk > 0 and num_chunks_in_file > 2:
-            chunks_to_prefetch = []
-            for i in range(10):
-                chunk_to_prefetch = end_chunk + 1 + i
-                if chunk_to_prefetch == num_chunks_in_file:
-                    break
-                if chunk_to_prefetch == num_chunks_in_file -1:
-                    chunk_size = last_chunk_size
-                else:
-                    chunk_size = self.chunk_size
-                chunks_to_prefetch.append((chunk_to_prefetch, chunk_size))
-            await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, ctx_uid)
+        # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
+        num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
+        chunks_to_prefetch = []
+        for i in range(num_chunks_to_prefetch):
+            chunk_to_prefetch = end_chunk + 1 + i
+            if chunk_to_prefetch >= num_chunks_in_file:
+                # chunk_to_prefetch beyond EOF, stop
+                break
+            # chunk_size: Last chunk in file may be shorter
+            if chunk_to_prefetch == num_chunks_in_file -1:
+                chunk_size = last_chunk_size
+            else:
+                chunk_size = self.chunk_size
+            # Add to list to fetch:
+            chunks_to_prefetch.append((chunk_to_prefetch, chunk_size))
+        await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, ctx_uid)
         # Assemble chunks
         result = bytearray()
         for chunk_id in chunks_to_read:
