@@ -13,6 +13,8 @@ from fuse4dbricks.fs.utils import fs_to_uc_path, InflightCoalescer
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.storage.persistence import DiskPersistence
+from fuse4dbricks.fs.ram_cache import RamCache
+
 
 @dataclass
 class _ChunkRequest:
@@ -26,6 +28,64 @@ class _ChunkRequest:
     "size of this chunk. It may be smaller than the typical chunk_size on the last chunk of o a file"
     ctx_uid: int
     "who requested the chunk"
+
+class DownloadScheduler:
+    def __init__(self, process_request, num_workers=10):
+        self._requests_lock = trio.Lock()
+        self._requests_priority: OrderedDict[Tuple[str, int, float], _ChunkRequest] = OrderedDict()
+        self._requests_regular: OrderedDict[Tuple[str, int, float], _ChunkRequest] = OrderedDict()
+        self._requests_num_workers = num_workers
+        self._process_request = process_request
+
+        self._wake_send, self._wake_recv = trio.open_memory_channel[None](max_buffer_size=1)
+
+    def run_services(self, nursery):
+        for i in range(self._requests_num_workers):
+            nursery.start_soon(self._downloader)
+
+    async def _dequeue_one(self) -> tuple[Tuple[str, int, float] | None, _ChunkRequest | None, str]:
+        async with self._requests_lock:
+            try:
+                cache_key, chunk_request = self._requests_priority.popitem(last=False)
+                return cache_key, chunk_request, "high"
+            except KeyError:
+                pass
+            try:
+                cache_key, chunk_request = self._requests_regular.popitem(last=False)
+                return cache_key, chunk_request, "regular"
+            except KeyError:
+                return None, None, "regular"
+
+    async def _downloader(self):
+        while True:
+            cache_key, chunk_request, priority = await self._dequeue_one()
+            if cache_key is None or chunk_request is None:
+                # Nothing to do: block until someone enqueues work (no polling).
+                await self._wake_recv.receive()
+                continue
+            await self._process_request(chunk_request, priority)
+
+    async def _poke_worker(self) -> None:
+        # Non-blocking "poke"; if buffer is full, a worker is already awake.
+        try:
+            self._wake_send.send_nowait(None)
+        except trio.WouldBlock:
+            pass
+
+    async def enqueue_request(self, chunk_request: _ChunkRequest, high_priority: bool):
+        cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime)
+        async with self._requests_lock:
+            if high_priority:
+                # If request for that chunk was present as a regular request, promote it:
+                if cache_key in self._requests_regular:
+                    self._requests_regular.pop(cache_key)
+                self._requests_priority[cache_key] = chunk_request
+                await self._poke_worker()
+            else:
+                # If request for that chunk was already a priority request, ignore it, otherwise add it
+                if cache_key not in self._requests_priority:
+                    self._requests_regular[cache_key] = chunk_request
+                    await self._poke_worker()
 
 
 class DataManager:
@@ -41,43 +101,16 @@ class DataManager:
         self.chunk_size = 8 * 1024 * 1024
         self._inflight_coalescer: InflightCoalescer[Tuple[str, int, float]] = InflightCoalescer()
         "Inflight coalescer for downloads identified by (file_id, chunk_id, mtime)"
-        
 
-        self._chunk_cache: OrderedDict[Tuple[str, int, float], bytes] = OrderedDict()
-        """(fs_path, chunk_id, mtime) -> chunk_data"""
-        self._chunk_cache_lock = trio.Lock()
-        self._chunk_cache_max_size = int(ram_cache_mb*1024*1024 / self.chunk_size)  # max number of chunks to cache in memory
+        self._download_scheduler = DownloadScheduler(process_request=self._process_request, num_workers=num_workers)
 
-        self._requests_lock = trio.Lock()
-        self._requests_priority: OrderedDict[Tuple[str, int, float], _ChunkRequest] = OrderedDict()
-        self._requests_regular: OrderedDict[Tuple[str, int, float], _ChunkRequest] = OrderedDict()
-        self._requests_num_workers = num_workers
+        # max number of chunks to cache in memory
+        max_ram_chunks = int(ram_cache_mb*1024*1024 / self.chunk_size)
+        self._ram_cache: RamCache[Tuple[str, int, float]] = RamCache(max_entries = max_ram_chunks)
 
-    def run_services(self, nursery):
-        """Starts download workers"""
-        for i in range(self._requests_num_workers):
-            nursery.start_soon(self._downloader)
-
-    async def _downloader(self):
-        while True:
-            async with self._requests_lock:
-                cache_key = None
-                chunk_request = None
-                priority = "regular"
-                try:
-                    (cache_key, chunk_request) = self._requests_priority.popitem()
-                    priority = "high"
-                except KeyError:
-                    pass
-                if chunk_request is None:
-                    try:
-                        (cache_key, chunk_request) = self._requests_regular.popitem()
-                        priority = "regular"
-                    except KeyError:
-                        pass
-            if cache_key is None or chunk_request is None:
-                await trio.sleep(0.2)
-                continue
+    async def _process_request(self, chunk_request: _ChunkRequest, priority: str):
+        try:
+            cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime)
             # We have a chunk_request to download
             # check if we already downloaded it:
             chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime)
@@ -85,19 +118,14 @@ class DataManager:
                 # download it.
                 chunk = await self._fetch_chunk(chunk_request)
             if priority == "high":
-                await self._save_chunk_to_ram(fs_path=chunk_request.fs_path, chunk_id=chunk_request.chunk_id, mtime=chunk_request.mtime, chunk=chunk)
+                await self._ram_cache.put(cache_key, chunk)
+        finally:
             await self._inflight_coalescer.notify_done(cache_key)
 
-    async def _save_chunk_to_ram(self, fs_path, chunk_id, mtime, chunk):
-        cache_key = (fs_path, chunk_id, mtime)
-        async with self._chunk_cache_lock:
-            self._chunk_cache[cache_key] = chunk
-            # Move to end to mark as recently used
-            self._chunk_cache.move_to_end(cache_key)
-            # Evict least recently used if cache exceeds max size
-            if len(self._chunk_cache) > self._chunk_cache_max_size:
-                self._chunk_cache.popitem(last=False)
-        return
+
+    def run_services(self, nursery):
+        """Starts download workers"""
+        self._download_scheduler.run_services(nursery)
 
     async def _fetch_chunk(self, chunk_request: _ChunkRequest):
         uc_path = fs_to_uc_path(chunk_request.fs_path)
@@ -118,19 +146,6 @@ class DataManager:
         )
         return chunk
 
-    async def _enqueue_fetch(self, chunk_request: _ChunkRequest, high_priority):
-        cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime)
-        async with self._requests_lock:
-            if high_priority:
-                # If request for that chunk was present as a regular request, promote it:
-                if cache_key in self._requests_regular:
-                    self._requests_regular.pop(cache_key)
-                self._requests_priority[cache_key] = chunk_request
-            else:
-                # If request for that chunk was already a priority request, ignore it, otherwise add it
-                if cache_key not in self._requests_priority:
-                    self._requests_regular[cache_key] = chunk_request
-
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, ctx_uid: int):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
             cache_key = (fs_path, chunk_id, mtime)
@@ -138,35 +153,25 @@ class DataManager:
             if not leader:
                 continue  # already being fetched, we don't care about it
             chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx_uid=ctx_uid)
-            await self._enqueue_fetch(chunk_request, high_priority=False)
+            await self._download_scheduler.enqueue_request(chunk_request, high_priority=False)
         return None
 
     async def _get_chunk_from_cache_or_disk(self, fs_path: str, chunk_id: int, mtime: float) -> bytes | None:
         cache_key = (fs_path, chunk_id, mtime)
         # get chunk from ram
-        async with self._chunk_cache_lock:
-            if cache_key in self._chunk_cache:
-                cached = self._chunk_cache[cache_key]
-                # Move to end to mark as recently used
-                self._chunk_cache.move_to_end(cache_key)
-                return cached
+        cached = await self._ram_cache.get(cache_key)
+        if cached is not None:
+            return cached
         # get chunk from disk
         chunk = await self.persistence.retrieve_chunk(fs_path, chunk_id, mtime)
         if chunk is not None:
-            # promote it to RAM before returning it
-            async with self._chunk_cache_lock:
-                self._chunk_cache[cache_key] = chunk
-                # Move to end to mark as recently used
-                self._chunk_cache.move_to_end(cache_key)
-                # Evict least recently used if cache exceeds max size
-                if len(self._chunk_cache) > self._chunk_cache_max_size:
-                    self._chunk_cache.popitem(last=False)
+            await self._ram_cache.put(cache_key, chunk)
         return chunk
 
 
     async def _read_chunk(
         self, fs_path: str, chunk_id: int, mtime: float, chunk_size: int, 
-        ctx_uid: int, out_dict
+        ctx_uid: int, out_dict: dict[int, bytes|None]
     ):
         cache_key = (fs_path, chunk_id, mtime)
         chunk = await self._get_chunk_from_cache_or_disk(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime)
@@ -180,7 +185,7 @@ class DataManager:
         if leader:
             # get chunk from network
             chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx_uid=ctx_uid)
-            await self._enqueue_fetch(chunk_request, high_priority=True)
+            await self._download_scheduler.enqueue_request(chunk_request, high_priority=True)
 
         # Now we wait for the download to complete and fetch it from RAM or Disk
         await wait_event.wait()
@@ -212,7 +217,7 @@ class DataManager:
             end_chunk = num_chunks_in_file - 1
         chunks_to_read = list(range(start_chunk, end_chunk + 1))
         # Download all required chunks
-        chunks: dict[int, bytes] = {}
+        chunks: dict[int, bytes|None] = {}
         # dictionary: chunk_id -> bytes
         async with trio.open_nursery() as nursery:
             for chunk_id in chunks_to_read:
