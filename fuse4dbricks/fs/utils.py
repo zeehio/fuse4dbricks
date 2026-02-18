@@ -50,31 +50,7 @@ def uc_to_fs_path(uc_path: str) -> str:
 
 _InflightKey = TypeVar("_InflightKey")
 
-async def join_or_lead_request(
-    lock: trio.Lock,
-    inflight_dict: dict[_InflightKey, trio.Event],
-    key: _InflightKey,
-) -> Tuple[trio.Event, bool]:
-    """
-    Helper for Request Coalescing.
-    Returns trio.Event and whether or not we are leaders
-    """
-    async with lock:
-        leader = key not in inflight_dict
-        if leader:
-            inflight_dict[key] = trio.Event()
-        return (inflight_dict[key], leader)
-
-async def notify_followers(
-    lock: trio.Lock, inflight_dict: dict[_InflightKey, trio.Event], key: _InflightKey
-):
-    """Wake up waiting threads and cleanup."""
-    async with lock:
-        if key in inflight_dict:
-            inflight_dict[key].set()
-            del inflight_dict[key]
-
-class InflightRequestCoalescer(Generic[_InflightKey]):
+class InflightCoalescer(Generic[_InflightKey]):
     """
     Request coalescing helper.
 
