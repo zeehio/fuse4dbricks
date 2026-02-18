@@ -346,6 +346,7 @@ class UnityCatalogClient:
                 entry = await self._get_file_metadata(uc_path, ctx_uid=ctx_uid)
                 # Returns either the folder or None if not found
                 return entry
+            return entry
         entry = await self._get_file_metadata(uc_path, ctx_uid=ctx_uid)
         if entry is None:
             entry = await self._get_directory_metadata(uc_path, ctx_uid=ctx_uid)
