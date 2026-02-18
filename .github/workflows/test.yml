@@ -70,3 +70,11 @@ jobs:
       url: https://pypi.org/p/fuse4dbricks
     permissions:
       id-token: write
+    steps:
+    - name: Download all the dists
+      uses: actions/download-artifact@v6
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Publish distribution to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
