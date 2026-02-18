@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import traceback
 import sys
 
 import trio
@@ -21,10 +22,19 @@ from fuse4dbricks.auth.provider import AuthProvider
 from fuse4dbricks.auth.entra_id import EntraIDPublicAuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
+logger = logging.getLogger(__name__)
+
+def _is_system_account() -> bool:
+    try:
+        uid = os.geteuid()
+        return uid < 1000
+    except Exception as exc:
+        logger.error("_is_system_account failed to determine if uid is a system account, assuming it is a user.\nException: %s\n%s", exc, traceback.format_exc())
+        return False
 
 def _get_default_cache_dir():
     # Assume POSIX system. if uid is root return /var/cache/fuse4dbricks else return something xdg compliant else $HOME/.cache/fuse4dbricks
-    if os.geteuid() == 0:
+    if _is_system_account():
         return "/var/cache/fuse4dbricks"
     xdg_cache_home = os.getenv("XDG_CACHE_HOME")
     if xdg_cache_home:
@@ -144,14 +154,10 @@ async def async_main():
             data_manager.run_services(nursery)
     
     except ExceptionGroup as eg:
-        import traceback
         # eg is the top-level ExceptionGroup
-        print("Top-level group message:", eg)
+        logger.error("Top-level group message: %s", eg)
         for i, exc in enumerate(eg.exceptions, 1):
-            print(f"[{i}] type={type(exc).__name__} -> {exc}")
-            print(traceback.format_exc())
-
-
+            logger.error("[%d] type=%s -> %s\n%s", i, type(exc).__name__, exc, traceback.format_exc())
 
 
 def cli_entry_point():

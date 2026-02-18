@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def clear_cache(cache_dir: str):
     """Removes *.tmp and *.bin files from cache_dir recursively"""
-    logging.info("Clearing cache...")
+    logging.info("Clearing cache... %s", cache_dir)
     for root, _, files in os.walk(cache_dir):
         for f in files:
             path = os.path.join(root, f)
