@@ -13,7 +13,7 @@ import time
 
 import msal  # type: ignore[import-untyped]
 
-from fuse4dbricks.fs.utils import join_or_lead_request, notify_followers
+from fuse4dbricks.fs.utils import InflightCoalescer
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ class EntraIDConfidentialAuthProvider:
 
         self._inflight_refresh: dict[int, trio.Event] = {}
         self._inflight_lock: trio.Lock = trio.Lock()
+        self._inflight_coalescer: InflightCoalescer[int] = InflightCoalescer()
         "uid -> threading.Event for that user's token refresh"
 
     async def get_access_token(self, ctx_uid: int, force_refresh=False) -> str|None:
@@ -68,9 +69,7 @@ class EntraIDConfidentialAuthProvider:
             return self._access_token.get(ctx_uid)
 
         # 2. Request Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._inflight_lock, self._inflight_refresh, ctx_uid
-        )
+        (wait_event, leader) = await self._inflight_coalescer.join_or_lead(ctx_uid)
 
         if not leader:
             await wait_event.wait()
@@ -88,9 +87,7 @@ class EntraIDConfidentialAuthProvider:
             else:
                 self._auth_state[ctx_uid] = AuthState.START
         finally:
-            await notify_followers(
-                self._inflight_lock, self._inflight_refresh, ctx_uid
-            )
+            await self._inflight_coalescer.notify_done(ctx_uid)
         return self._access_token.get(ctx_uid)
 
 

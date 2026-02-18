@@ -21,8 +21,8 @@ from fuse4dbricks.api.uc_client import (UcNodeType, UnityCatalogClient,
                                         UnityCatalogEntry)
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
 from fuse4dbricks.fs.utils import (fs_to_uc_path,  fs_to_securable,
-                                   join_or_lead_request,
-                                   notify_followers, uc_to_fs_path)
+                                   InflightCoalescer,
+                                   uc_to_fs_path)
 
 logger = logging.getLogger(__name__)
 
@@ -90,21 +90,18 @@ class MetadataManager:
 
         # --- Request Coalescing (Thundering Herd Protection) ---
         # Stores active requests: { full_path: trio.Event }
-        self._inflight_attr: dict[str, trio.Event] = {}
-        self._inflight_dir: dict[str, trio.Event] = {}
-        self._inflight_lock = trio.Lock()
+        self._attr_coalescer: InflightCoalescer[str] = InflightCoalescer()
+        self._dir_coalescer: InflightCoalescer[str] = InflightCoalescer()
 
-        self._permissions_lock = trio.Lock()
-        self._inflight_permissions: dict[Tuple[int, str], trio.Event] = {}
-        self._permissions_inflight_lock = trio.Lock()
         self._permissions_cache: OrderedDict[
             Tuple[int, str], Tuple[float, bool]
         ] = OrderedDict()
+        self._permissions_lock = trio.Lock()
+        self._permissions_coalescer: InflightCoalescer[Tuple[int, str]] = InflightCoalescer()
 
         self._principal_cache: OrderedDict[int, str] = OrderedDict()
         self._principal_cache_lock = trio.Lock()
-        self._principal_inflight: dict[int, trio.Event] = {}
-        self._principal_inflight_lock = trio.Lock()
+        self._principal_coalescer: InflightCoalescer[int] = InflightCoalescer()
 
         """(uid, securable) -> (expires_at, has_permission)
         Caches permission checks to avoid redundant API calls for the same user and securable.
@@ -126,9 +123,7 @@ class MetadataManager:
             if principal is not None:
                 return principal
         # 2. Request Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._principal_inflight_lock, self._principal_inflight, ctx.uid
-        )
+        (wait_event, leader) = await self._principal_coalescer.join_or_lead(ctx.uid)
 
         if not leader:
             await wait_event.wait()
@@ -145,9 +140,7 @@ class MetadataManager:
                 if len(self._principal_cache) > self.max_entries:
                     self._principal_cache.popitem(last=False)
         finally:
-            await notify_followers(
-                self._principal_inflight_lock, self._principal_inflight, ctx.uid
-            )
+            await self._principal_coalescer.notify_done(ctx.uid)
         return principal
 
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
@@ -174,9 +167,7 @@ class MetadataManager:
             if cached is not None:
                 return cached
         # 2. Request Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._permissions_inflight_lock, self._inflight_permissions, (ctx.uid, securable)
-        )
+        (wait_event, leader) = await self._permissions_coalescer.join_or_lead((ctx.uid, securable))
 
         if not leader:
             await wait_event.wait()
@@ -201,9 +192,7 @@ class MetadataManager:
                 if len(self._permissions_cache) > self.max_entries:
                     self._permissions_cache.popitem(last=False)
         finally:
-            await notify_followers(
-                self._permissions_inflight_lock, self._inflight_permissions, (ctx.uid, securable)
-            )
+            await self._permissions_coalescer.notify_done((ctx.uid, securable))
         return permissions_fullfilled
 
     async def get_attributes(self, entry: InodeEntry, ctx) -> InodeEntryAttr | None:
@@ -222,9 +211,7 @@ class MetadataManager:
                 return cached
 
         # 2. Request Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._inflight_lock, self._inflight_attr, entry.fs_path
-        )
+        (wait_event, leader) = await self._attr_coalescer.join_or_lead(entry.fs_path)
 
         if not leader:
             await wait_event.wait()
@@ -239,9 +226,7 @@ class MetadataManager:
         try:
             attr = await self._refresh_entry_metadata(entry, ctx)
         finally:
-            await notify_followers(
-                self._inflight_lock, self._inflight_attr, entry.fs_path
-            )
+            await self._attr_coalescer.notify_done(entry.fs_path)
         return attr
 
     async def lookup_child(
@@ -267,9 +252,7 @@ class MetadataManager:
                     return cached
 
         # 2. Coalescing (Reuse attr inflight tracker)
-        (wait_event, leader) = await join_or_lead_request(
-            self._inflight_lock, self._inflight_attr, child_fs_path
-        )
+        (wait_event, leader) = await self._attr_coalescer.join_or_lead(child_fs_path)
 
         if not leader:
             await wait_event.wait()
@@ -295,9 +278,7 @@ class MetadataManager:
             )
             return attr
         finally:
-            await notify_followers(
-                self._inflight_lock, self._inflight_attr, child_fs_path
-            )
+            await self._attr_coalescer.notify_done(child_fs_path)
 
     async def list_directory(
         self, entry: InodeEntry, ctx: pyfuse3.RequestContext
@@ -314,9 +295,7 @@ class MetadataManager:
                 return cached
 
         # 2. Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._inflight_lock, self._inflight_dir, entry.fs_path
-        )
+        (wait_event, leader) = await self._dir_coalescer.join_or_lead(entry.fs_path)
 
         if not leader:
             await wait_event.wait()
@@ -362,9 +341,7 @@ class MetadataManager:
             print(traceback.format_exc())
             return None
         finally:
-            await notify_followers(
-                self._inflight_lock, self._inflight_dir, entry.fs_path
-            )
+            await self._dir_coalescer.notify_done(entry.fs_path)
 
     def invalidate(self, fs_path: str, is_dir: bool):
         """

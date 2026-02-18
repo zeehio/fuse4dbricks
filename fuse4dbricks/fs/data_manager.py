@@ -9,8 +9,7 @@ try:
 except ImportError:
     import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
 
-from fuse4dbricks.fs.utils import (fs_to_uc_path, join_or_lead_request,
-                                   notify_followers)
+from fuse4dbricks.fs.utils import fs_to_uc_path, InflightCoalescer
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.storage.persistence import DiskPersistence
@@ -40,9 +39,9 @@ class DataManager:
         self.uc_client = uc_client
         self.persistence = persistence
         self.chunk_size = 8 * 1024 * 1024
-        self._inflight_downloads: dict[Tuple[str, int, float], trio.Event] = {}
-        "(file_id, chunk_id, mtime) -> trio.Event"
-        self._inflight_lock = trio.Lock()
+        self._inflight_coalescer: InflightCoalescer[Tuple[str, int, float]] = InflightCoalescer()
+        "Inflight coalescer for downloads identified by (file_id, chunk_id, mtime)"
+        
 
         self._chunk_cache: OrderedDict[Tuple[str, int, float], bytes] = OrderedDict()
         """(fs_path, chunk_id, mtime) -> chunk_data"""
@@ -87,7 +86,7 @@ class DataManager:
                 chunk = await self._fetch_chunk(chunk_request)
             if priority == "high":
                 await self._save_chunk_to_ram(fs_path=chunk_request.fs_path, chunk_id=chunk_request.chunk_id, mtime=chunk_request.mtime, chunk=chunk)
-            await notify_followers(self._inflight_lock, self._inflight_downloads, cache_key)
+            await self._inflight_coalescer.notify_done(cache_key)
 
     async def _save_chunk_to_ram(self, fs_path, chunk_id, mtime, chunk):
         cache_key = (fs_path, chunk_id, mtime)
@@ -135,9 +134,7 @@ class DataManager:
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, ctx_uid: int):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
             cache_key = (fs_path, chunk_id, mtime)
-            (wait_event, leader) = await join_or_lead_request(
-                self._inflight_lock, self._inflight_downloads, cache_key
-            )
+            (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
             if not leader:
                 continue  # already being fetched, we don't care about it
             chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx_uid=ctx_uid)
@@ -178,9 +175,7 @@ class DataManager:
             return
 
         # 2. Coalescing
-        (wait_event, leader) = await join_or_lead_request(
-            self._inflight_lock, self._inflight_downloads, cache_key
-        )
+        (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
 
         if leader:
             # get chunk from network
