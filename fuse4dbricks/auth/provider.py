@@ -14,7 +14,7 @@ import errno
 logger = logging.getLogger(__name__)
 
 class AuthProvider:
-    def __init__(self, provider =None):
+    def __init__(self, provider=None):
         self._uid_to_access_token: dict[int, str] = {}
         "uid -> access_token"
         self._external_provider = provider

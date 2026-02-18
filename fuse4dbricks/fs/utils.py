@@ -1,5 +1,5 @@
 import trio
-from typing import TypeVar, Tuple
+from typing import TypeVar, Tuple, Generic
 
 def fs_to_securable(fs_path: str) -> Tuple[str, str]:
     
@@ -73,3 +73,34 @@ async def notify_followers(
         if key in inflight_dict:
             inflight_dict[key].set()
             del inflight_dict[key]
+
+class InflightRequestCoalescer(Generic[_InflightKey]):
+    """
+    Request coalescing helper.
+
+    Tracks in-flight work keyed by an arbitrary key.
+    - join_or_lead(key) returns (event, is_leader)
+    - notify_done(key) wakes followers and removes the key
+    """
+
+    def __init__(self) -> None:
+        self._lock = trio.Lock()
+        self._inflight: dict[_InflightKey, trio.Event] = {}
+
+    async def join_or_lead(self, key: _InflightKey) -> Tuple[trio.Event, bool]:
+        """
+        If no request is running for key, caller becomes leader and must perform the work.
+        Followers should await the returned event.
+        """
+        async with self._lock:
+            leader = key not in self._inflight
+            if leader:
+                self._inflight[key] = trio.Event()
+            return self._inflight[key], leader
+
+    async def notify_done(self, key: _InflightKey) -> None:
+        """Wake up any followers waiting on key and cleanup."""
+        async with self._lock:
+            ev = self._inflight.pop(key, None)
+            if ev is not None:
+                ev.set()
