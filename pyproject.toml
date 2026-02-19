@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "fuse4dbricks"
 version = "0.1.0"
-description = "High-performance FUSE driver for Databricks Unity Catalog Volumes"
+description = "FUSE driver for Databricks Unity Catalog Volumes."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "Sergio Oller", email = ""}
+    {name = "Sergio Oller", email = "sergioller@gmail.com"}
 ]
 keywords = ["databricks", "fuse", "unity-catalog", "filesystem", "async", "trio"]
 classifiers = [

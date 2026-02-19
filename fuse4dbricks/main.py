@@ -54,7 +54,7 @@ def parse_args():
     )
     parser.add_argument("mountpoint", help="Local directory to mount")
     parser.add_argument(
-        "--cache-dir", default=_get_default_cache_dir(), help="Local disk cache location"
+        "--disk-cache-dir", default=_get_default_cache_dir(), help="Local disk cache location"
     )
     
     parser.add_argument("--allow-other", action="store_true",
@@ -63,6 +63,42 @@ def parse_args():
 
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
+    )
+    parser.add_argument(
+        "--disk-cache-gb",
+        type=float,
+        default=10,
+        help="Maximum disk cache size in GB",
+    )
+    parser.add_argument(
+        "--disk-cache-max-days",
+        type=int,
+        default=30,
+        help="Maximum age of disk cache entries in days",
+    )
+    parser.add_argument(
+        "--ram-cache-mb",
+        type=int,
+        default=512,
+        help="In-memory data cache size in MB",
+    )
+    parser.add_argument(
+        "--metadata-cache-ttl-sec",
+        type=int,
+        default=30,
+        help="Default TTL for metadata cache entries in seconds",
+    )
+    parser.add_argument(
+        "--metadata-cache-ttl-catalog-sec",
+        type=int,
+        default=600,
+        help="TTL for catalog metadata cache entries in seconds",
+    )
+    parser.add_argument(
+        "--metadata-cache-max-entries",
+        type=int,
+        default=20000,
+        help="Maximum number of metadata cache entries",
     )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
     return parser.parse_args()
@@ -109,7 +145,7 @@ async def async_main():
         logging.error(f"Mountpoint does not exist: {mountpoint}")
         sys.exit(1)
 
-    root_cache_dir = os.path.abspath(args.cache_dir)
+    root_cache_dir = os.path.abspath(args.disk_cache_dir)
     os.makedirs(root_cache_dir, exist_ok=True, mode=0o700)
     os.chmod(root_cache_dir, mode=0o700)
     # auth cache and data cache
@@ -139,11 +175,11 @@ async def async_main():
     auth_provider: AuthProvider = AuthProvider(provider=external_provider)
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
-    persistence = DiskPersistence(data_cache_dir, max_size_gb=10, max_age_days=30)
+    persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
 
     inode_manager = InodeManager()
-    data_manager = DataManager(uc_client, persistence, ram_cache_mb=512)
-    metadata_manager = MetadataManager(uc_client, ttl=30, max_entries=20000, ttl_catalog=600)
+    data_manager = DataManager(uc_client, persistence, ram_cache_mb=args.ram_cache_mb)
+    metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec)
     auth_manager = AuthManager(uc_client, auth_provider, workspace=workspace)
     operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
 
