@@ -172,7 +172,7 @@ class MetadataManager:
         if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
-            async with self._cache_lock:
+            async with self._permissions_lock:
                 permissions_fullfilled = self._get_valid_cache(
                     self._permissions_cache, (ctx.uid, securable)
                 )
