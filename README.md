@@ -2,6 +2,12 @@
 
 A filesystem in userspace for mounting the Unity Catalog from Databricks.
 
+## Disclaimer
+
+This is not an official databricks package. I, the author of this package, am not affiliated to Databricks. My capacity to support this package is very limited or none. I may review issues and pull requests but I won't commit to timelines or features.
+
+## Features
+
 The filesystem is read only.
 
 This filesystem uses the [public databricks API](https://docs.databricks.com/api/azure/workspace/introduction) to retrieve files, directories and access permissions from the Unity Catalog.
@@ -24,9 +30,9 @@ a virtual `/Volumes/README.txt` file appears, with instructions on how to add th
 
 In the future other auth options may be integrated.
 
-# Installation
+## Installation
 
-You can install this from pypi:
+You can install this package from pypi:
 
     pip install "fuse4dbricks"
 
@@ -34,7 +40,7 @@ Or the development version:
 
     pip install "git+https://github.com/zeehio/fuse4dbricks.git"
 
-# Quickstart
+## Quickstart
 
 Assuming you are the only user:
 
