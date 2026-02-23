@@ -56,12 +56,19 @@ class DownloadScheduler:
             except KeyError:
                 return None, None, "regular"
 
+    def close(self) -> None:
+        # Closing send channel will eventually make receivers get EndOfChannel
+        self._wake_send.close()
+
     async def _downloader(self):
         while True:
             cache_key, chunk_request, priority = await self._dequeue_one()
             if cache_key is None or chunk_request is None:
                 # Nothing to do: block until someone enqueues work (no polling).
-                await self._wake_recv.receive()
+                try:
+                    await self._wake_recv.receive()
+                except trio.EndOfChannel:
+                    return
                 continue
             await self._process_request(chunk_request, priority)
 
@@ -107,6 +114,9 @@ class DataManager:
         # max number of chunks to cache in memory
         max_ram_chunks = int(ram_cache_mb*1024*1024 / self.chunk_size)
         self._ram_cache: RamCache[Tuple[str, int, float]] = RamCache(max_entries = max_ram_chunks)
+
+    def close(self) -> None:
+        self._download_scheduler.close()
 
     async def _process_request(self, chunk_request: _ChunkRequest, priority: str):
         try:
@@ -218,16 +228,24 @@ class DataManager:
         chunks_to_read = list(range(start_chunk, end_chunk + 1))
         # Download all required chunks
         chunks: dict[int, bytes|None] = {}
-        # dictionary: chunk_id -> bytes
-        async with trio.open_nursery() as nursery:
-            for chunk_id in chunks_to_read:
-                if chunk_id == num_chunks_in_file - 1:
-                    chunk_size = last_chunk_size
-                else:
-                    chunk_size = self.chunk_size
-                nursery.start_soon(
-                    self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks
-                )
+        if len(chunks_to_read) == 1:
+            chunk_id = chunks_to_read[0]
+            if chunk_id == num_chunks_in_file - 1:
+                chunk_size = last_chunk_size
+            else:
+                chunk_size = self.chunk_size
+            await self._read_chunk(fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks)
+        else:
+            # dictionary: chunk_id -> bytes
+            async with trio.open_nursery() as nursery:
+                for chunk_id in chunks_to_read:
+                    if chunk_id == num_chunks_in_file - 1:
+                        chunk_size = last_chunk_size
+                    else:
+                        chunk_size = self.chunk_size
+                    nursery.start_soon(
+                        self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks
+                    )
         # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
         num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
         chunks_to_prefetch = []
