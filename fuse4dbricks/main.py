@@ -114,7 +114,7 @@ def setup_logging(debug_mode):
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
 
 
-async def start_fuse(ops, mountpoint, allow_other, debug_mode):
+async def start_fuse(ops, mountpoint, allow_other, debug_mode, stopped_evt: trio.Event | None = None):
     mount_options = ["fsname=fuse4dbricks", "noatime"]
     if allow_other:
         mount_options.append("allow_other")
@@ -125,7 +125,7 @@ async def start_fuse(ops, mountpoint, allow_other, debug_mode):
         pyfuse3.init(ops, mountpoint, mount_options)
     except Exception as e:
         logging.error(f"Failed to initialize FUSE: {e}")
-        sys.exit(1)
+        raise  # allow nursery to handle cancellation/propagation
 
     logging.info(f"Mounted at {mountpoint}")
     try:
@@ -133,7 +133,11 @@ async def start_fuse(ops, mountpoint, allow_other, debug_mode):
     except KeyboardInterrupt:
         pass
     finally:
-        pyfuse3.close()
+        try:
+            pyfuse3.close()
+        finally:
+            if stopped_evt is not None:
+                stopped_evt.set()
 
 
 async def async_main():
@@ -182,18 +186,24 @@ async def async_main():
     metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec)
     auth_manager = AuthManager(uc_client, auth_provider, workspace=workspace)
     operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
-
+    stopped_evt = trio.Event()
     try:
         async with trio.open_nursery() as nursery:
-            nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug)            
             persistence.run_services(nursery)
             data_manager.run_services(nursery)
-    
+            nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug, stopped_evt)
+
+            await stopped_evt.wait()
+            nursery.cancel_scope.cancel()
+
     except ExceptionGroup as eg:
         # eg is the top-level ExceptionGroup
         logger.error("Top-level group message: %s", eg)
         for i, exc in enumerate(eg.exceptions, 1):
             logger.error("[%d] type=%s -> %s\n%s", i, type(exc).__name__, exc, traceback.format_exc())
+    finally:
+        data_manager.close()
+        await uc_client.close()
 
 
 def cli_entry_point():
