@@ -55,3 +55,78 @@ Open a new terminal:
     ls /Volumes
     # Your catalogs will appear
 
+## Multi user setup
+
+- Create a virtual environment and install fuse4dbricks there:
+
+      # Note that fuse4dbricks requires python>=3.11
+      sudo mkdir /opt/fuse4dbricks
+      sudo chmod 755
+      sudo python3.11 -m venv /opt/fuse4dbricks/venv
+      source /opt/fuse4dbricks/venv/bin/activate
+      python3 -m pip install fuse4dbricks
+      deactivate
+
+- Create a system user account
+
+      sudo useradd --system --shell /usr/sbin/nologin fuse4dbricks
+
+- Create the mount directory:
+
+      sudo mkdir /Volumes
+      sudo chown fuse4dbricks /Volumes
+      sudo chmod 0700 /Volumes
+
+- Create the cache directory:
+
+      sudo mkdir /var/cache/fuse4dbricks
+      sudo chmod 0700 /var/cache/fuse4dbricks
+      sudo chown fuse4dbricks /var/cache/fuse4dbricks
+
+- Create a starting script and make it executable:
+
+    Please replace whatever you need here
+
+      cat << EOF | sudo tee /opt/fuse4dbricks/fuse4dbricks_start.sh
+      #!/bin/bash
+
+      source /opt/fuse4dbricks/venv/bin/activate
+      fuse4dbricks \
+        --workspace "https://adb-xxxx.azuredatabricks.net" \
+        --disk-cache-dir /var/cache/fuse4dbricks \
+        --allow-other \
+        --ram-cache-mb 512 \
+        --disk-cache-gb 1024 \
+        --disk-cache-max-days 30 \
+        /Volumes
+      EOF
+      sudo chmod +x /opt/fuse4dbricks/fuse4dbricks_start.sh
+
+- Create a systemd unit
+
+      cat << EOF | sudo tee /etc/systemd/system/fuse4dbricks.service
+      [Unit]
+      Description=fuse4dbricks
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=fuse4dbricks
+      WorkingDirectory=/opt/fuse4dbricks
+      ExecStart=/opt/fuse4dbricks/fuse4dbricks_start.sh
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+
+- Reload the daemon lists
+
+      sudo systemctl daemon-reload
+
+- Enable and start the service
+
+      sudo systemctl enable fuse4dbricks
+      sudo systemctl start fuse4dbricks
