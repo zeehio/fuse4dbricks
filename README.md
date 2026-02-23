@@ -61,7 +61,7 @@ Open a new terminal:
 
       # Note that fuse4dbricks requires python>=3.11
       sudo mkdir /opt/fuse4dbricks
-      sudo chmod 755
+      sudo chmod 755 /opt/fuse4dbricks
       sudo python3.11 -m venv /opt/fuse4dbricks/venv
       source /opt/fuse4dbricks/venv/bin/activate
       python3 -m pip install fuse4dbricks
