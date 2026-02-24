@@ -12,6 +12,15 @@ from enum import Enum
 from typing import AsyncGenerator
 
 import httpx
+from fuse4dbricks.api.errors import (
+    UcBadRequest,
+    UcConflict,
+    UcError,
+    UcNotFound,
+    UcPermissionDenied,
+    UcRateLimited,
+    UcUnavailable,
+)
 
 from fuse4dbricks.auth.provider import AuthProvider
 
@@ -66,7 +75,46 @@ class UnityCatalogClient:
             "Accept": "application/json, application/octet-stream",
         }
 
-    async def _request(self, method, url, *, ctx_uid, params=None, headers=None, stream=False):
+    def _raise_for_status(self, resp: httpx.Response, *, uc_path: str | None = None) -> None:
+        if resp.status_code < 400:
+            return
+
+        request_id = resp.headers.get("x-databricks-request-id") or resp.headers.get("x-request-id")
+        url = str(resp.request.url)
+        msg = f"Databricks API error {resp.status_code}"
+
+        if resp.status_code in (401, 403):
+            # 401 tends to mean token invalid/expired; 403 means forbidden.
+            # The auth refresh logic already handles 401; after retry, treat as permission issue.
+            raise UcPermissionDenied(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
+
+        if resp.status_code == 404:
+            raise UcNotFound(msg, status_code=404, uc_path=uc_path, url=url, request_id=request_id)
+
+        if resp.status_code == 409:
+            raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
+
+        if resp.status_code == 400:
+            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
+
+        if resp.status_code == 429:
+            exc = UcRateLimited(msg, status_code=429, uc_path=uc_path, url=url, request_id=request_id)
+            # Optional: parse Retry-After
+            ra = resp.headers.get("retry-after")
+            if ra:
+                try:
+                    exc.retry_after_s = float(ra)
+                except ValueError:
+                    pass
+            raise exc
+
+        if resp.status_code in (500, 502, 503, 504):
+            raise UcUnavailable(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
+
+        raise UcError(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
+
+
+    async def _request(self, method, url, *, ctx_uid, params=None, headers=None, stream=False, uc_path=None):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
         """
@@ -102,7 +150,7 @@ class UnityCatalogClient:
         if not stream:
             if response.status_code == 404:
                 return None
-            response.raise_for_status()
+            self._raise_for_status(response, uc_path=uc_path)
 
             if method == "HEAD":
                 return response
@@ -111,12 +159,12 @@ class UnityCatalogClient:
         # For streams, we return the response object to be used in a context manager
         if response.status_code >= 400:
             await response.aclose()
-            response.raise_for_status()
+            self._raise_for_status(response, uc_path=uc_path)
         return response
 
     # --- Discovery Layer (Pagination Support) ---
 
-    async def _fetch_all_pages(self, endpoint, key, *, ctx_uid, params=None):
+    async def _fetch_all_pages(self, endpoint, key, *, ctx_uid, params=None, uc_path=None):
         if params is None:
             params = {}
         results = []
@@ -126,7 +174,7 @@ class UnityCatalogClient:
             if next_token:
                 params["page_token"] = next_token
 
-            data = await self._request("GET", endpoint, ctx_uid=ctx_uid, params=params)
+            data = await self._request("GET", endpoint, ctx_uid=ctx_uid, params=params, uc_path=uc_path)
             if not data:
                 break
 
@@ -139,6 +187,7 @@ class UnityCatalogClient:
     async def _get_catalogs(self, ctx_uid: int) -> list[UnityCatalogEntry]:
         catalogs = await self._fetch_all_pages(
             "/api/2.1/unity-catalog/catalogs", "catalogs", ctx_uid=ctx_uid,
+            uc_path="/Volumes",
         )
         return [
             UnityCatalogEntry(
@@ -162,6 +211,7 @@ class UnityCatalogClient:
         priv_assignments = await self._fetch_all_pages(
             endpoint, "privilege_assignments", ctx_uid=ctx_uid,
             params={"principal": principal},
+            uc_path=securable,
         )
         all_privs = set()
         for priv_assign in priv_assignments:
@@ -172,7 +222,7 @@ class UnityCatalogClient:
 
     async def _get_catalog(self, catalog_name: str, ctx_uid: int) -> UnityCatalogEntry | None:
         endpoint = f"/api/2.1/unity-catalog/catalogs/{catalog_name}"
-        catalog = await self._request("GET", endpoint, ctx_uid=ctx_uid)
+        catalog = await self._request("GET", endpoint, ctx_uid=ctx_uid, uc_path=f"/Volumes/{catalog_name}")
         if not catalog:
             return None
         return UnityCatalogEntry(
@@ -189,6 +239,7 @@ class UnityCatalogClient:
             "schemas",
             ctx_uid=ctx_uid,
             params={"catalog_name": catalog_name},
+            uc_path=f"/Volumes/{catalog_name}",
         )
         return [
             UnityCatalogEntry(
@@ -203,7 +254,11 @@ class UnityCatalogClient:
 
     async def _get_schema(self, catalog_name, schema_name, ctx_uid: int) -> UnityCatalogEntry | None:
         endpoint = f"/api/2.1/unity-catalog/schemas/{catalog_name}.{schema_name}"
-        schema = await self._request("GET", endpoint, ctx_uid=ctx_uid)
+        schema = await self._request("GET", endpoint,
+            ctx_uid=ctx_uid,
+            uc_path=f"/Volumes/{catalog_name}/{schema_name}"
+        )
+
         if not schema:
             return None
         return UnityCatalogEntry(
@@ -220,6 +275,7 @@ class UnityCatalogClient:
             "volumes",
             ctx_uid=ctx_uid,
             params={"catalog_name": catalog_name, "schema_name": schema_name},
+            uc_path=f"/Volumes/{catalog_name}/{schema_name}"
         )
         return [
             UnityCatalogEntry(
@@ -244,7 +300,10 @@ class UnityCatalogClient:
         endpoint = (
             f"/api/2.1/unity-catalog/volumes/{catalog_name}.{schema_name}.{volume_name}"
         )
-        volume = await self._request("GET", endpoint, ctx_uid=ctx_uid)
+        volume = await self._request("GET", endpoint,
+            ctx_uid=ctx_uid,
+            uc_path=f"/Volumes/{catalog_name}/{schema_name}/{volume_name}",
+        )
         if not volume:
             return None
         return UnityCatalogEntry(
@@ -272,7 +331,7 @@ class UnityCatalogClient:
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
 
-        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid)
+        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid, uc_path=path)
         if response is None:
             return None
 
@@ -300,7 +359,7 @@ class UnityCatalogClient:
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
 
-        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid)
+        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid, uc_path=path)
         if response is None:
             return None
         return UnityCatalogEntry(
@@ -367,7 +426,7 @@ class UnityCatalogClient:
             if next_token:
                 params["page_token"] = next_token
 
-            data = await self._request("GET", endpoint, params=params, ctx_uid=ctx_uid)
+            data = await self._request("GET", endpoint, params=params, ctx_uid=ctx_uid, uc_path=path)
             if first_page and data is None:
                 return None  # Possibly not a directory
             if data is None:
@@ -443,7 +502,7 @@ class UnityCatalogClient:
             )
 
         # We use _request with stream=True
-        response = await self._request("GET", endpoint, ctx_uid=ctx_uid, headers=headers, stream=True)
+        response = await self._request("GET", endpoint, ctx_uid=ctx_uid, headers=headers, stream=True, uc_path=path)
 
         try:
             # Yield data in increments of 64KB

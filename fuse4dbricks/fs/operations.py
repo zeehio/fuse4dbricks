@@ -15,6 +15,15 @@ from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.api.errors import (
+    UcBadRequest,
+    UcConflict,
+    UcError,
+    UcNotFound,
+    UcPermissionDenied,
+    UcRateLimited,
+    UcUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +57,35 @@ class UnityCatalogFS(pyfuse3.Operations):
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         # Check permissions
-        if self._dispatch(entry.fs_path) == "auth":
-            granted = await self.auth_manager.check_access(entry, mode, ctx)
-        else:
-            granted = await self.metadata_manager.check_access(entry, mode, ctx)
-        if not granted:
-            raise pyfuse3.FUSEError(errno.EACCES)
+        try:
+            if self._dispatch(entry.fs_path) == "auth":
+                granted = await self.auth_manager.check_access(entry, mode, ctx)
+            else:
+                granted = await self.metadata_manager.check_access(entry, mode, ctx)
+            if not granted:
+                raise pyfuse3.FUSEError(errno.EACCES)
+        except Exception as e:
+            raise pyfuse3.FUSEError(errno.EACCES) from e
         return True
 
+    def _raise_fuse_error(self, exc: Exception, *, fs_path: str | None = None, op: str | None = None):
+        # Domain -> errno mapping
+        if isinstance(exc, UcPermissionDenied):
+            raise pyfuse3.FUSEError(errno.EACCES) from exc
+        if isinstance(exc, UcNotFound):
+            raise pyfuse3.FUSEError(errno.ENOENT) from exc
+        if isinstance(exc, UcBadRequest):
+            raise pyfuse3.FUSEError(errno.EINVAL) from exc
+        if isinstance(exc, UcConflict):
+            raise pyfuse3.FUSEError(errno.EEXIST) from exc
+        if isinstance(exc, (UcRateLimited, UcUnavailable)):
+            # transient
+            raise pyfuse3.FUSEError(errno.EAGAIN) from exc
+        if isinstance(exc, UcError):
+            raise pyfuse3.FUSEError(errno.EIO) from exc
+
+        # fall back
+        raise pyfuse3.FUSEError(errno.EIO) from exc
 
     async def access(self, inode: int, mode: int, ctx: pyfuse3.RequestContext) -> bool:
         return await self._check_permissions(inode, mode, ctx)
@@ -100,10 +130,14 @@ class UnityCatalogFS(pyfuse3.Operations):
             return await self.getattr(existing, ctx=ctx)
 
         # 2. Ask Cache/API
-        if self._dispatch(full_path) == "auth":
-            attr = await self.auth_manager.lookup_child(parent_entry, name, ctx)
-        else:
-            attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        try:
+            if self._dispatch(full_path) == "auth":
+                attr = await self.auth_manager.lookup_child(parent_entry, name, ctx)
+            else:
+                attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        except Exception as exc:
+            self._raise_fuse_error(exc, fs_path=full_path, op="lookup")
+
         if attr is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         # 3. Create Inode
@@ -219,6 +253,9 @@ class UnityCatalogFS(pyfuse3.Operations):
                     if exc.errno == errno.EACCES and inode == pyfuse3.ROOT_INODE:
                         return
                     raise
+                except Exception as exc:
+                    self._raise_fuse_error(exc, fs_path=entry.fs_path, op="readdir")
+                    raise
             if items is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             self._readdir_state[fh]["children"] = items
@@ -307,7 +344,8 @@ class UnityCatalogFS(pyfuse3.Operations):
                     ctx_uid=ctx.uid,
                 )
         except Exception as e:
-            logger.error(f"Read error reading {entry.fs_path}: {e}")
+            logger.exception("read failed op=read path=%s uid=%s. %s", entry.fs_path, getattr(ctx, "uid", None), e)
+            self._raise_fuse_error(e, fs_path=entry.fs_path, op="read")
             raise pyfuse3.FUSEError(errno.EIO)
 
     async def write(self, fh, offset, buffer) -> int:
