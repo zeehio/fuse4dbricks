@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
+from fuse4dbricks.api.errors import UcError
 
 # --- FIXTURES ---
 
@@ -46,7 +47,7 @@ async def test_request_success_200(client, mock_auth_provider):
     result = await client._request("GET", "/test", ctx_uid=0)
 
     assert result == {"key": "value"}
-    #await mock_auth_provider.get_access_token.assert_awaited_with(ctx_uid=0)
+    mock_auth_provider.get_access_token.assert_awaited_with(ctx_uid=0)
 
     # Verify headers
     call_kwargs = client.client.build_request.call_args[1]
@@ -140,18 +141,23 @@ async def test_download_chunk_stream_headers(client):
 
 @pytest.mark.trio
 async def test_download_chunk_stream_412_precondition_failed(client):
-    """Verify that if the file changed (412), it raises error."""
+    """Verify that if the file changed (412), it raises a UcError."""
     mock_response = AsyncMock(spec=httpx.Response)
     mock_response.status_code = 412
-    # Simulamos el comportamiento de raise_for_status
-    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-        "412 Precondition Failed", request=MagicMock(), response=mock_response
-    )
+
+    # UnityCatalogClient._raise_for_status reads these fields
+    mock_response.headers = {}
+    mock_response.request = MagicMock(spec=httpx.Request)
+    mock_response.request.url = "https://test-workspace.net/api/2.0/fs/files/file.bin"
+
+    # For stream=True, _request() will aclose() the response on error
+    mock_response.aclose = AsyncMock()
 
     client.client.send.return_value = mock_response
 
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(UcError) as excinfo:
         async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx_uid=0):
             pass
 
-    assert excinfo.value.response.status_code == 412
+    assert excinfo.value.status_code == 412
+    mock_response.aclose.assert_awaited()
