@@ -32,6 +32,9 @@ In the future other auth options may be integrated.
 
 ## Installation
 
+*This package depends on pyfuse3, that requires the `libfuse3-dev` or `fuse3-devel` system package
+being installed. The package name depends on your specific linux distribution.*
+
 You can install this package from pypi:
 
     pip install "fuse4dbricks"
@@ -82,6 +85,10 @@ Open a new terminal:
       sudo mkdir /var/cache/fuse4dbricks
       sudo chmod 0700 /var/cache/fuse4dbricks
       sudo chown fuse4dbricks /var/cache/fuse4dbricks
+
+- Enable `user_allow_other` support in `/etc/fuse.conf`
+
+    Edit `/etc/fuse.conf` and uncomment the `user_allow_other` line.
 
 - Create a starting script and make it executable:
 
