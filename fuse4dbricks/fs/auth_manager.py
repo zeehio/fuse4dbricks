@@ -73,6 +73,7 @@ class AuthManager:
         self._uc_client = uc_client
         self._auth_provider = auth_provider
         self._workspace = workspace
+        self._write_buffers = {}
 
     def _gen_readme(self) -> bytes:
         readme = f"""README
@@ -227,27 +228,46 @@ the device authorization flow is not available.
             end_range = file_size
         return file_contents[offset:end_range]
 
+    async def release(self, fs_path: str, ctx_uid: int):
+        if not self._file_exists(fs_path):
+            raise pyfuse3.FUSEError(errno.EIO)
+        fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
+        if fs_type == AuthInode.ACCESS_TOKEN:
+            # Buffer the write per (fs_path, ctx_uid)
+            key = (fs_path, ctx_uid)
+            # On release, set the access token from the accumulated buffer
+            buffer = self._write_buffers.pop(key, None)
+            if buffer is not None:
+                try:
+                    buffer_txt = buffer.decode("utf-8").strip()
+                except Exception:
+                    buffer_txt = ""
+                self._auth_provider.set_access_token(ctx_uid=ctx_uid, access_token=buffer_txt)
+        return
+
     async def write(self, fs_path: str, offset: int, buffer: bytes, ctx_uid: int) -> int:
         if not self._file_exists(fs_path):
             raise pyfuse3.FUSEError(errno.EIO)
-        if offset != 0:
-            # For simplicity, we only allow full overwrites from the start of the file
-            raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
-        # All writes are expected to be just text, so we can turn buffer to text
-        # We can also strip whitespace since that's probably user error
-        try:
-            buffer_txt = buffer.decode("utf-8").strip()
-        except Exception:
-            raise pyfuse3.FUSEError(errno.EIO)
-        if fs_type == AuthInode.CTRL:
-            cmd = buffer_txt
-            if cmd == "init":
-                print("Received INIT command. Starting OAuth flow...")
-                self._auth_provider._external_provider.initiate_device_flow()
-                # 3. Spawn background task to poll for token
-            return len(buffer)
         if fs_type == AuthInode.ACCESS_TOKEN:
-            self._auth_provider.set_access_token(ctx_uid=ctx_uid, access_token=buffer_txt)
+            # Buffer the write per (fs_path, ctx_uid)
+            key = (fs_path, ctx_uid)
+            # Prepare overwrite:
+            if offset == 0:
+                self._write_buffers[key] = bytearray()
+            # If offset is beyond current buffer, we reject:
+            if offset > len(self._write_buffers.get(key, b"")):
+                raise pyfuse3.FUSEError(errno.EIO)
+            # Insert/overwrite at offset
+            buf = self._write_buffers.get(key, bytearray())
+            # Expand buffer if needed
+            if len(buf) < offset:
+                buf.extend(b"\x00" * (offset - len(buf)))
+            # Overwrite or append
+            if len(buf) < offset + len(buffer):
+                buf[offset:] = buffer
+            else:
+                buf[offset:offset+len(buffer)] = buffer
+            self._write_buffers[key] = buf
             return len(buffer)
         raise pyfuse3.FUSEError(errno.EACCES)

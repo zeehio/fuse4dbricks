@@ -309,6 +309,27 @@ class UnityCatalogFS(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=fh)
 
     async def release(self, fh: pyfuse3.FileHandleT) -> None:
+        if fh not in self._open_state:
+            # This should not happen, but we want to be resilient to it. Just ignore.
+            return
+
+        inode = self._open_state[fh]["inode"]
+        ctx = self._open_state[fh]["ctx"]
+
+        entry = self.inodes.get_entry(inode)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        try:
+            if self._dispatch(entry.fs_path) == "auth":
+                await self.auth_manager.release(
+                    entry.fs_path,
+                    ctx_uid=ctx.uid,
+                )
+        except Exception as e:
+            logger.error(f"release/close error on {entry.fs_path}: {e}")
+            raise pyfuse3.FUSEError(errno.EIO)
+
         if fh in self._open_state:
             del self._open_state[fh]
 
