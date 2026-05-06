@@ -26,8 +26,8 @@ class _ChunkRequest:
     "last modified, to ensure chunks are not altered between reads"
     chunk_size: int
     "size of this chunk. It may be smaller than the typical chunk_size on the last chunk of o a file"
-    ctx_uid: int
-    "who requested the chunk"
+    ctx: pyfuse3.RequestContext
+    "request context, used for auth when downloading"
 
 class DownloadScheduler:
     def __init__(self, process_request, num_workers=10):
@@ -145,7 +145,7 @@ class DataManager:
             path=uc_path,
             offset=offset,
             length=length,
-            ctx_uid=chunk_request.ctx_uid,
+            ctx=chunk_request.ctx,
             if_unmodified_since=chunk_request.mtime,
         )
         chunk = await self.persistence.store_chunk_from_stream(
@@ -156,13 +156,13 @@ class DataManager:
         )
         return chunk
 
-    async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, ctx_uid: int):
+    async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, ctx: pyfuse3.RequestContext):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
             cache_key = (fs_path, chunk_id, mtime)
             (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
             if not leader:
                 continue  # already being fetched, we don't care about it
-            chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx_uid=ctx_uid)
+            chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx=ctx)
             await self._download_scheduler.enqueue_request(chunk_request, high_priority=False)
         return None
 
@@ -181,7 +181,7 @@ class DataManager:
 
     async def _read_chunk(
         self, fs_path: str, chunk_id: int, mtime: float, chunk_size: int, 
-        ctx_uid: int, out_dict: dict[int, bytes|None]
+        ctx: pyfuse3.RequestContext, out_dict: dict[int, bytes|None]
     ):
         cache_key = (fs_path, chunk_id, mtime)
         chunk = await self._get_chunk_from_cache_or_disk(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime)
@@ -194,7 +194,7 @@ class DataManager:
 
         if leader:
             # get chunk from network
-            chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx_uid=ctx_uid)
+            chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, chunk_size=chunk_size, ctx=ctx)
             await self._download_scheduler.enqueue_request(chunk_request, high_priority=True)
 
         # Now we wait for the download to complete and fetch it from RAM or Disk
@@ -206,7 +206,7 @@ class DataManager:
 
     async def read(
         self, fs_path: str, offset: int, length: int, mtime: float, file_size: int,
-        ctx_uid: int
+        ctx: pyfuse3.RequestContext
     ) -> bytes:
         """
         Reads file contents
@@ -234,7 +234,7 @@ class DataManager:
                 chunk_size = last_chunk_size
             else:
                 chunk_size = self.chunk_size
-            await self._read_chunk(fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks)
+            await self._read_chunk(fs_path, chunk_id, mtime, chunk_size, ctx, chunks)
         else:
             # dictionary: chunk_id -> bytes
             async with trio.open_nursery() as nursery:
@@ -244,7 +244,7 @@ class DataManager:
                     else:
                         chunk_size = self.chunk_size
                     nursery.start_soon(
-                        self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx_uid, chunks
+                        self._read_chunk, fs_path, chunk_id, mtime, chunk_size, ctx, chunks
                     )
         # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
         num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
@@ -261,7 +261,7 @@ class DataManager:
                 chunk_size = self.chunk_size
             # Add to list to fetch:
             chunks_to_prefetch.append((chunk_to_prefetch, chunk_size))
-        await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, ctx_uid)
+        await self._request_fetch_ahead_chunks(fs_path, chunks_to_prefetch, mtime, ctx)
         # Assemble chunks
         result = bytearray()
         for chunk_id in chunks_to_read:
@@ -276,5 +276,5 @@ class DataManager:
             result.extend(chunk_data[chunk_start:chunk_end])
         return bytes(result)
 
-    async def write(self, fs_path: str, offset: int, buffer: bytes, ctx_uid: int) -> int:
+    async def write(self, fs_path: str, offset: int, buffer: bytes, ctx: pyfuse3.RequestContext) -> int:
         raise pyfuse3.FUSEError(errno.EACCES)

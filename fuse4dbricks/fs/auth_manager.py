@@ -8,59 +8,13 @@ from fuse4dbricks.fs.inode_manager import InodeEntryAttr, InodeEntry
 logger = logging.getLogger(__name__)
 
 
-LOGIN_SCRIPT_CONTENT = b"""#!/bin/bash
-AUTH_DIR="$(dirname "$0")"
-CTRL_FILE="$AUTH_DIR/.login_ctrl"
-STATUS_FILE="$AUTH_DIR/.login_status"
-GREEN='\\033[0;32m'
-BLUE='\\033[0;34m'
-RED='\\033[0;31m'
-NC='\\033[0m'
-
-echo -e "${BLUE}=== Databricks Fuse Driver Login ===${NC}"
-echo "init" > "$CTRL_FILE" || { echo "Failed to init"; exit 1; }
-
-# Read initial status
-DATA=$(cat "$STATUS_FILE")
-STATE=$(echo "$DATA" | cut -d'|' -f1)
-URL=$(echo "$DATA" | cut -d'|' -f2)
-CODE=$(echo "$DATA" | cut -d'|' -f3)
-
-if [ "$STATE" != "PENDING" ]; then
-    echo -e "${RED}Error: $STATE${NC}"
-    exit 1
-fi
-
-echo ""
-echo -e "Visit:  ${BLUE}$URL${NC}"
-echo -e "Code:   ${GREEN}$CODE${NC}"
-echo ""
-echo "Waiting for browser login..."
-
-# Simple polling loop
-while true; do
-    CURRENT_STATUS=$(cat "$STATUS_FILE")
-    if [[ "$CURRENT_STATUS" == "SUCCESS"* ]]; then
-        echo -e "${GREEN}Success! Logged in.${NC}"
-        break
-    fi
-    sleep 2
-done
-"""
-
 class AuthInode(Enum):
     AUTH_DIR = "AUTH_DIR"
-    SCRIPT = "SCRIPT"
-    CTRL = "CTRL"
-    STATUS = "STATUS"
     ACCESS_TOKEN = "ACCESS_TOKEN"
     README = "README"
 
 _FS_PATH_TO_AUTHINODE = {
     "/.auth": AuthInode.AUTH_DIR,
-    "/.auth/login.sh": AuthInode.SCRIPT,
-    "/.auth/.login_ctrl": AuthInode.CTRL,
-    "/.auth/.login_status": AuthInode.STATUS,
     "/.auth/personal_access_token": AuthInode.ACCESS_TOKEN,
     "/.auth/README.txt": AuthInode.README,
     "/README.txt": AuthInode.README,
@@ -87,9 +41,6 @@ If you are not seeing your catalogs or you get permission errors, you may need t
 
     echo "dapi0000000000000000000-2" > /Volumes/.auth/personal_access_token
 
-Alternatively, if the /Volumes/.auth/login.sh script exists, you can execute
-it to obtain a token using a device authorization flow. If you don't see it,
-the device authorization flow is not available.
 """.encode("utf-8")
         return readme
 
@@ -97,15 +48,6 @@ the device authorization flow is not available.
         if auth_inode == AuthInode.AUTH_DIR:
             mode = (stat.S_IFDIR | 0o555)
             size = 4096
-        elif auth_inode == AuthInode.SCRIPT:
-            mode = (stat.S_IFREG | 0o555)
-            size = len(LOGIN_SCRIPT_CONTENT)
-        elif auth_inode == AuthInode.CTRL:
-            mode = (stat.S_IFREG | 0o222)
-            size = 0
-        elif auth_inode == AuthInode.STATUS:
-            mode = (stat.S_IFREG | 0o444)
-            size = 1024  # Arbitrary size for status file
         elif auth_inode == AuthInode.ACCESS_TOKEN:
             mode = (stat.S_IFREG | 0o222)
             size = 0
@@ -124,19 +66,7 @@ the device authorization flow is not available.
         )
 
     def _file_exists(self, fs_path) -> bool:
-        if fs_path not in _FS_PATH_TO_AUTHINODE:
-            return False
-        auth_inode = _FS_PATH_TO_AUTHINODE[fs_path]
-        if self._auth_provider.has_external_provider:
-            return True
-        # No external provider only few files available:
-        available_files = [
-            AuthInode.AUTH_DIR,
-            AuthInode.README,
-            AuthInode.ACCESS_TOKEN,
-        ]
-        return auth_inode in available_files
-        
+        return fs_path in _FS_PATH_TO_AUTHINODE
 
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
         if not self._file_exists(entry.fs_path):
@@ -179,19 +109,10 @@ the device authorization flow is not available.
                 "README.txt":  self._gen_attr(AuthInode.README),
             }
         if ftype == AuthInode.AUTH_DIR:
-            if self._auth_provider.has_external_provider:
-                return {
-                    "README.txt":  self._gen_attr(AuthInode.README),
-                    "personal_access_token": self._gen_attr(AuthInode.ACCESS_TOKEN),
-                    "login.sh": self._gen_attr(AuthInode.SCRIPT),
-                    ".login_ctrl": self._gen_attr(AuthInode.CTRL),
-                    ".login_status": self._gen_attr(AuthInode.STATUS),
-                }
-            else:
-                return {
-                    "README.txt":  self._gen_attr(AuthInode.README),
-                    "personal_access_token": self._gen_attr(AuthInode.ACCESS_TOKEN),
-                }
+            return {
+                "README.txt":  self._gen_attr(AuthInode.README),
+                "personal_access_token": self._gen_attr(AuthInode.ACCESS_TOKEN),
+            }
         return None
 
 
@@ -200,24 +121,13 @@ the device authorization flow is not available.
 
     async def read(
         self, fs_path: str, offset: int, length: int, mtime: float, file_size: int,
-        ctx_uid: int
+        ctx: pyfuse3.RequestContext
     ) -> bytes:
         if not self._file_exists(fs_path):
             raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
         if fs_type == AuthInode.README:
             file_contents = self._gen_readme()
-        elif fs_type == AuthInode.SCRIPT:
-            file_contents = LOGIN_SCRIPT_CONTENT
-        elif fs_type == AuthInode.STATUS:
-            # For this simplified example, we'll cheat and say "Lookup generic state"
-            
-            # SIMULATION logic:
-            # We construct the status string dynamically
-            file_contents = b"PENDING|https://databricks.com/login|ABCD-1234\n"
-            
-            # If the user script loops, eventually we want to return SUCCESS
-            # This is where you would check self.user_states[uid].
         else:
             raise pyfuse3.FUSEError(errno.EACCES)
         file_size = len(file_contents)
@@ -228,13 +138,13 @@ the device authorization flow is not available.
             end_range = file_size
         return file_contents[offset:end_range]
 
-    async def release(self, fs_path: str, ctx_uid: int):
+    async def release(self, fs_path: str, ctx: pyfuse3.RequestContext):
         if not self._file_exists(fs_path):
             raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
         if fs_type == AuthInode.ACCESS_TOKEN:
-            # Buffer the write per (fs_path, ctx_uid)
-            key = (fs_path, ctx_uid)
+            # Buffer the write per (fs_path, ctx.uid)
+            key = (fs_path, ctx.uid)
             # On release, set the access token from the accumulated buffer
             buffer = self._write_buffers.pop(key, None)
             if buffer is not None:
@@ -242,16 +152,16 @@ the device authorization flow is not available.
                     buffer_txt = buffer.decode("utf-8").strip()
                 except Exception:
                     buffer_txt = ""
-                self._auth_provider.set_access_token(ctx_uid=ctx_uid, access_token=buffer_txt)
+                self._auth_provider.set_access_token(ctx_uid=ctx.uid, access_token=buffer_txt)
         return
 
-    async def write(self, fs_path: str, offset: int, buffer: bytes, ctx_uid: int) -> int:
+    async def write(self, fs_path: str, offset: int, buffer: bytes, ctx: pyfuse3.RequestContext) -> int:
         if not self._file_exists(fs_path):
             raise pyfuse3.FUSEError(errno.EIO)
         fs_type = _FS_PATH_TO_AUTHINODE[fs_path]
         if fs_type == AuthInode.ACCESS_TOKEN:
-            # Buffer the write per (fs_path, ctx_uid)
-            key = (fs_path, ctx_uid)
+            # Buffer the write per (fs_path, ctx.uid)
+            key = (fs_path, ctx.uid)
             # Prepare overwrite:
             if offset == 0:
                 self._write_buffers[key] = bytearray()
