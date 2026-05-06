@@ -68,8 +68,8 @@ class UnityCatalogClient:
     async def close(self):
         await self.client.aclose()
 
-    async def _get_headers(self, ctx_uid):
-        token = await self.auth_provider.get_access_token(ctx_uid=ctx_uid)
+    async def _get_headers(self, ctx: pyfuse3.RequestContext) -> dict[str, str]:
+        token = await self.auth_provider.get_access_token(ctx=ctx)
         return {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json, application/octet-stream",
@@ -114,14 +114,14 @@ class UnityCatalogClient:
         raise UcError(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
 
 
-    async def _request(self, method, url, *, ctx_uid, params=None, headers=None, stream=False, uc_path=None):
+    async def _request(self, method, url, *, ctx: pyfuse3.RequestContext, params=None, headers=None, stream=False, uc_path=None):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
         """
         if headers is None:
             headers = {}
 
-        base_headers = await self._get_headers(ctx_uid=ctx_uid)
+        base_headers = await self._get_headers(ctx=ctx)
         headers.update(base_headers)
 
         request = self.client.build_request(method, url, params=params, headers=headers)
@@ -135,9 +135,10 @@ class UnityCatalogClient:
         # 401 Retry Logic (Token Expiration)
         if response.status_code == 401:
             logger.warning("Token expired (401). Refreshing and retrying...")
-            await self.auth_provider.get_access_token(ctx_uid=ctx_uid, force_refresh=True)
+            self.auth_provider.invalidate_access_token(ctx=ctx)
+            await self.auth_provider.get_access_token(ctx=ctx)
 
-            headers.update(await self._get_headers(ctx_uid=ctx_uid))
+            headers.update(await self._get_headers(ctx=ctx))
             # For stream=True, we must ensure the first response is closed before retrying
             if stream:
                 await response.aclose()
@@ -164,7 +165,7 @@ class UnityCatalogClient:
 
     # --- Discovery Layer (Pagination Support) ---
 
-    async def _fetch_all_pages(self, endpoint, key, *, ctx_uid, params=None, uc_path=None):
+    async def _fetch_all_pages(self, endpoint, key, *, ctx: pyfuse3.RequestContext, params=None, uc_path=None):
         if params is None:
             params = {}
         results = []
@@ -174,7 +175,7 @@ class UnityCatalogClient:
             if next_token:
                 params["page_token"] = next_token
 
-            data = await self._request("GET", endpoint, ctx_uid=ctx_uid, params=params, uc_path=uc_path)
+            data = await self._request("GET", endpoint, ctx=ctx, params=params, uc_path=uc_path)
             if not data:
                 break
 
@@ -184,9 +185,9 @@ class UnityCatalogClient:
                 break
         return results
 
-    async def _get_catalogs(self, ctx_uid: int) -> list[UnityCatalogEntry]:
+    async def _get_catalogs(self, ctx: pyfuse3.RequestContext) -> list[UnityCatalogEntry]:
         catalogs = await self._fetch_all_pages(
-            "/api/2.1/unity-catalog/catalogs", "catalogs", ctx_uid=ctx_uid,
+            "/api/2.1/unity-catalog/catalogs", "catalogs", ctx=ctx,
             uc_path="/Volumes",
         )
         return [
@@ -200,16 +201,16 @@ class UnityCatalogClient:
             for x in catalogs
         ]
 
-    async def get_current_user_info(self, ctx_uid: int) -> str:
+    async def get_current_user_info(self, ctx: pyfuse3.RequestContext) -> str:
         endpoint = "/api/2.0/preview/scim/v2/Me"
-        resp = await self._request("GET", endpoint, ctx_uid=ctx_uid)
+        resp = await self._request("GET", endpoint, ctx=ctx)
         return resp["userName"]
 
     async def check_permissions(self, securable: str, securable_type: str,
-                                privileges: list[str], principal: str, ctx_uid: int) -> bool:
+                                privileges: list[str], principal: str, ctx: pyfuse3.RequestContext) -> bool:
         endpoint = f"/api/2.1/unity-catalog/effective-permissions/{securable_type}/{securable}"
         priv_assignments = await self._fetch_all_pages(
-            endpoint, "privilege_assignments", ctx_uid=ctx_uid,
+            endpoint, "privilege_assignments", ctx=ctx,
             params={"principal": principal},
             uc_path=securable,
         )
@@ -220,9 +221,9 @@ class UnityCatalogClient:
         return set(privileges).issubset(all_privs)
 
 
-    async def _get_catalog(self, catalog_name: str, ctx_uid: int) -> UnityCatalogEntry | None:
+    async def _get_catalog(self, catalog_name: str, ctx: pyfuse3.RequestContext) -> UnityCatalogEntry | None:
         endpoint = f"/api/2.1/unity-catalog/catalogs/{catalog_name}"
-        catalog = await self._request("GET", endpoint, ctx_uid=ctx_uid, uc_path=f"/Volumes/{catalog_name}")
+        catalog = await self._request("GET", endpoint, ctx=ctx, uc_path=f"/Volumes/{catalog_name}")
         if not catalog:
             return None
         return UnityCatalogEntry(
@@ -233,11 +234,11 @@ class UnityCatalogClient:
             mtime=float(catalog["updated_at"]) / 1000.0,
         )
 
-    async def _get_schemas(self, catalog_name: str, ctx_uid) -> list[UnityCatalogEntry]:
+    async def _get_schemas(self, catalog_name: str, ctx: pyfuse3.RequestContext) -> list[UnityCatalogEntry]:
         schemas = await self._fetch_all_pages(
             "/api/2.1/unity-catalog/schemas",
             "schemas",
-            ctx_uid=ctx_uid,
+            ctx=ctx,
             params={"catalog_name": catalog_name},
             uc_path=f"/Volumes/{catalog_name}",
         )
@@ -252,10 +253,10 @@ class UnityCatalogClient:
             for x in schemas
         ]
 
-    async def _get_schema(self, catalog_name, schema_name, ctx_uid: int) -> UnityCatalogEntry | None:
+    async def _get_schema(self, catalog_name, schema_name, ctx: pyfuse3.RequestContext) -> UnityCatalogEntry | None:
         endpoint = f"/api/2.1/unity-catalog/schemas/{catalog_name}.{schema_name}"
         schema = await self._request("GET", endpoint,
-            ctx_uid=ctx_uid,
+            ctx=ctx,
             uc_path=f"/Volumes/{catalog_name}/{schema_name}"
         )
 
@@ -269,11 +270,11 @@ class UnityCatalogClient:
             mtime=float(schema["updated_at"]) / 1000.0,
         )
 
-    async def _get_volumes(self, catalog_name, schema_name, ctx_uid: int):
+    async def _get_volumes(self, catalog_name, schema_name, ctx: pyfuse3.RequestContext):
         volumes = await self._fetch_all_pages(
             "/api/2.1/unity-catalog/volumes",
             "volumes",
-            ctx_uid=ctx_uid,
+            ctx=ctx,
             params={"catalog_name": catalog_name, "schema_name": schema_name},
             uc_path=f"/Volumes/{catalog_name}/{schema_name}"
         )
@@ -295,13 +296,13 @@ class UnityCatalogClient:
 
     async def _get_volume(
         self, catalog_name, schema_name, volume_name,
-        ctx_uid: int,
+        ctx: pyfuse3.RequestContext,
     ) -> UnityCatalogEntry | None:
         endpoint = (
             f"/api/2.1/unity-catalog/volumes/{catalog_name}.{schema_name}.{volume_name}"
         )
         volume = await self._request("GET", endpoint,
-            ctx_uid=ctx_uid,
+            ctx=ctx,
             uc_path=f"/Volumes/{catalog_name}/{schema_name}/{volume_name}",
         )
         if not volume:
@@ -326,12 +327,12 @@ class UnityCatalogClient:
             path = "/" + path
         return urllib.parse.quote(path)
 
-    async def _get_file_metadata(self, path: str, ctx_uid) -> UnityCatalogEntry | None:
+    async def _get_file_metadata(self, path: str, ctx: pyfuse3.RequestContext) -> UnityCatalogEntry | None:
         """HEAD request for size/mtime."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/files{encoded_path}"
 
-        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid, uc_path=path)
+        response = await self._request("HEAD", endpoint, ctx=ctx, uc_path=path)
         if response is None:
             return None
 
@@ -354,12 +355,12 @@ class UnityCatalogClient:
             mtime=mtime,
         )
 
-    async def _get_directory_metadata(self, path: str, ctx_uid) -> UnityCatalogEntry | None:
+    async def _get_directory_metadata(self, path: str, ctx: pyfuse3.RequestContext) -> UnityCatalogEntry | None:
         """HEAD request, checks for existance."""
         encoded_path = self._quote_path(path)
         endpoint = f"/api/2.0/fs/directories{encoded_path}"
 
-        response = await self._request("HEAD", endpoint, ctx_uid=ctx_uid, uc_path=path)
+        response = await self._request("HEAD", endpoint, ctx=ctx, uc_path=path)
         if response is None:
             return None
         return UnityCatalogEntry(
@@ -369,7 +370,7 @@ class UnityCatalogClient:
         )
 
     async def get_path_metadata(
-        self, uc_path: str, *, ctx_uid: int, expected_type: UcNodeType | None = None
+        self, uc_path: str, *, ctx: pyfuse3.RequestContext, expected_type: UcNodeType | None = None
     ) -> UnityCatalogEntry | None:
         """
         Gets the catalog entry. None if not found. expected_type is optional
@@ -390,29 +391,29 @@ class UnityCatalogClient:
             raise ValueError("'/Volumes' is not a unity catalog entry.")
         catalog = parts[2]
         if len(parts) == 3:
-            return await self._get_catalog(catalog, ctx_uid=ctx_uid)
+            return await self._get_catalog(catalog, ctx=ctx)
         schema = parts[3]
         if len(parts) == 4:
-            return await self._get_schema(catalog, schema, ctx_uid=ctx_uid)
+            return await self._get_schema(catalog, schema, ctx=ctx)
         volume = parts[4]
         if len(parts) == 5:
-            return await self._get_volume(catalog, schema, volume, ctx_uid=ctx_uid)
+            return await self._get_volume(catalog, schema, volume, ctx=ctx)
         if expected_type == UcNodeType.DIRECTORY:
-            entry = await self._get_directory_metadata(uc_path, ctx_uid=ctx_uid)
+            entry = await self._get_directory_metadata(uc_path, ctx=ctx)
             if entry is None:
                 # File not found, check if that path is now a directory (because
                 # someone created a folder with that same name)
-                entry = await self._get_file_metadata(uc_path, ctx_uid=ctx_uid)
+                entry = await self._get_file_metadata(uc_path, ctx=ctx)
                 # Returns either the folder or None if not found
                 return entry
             return entry
-        entry = await self._get_file_metadata(uc_path, ctx_uid=ctx_uid)
+        entry = await self._get_file_metadata(uc_path, ctx=ctx)
         if entry is None:
-            entry = await self._get_directory_metadata(uc_path, ctx_uid=ctx_uid)
+            entry = await self._get_directory_metadata(uc_path, ctx=ctx)
         return entry
 
     async def _list_directory_contents(
-        self, path, *, ctx_uid: int, limit=None
+        self, path, *, ctx: pyfuse3.RequestContext, limit=None
     ) -> list[UnityCatalogEntry] | None:
         """Lists directory contents, or None if not a directory"""
         encoded_path = self._quote_path(path)
@@ -426,7 +427,7 @@ class UnityCatalogClient:
             if next_token:
                 params["page_token"] = next_token
 
-            data = await self._request("GET", endpoint, params=params, ctx_uid=ctx_uid, uc_path=path)
+            data = await self._request("GET", endpoint, params=params, ctx=ctx, uc_path=path)
             if first_page and data is None:
                 return None  # Possibly not a directory
             if data is None:
@@ -454,7 +455,7 @@ class UnityCatalogClient:
                 break
         return results
 
-    async def get_path_contents(self, uc_path: str, ctx_uid: int) -> list[UnityCatalogEntry] | None:
+    async def get_path_contents(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> list[UnityCatalogEntry] | None:
         """
         Lists the path contents, or returns None if not a catalog/schema/volume/directory
 
@@ -469,22 +470,21 @@ class UnityCatalogClient:
         if len(parts) < 2 or parts[1] != "Volumes":
             raise ValueError("path should start with /Volumes")
         if len(parts) == 2:
-            return await self._get_catalogs(ctx_uid=ctx_uid)
+            return await self._get_catalogs(ctx=ctx)
         catalog = parts[2]
         if len(parts) == 3:
-            return await self._get_schemas(catalog_name=catalog, ctx_uid=ctx_uid)
+            return await self._get_schemas(catalog_name=catalog, ctx=ctx)
         schema = parts[3]
         if len(parts) == 4:
-            return await self._get_volumes(catalog, schema, ctx_uid=ctx_uid)
-        return await self._list_directory_contents(uc_path, ctx_uid=ctx_uid)
-
+            return await self._get_volumes(catalog, schema, ctx=ctx)
+        return await self._list_directory_contents(uc_path, ctx=ctx)
     async def download_chunk_stream(
         self,
         path: str,
         offset: int,
         length: int,
         *,
-        ctx_uid: int,
+        ctx: pyfuse3.RequestContext,
         if_unmodified_since: float | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """
@@ -502,7 +502,7 @@ class UnityCatalogClient:
             )
 
         # We use _request with stream=True
-        response = await self._request("GET", endpoint, ctx_uid=ctx_uid, headers=headers, stream=True, uc_path=path)
+        response = await self._request("GET", endpoint, ctx=ctx, headers=headers, stream=True, uc_path=path)
 
         try:
             # Yield data in increments of 64KB

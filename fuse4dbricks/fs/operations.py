@@ -324,7 +324,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             if self._dispatch(entry.fs_path) == "auth":
                 await self.auth_manager.release(
                     entry.fs_path,
-                    ctx_uid=ctx.uid,
+                    ctx=ctx,
                 )
         except Exception as e:
             logger.error(f"release/close error on {entry.fs_path}: {e}")
@@ -353,7 +353,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                     length,
                     entry.attr.st_mtime,
                     entry.attr.st_size,
-                    ctx_uid=ctx.uid,
+                    ctx=ctx,
                 )
             else:
                 return await self.data_manager.read(
@@ -362,7 +362,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                     length,
                     entry.attr.st_mtime,
                     entry.attr.st_size,
-                    ctx_uid=ctx.uid,
+                    ctx=ctx,
                 )
         except Exception as e:
             logger.exception("read failed op=read path=%s uid=%s. %s", entry.fs_path, getattr(ctx, "uid", None), e)
@@ -387,7 +387,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                     entry.fs_path,
                     offset,
                     buffer,
-                    ctx_uid=ctx.uid,
+                    ctx=ctx,
                 )
             else:
                 raise pyfuse3.FUSEError(errno.EACCES)

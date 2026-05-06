@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+import pyfuse3
+
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.api.errors import UcError
 
@@ -44,11 +46,11 @@ async def test_request_success_200(client, mock_auth_provider):
     mock_response.json.return_value = {"key": "value"}
     client.client.send.return_value = mock_response
 
-    result = await client._request("GET", "/test", ctx_uid=0)
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
 
     assert result == {"key": "value"}
-    mock_auth_provider.get_access_token.assert_awaited_with(ctx_uid=0)
-
+    mock_auth_provider.get_access_token.assert_awaited_with(ctx=ctx)
     # Verify headers
     call_kwargs = client.client.build_request.call_args[1]
     assert call_kwargs["headers"]["Authorization"] == "Bearer fake_token_123"
@@ -66,12 +68,12 @@ async def test_request_401_retry_success(client, mock_auth_provider):
 
     client.client.send.side_effect = [response_401, response_200]
 
-    result = await client._request("GET", "/test", ctx_uid=0)
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
 
     assert result == {"success": True}
     assert client.client.send.call_count == 2
-    mock_auth_provider.get_access_token.assert_any_call(force_refresh=True, ctx_uid=0)
-
+    mock_auth_provider.get_access_token.assert_any_call(force_refresh=True, ctx=ctx)
 
 # --- TESTS: PATH & METADATA ---
 
@@ -93,7 +95,8 @@ async def test_get_file_metadata_parsing(client):
     }
     client.client.send.return_value = mock_response
 
-    meta = await client._get_file_metadata("/data.csv", ctx_uid=0)
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    meta = await client._get_file_metadata("/data.csv", ctx=ctx)
 
     assert meta.size == 1024
     expected_dt = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -107,7 +110,8 @@ async def test_get_file_metadata_404(client):
     mock_response.status_code = 404
     client.client.send.return_value = mock_response
 
-    result = await client._get_file_metadata("/missing", ctx_uid=0)
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._get_file_metadata("/missing", ctx=ctx)
     assert result is None
 
 
@@ -128,8 +132,9 @@ async def test_download_chunk_stream_headers(client):
 
     client.client.send.return_value = mock_response
 
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
     chunks = []
-    async for chunk in client.download_chunk_stream("/file.bin", offset=0, length=100, ctx_uid=0):
+    async for chunk in client.download_chunk_stream("/file.bin", offset=0, length=100, ctx=ctx):
         chunks.append(chunk)
 
     assert b"".join(chunks) == b"chunk1chunk2"
@@ -155,8 +160,9 @@ async def test_download_chunk_stream_412_precondition_failed(client):
 
     client.client.send.return_value = mock_response
 
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
     with pytest.raises(UcError) as excinfo:
-        async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx_uid=0):
+        async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx=ctx):
             pass
 
     assert excinfo.value.status_code == 412

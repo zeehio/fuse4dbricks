@@ -54,8 +54,9 @@ async def test_consistency_precondition_failed_with_respx(auth_mock):
 
         # Execution: Intentar descargar. El error debe saltar al iniciar el stream.
         with pytest.raises(UcError) as excinfo:
+            ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
             stream = client.download_chunk_stream(
-                file_path, offset=0, length=10, ctx_uid=0, if_unmodified_since=t1_old.timestamp()
+                file_path, offset=0, length=10, ctx=ctx, if_unmodified_since=t1_old.timestamp()
             )
             await consume_stream(stream)
 
@@ -84,8 +85,9 @@ async def test_consistency_success_with_respx(auth_mock):
         )
 
         # Action: Consumir el stream
+        ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
         stream = client.download_chunk_stream(
-            file_path, offset=0, length=15, ctx_uid=0, if_unmodified_since=t_now.timestamp()
+            file_path, offset=0, length=15, ctx=ctx, if_unmodified_since=t_now.timestamp()
         )
         data = await consume_stream(stream)
 
@@ -113,7 +115,8 @@ async def test_download_without_conditional_header(auth_mock):
             return_value=httpx.Response(200, content=b"just data")
         )
 
-        stream = client.download_chunk_stream(file_path, 0, 9, ctx_uid=0)
+        ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+        stream = client.download_chunk_stream(file_path, 0, 9, ctx=ctx)
         data = await consume_stream(stream)
 
         sent_request = respx_mock.calls.last.request
