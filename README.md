@@ -70,21 +70,15 @@ Open a new terminal:
       python3 -m pip install fuse4dbricks
       deactivate
 
-- Create a system user account
-
-      sudo useradd --system --shell /usr/sbin/nologin fuse4dbricks
-
 - Create the mount directory:
 
       sudo mkdir /Volumes
-      sudo chown fuse4dbricks /Volumes
-      sudo chmod 0700 /Volumes
+      sudo chmod 0755 /Volumes
 
 - Create the cache directory:
 
       sudo mkdir /var/cache/fuse4dbricks
       sudo chmod 0700 /var/cache/fuse4dbricks
-      sudo chown fuse4dbricks /var/cache/fuse4dbricks
 
 - Enable `user_allow_other` support in `/etc/fuse.conf`
 
@@ -102,6 +96,7 @@ Open a new terminal:
         --workspace "https://adb-xxxx.azuredatabricks.net" \
         --disk-cache-dir /var/cache/fuse4dbricks \
         --allow-other \
+        --posit-workbench \
         --ram-cache-mb 512 \
         --disk-cache-gb 1024 \
         --disk-cache-max-days 30 \
@@ -118,11 +113,17 @@ Open a new terminal:
 
       [Service]
       Type=simple
-      User=fuse4dbricks
+      User=root
       WorkingDirectory=/opt/fuse4dbricks
       ExecStart=/opt/fuse4dbricks/fuse4dbricks_start.sh
       Restart=on-failure
       RestartSec=5
+
+      CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+      AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+      NoNewPrivileges=no
+      ProtectHome=yes
+      PrivateDevices=yes
 
       [Install]
       WantedBy=multi-user.target
