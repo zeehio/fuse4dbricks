@@ -19,7 +19,6 @@ from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
 from fuse4dbricks.auth.provider import AuthProvider
-from fuse4dbricks.auth.entra_id import EntraIDPublicAuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 logger = logging.getLogger(__name__)
@@ -48,10 +47,6 @@ def parse_args():
     parser.add_argument(
         "--workspace", default="", help="https://adb-xxxx.azuredatabricks.net"
     )
-    parser.add_argument("--tenant-id", help="Azure Tenant ID (required for device auth)", required=False, default="")
-    parser.add_argument(
-        "--client-id", default="", required=False, help="Azure App Client ID (required for device auth)"
-    )
     parser.add_argument("mountpoint", help="Local directory to mount")
     parser.add_argument(
         "--disk-cache-dir", default=_get_default_cache_dir(), help="Local disk cache location"
@@ -60,7 +55,9 @@ def parse_args():
     parser.add_argument("--allow-other", action="store_true",
         help="Use -o allow_other only if /etc/fuse.conf has user_allow_other"
     )
-
+    parser.add_argument("--unified-auth", action="store_true", default=True,
+        help="Use the Databricks Unified Authentication to obtain a token"
+    )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
     )
@@ -171,12 +168,8 @@ async def async_main():
             sys.exit(1)
 
     # Auth
-    logging.info("Initializing Authentication...")
-    external_provider = None
-    if args.tenant_id and args.client_id:
-        external_provider = EntraIDPublicAuthProvider(tenant_id=args.tenant_id, client_id = args.client_id, cache_dir=auth_cache_dir)
-
-    auth_provider: AuthProvider = AuthProvider(provider=external_provider)
+    logging.info(f"Initializing Authentication... with {args.unified_auth=}")
+    auth_provider: AuthProvider = AuthProvider(unified_auth=args.unified_auth)
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
