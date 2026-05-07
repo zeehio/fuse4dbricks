@@ -147,6 +147,7 @@ class MetadataManager:
         #R_OK = 4
         W_OK = 2
         if (mode & W_OK):
+            logger.error("Write access not supported")
             raise pyfuse3.FUSEError(errno.EACCES)
         (securable, securable_type) = fs_to_securable(entry.fs_path)
         if securable == "":
@@ -184,6 +185,7 @@ class MetadataManager:
         try:
             principal = await self._get_principal(ctx)
             if principal is None:
+                logger.error(f"Unable to get principal for {ctx=}")
                 raise pyfuse3.FUSEError(errno.EACCES)
             permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx=ctx)
             # Cache the result
