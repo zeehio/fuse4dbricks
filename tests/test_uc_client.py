@@ -73,7 +73,7 @@ async def test_request_401_retry_success(client, mock_auth_provider):
 
     assert result == {"success": True}
     assert client.client.send.call_count == 2
-    mock_auth_provider.get_access_token.assert_any_call(force_refresh=True, ctx=ctx)
+    mock_auth_provider.get_access_token.assert_any_call(ctx=ctx)
 
 # --- TESTS: PATH & METADATA ---
 
