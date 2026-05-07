@@ -117,7 +117,7 @@ class MetadataManager:
     # Public API
     # =========================================================================
 
-    async def _get_principal(self, ctx) -> str|None:
+    async def _get_principal(self, ctx: pyfuse3.RequestContext) -> str|None:
         async with self._principal_cache_lock:
             principal = self._principal_cache.get(ctx.uid)
             if principal is not None:
@@ -134,7 +134,7 @@ class MetadataManager:
 
         # 3. Real API Call (Leader Only)
         try:
-            principal = await self.uc_client.get_current_user_info(ctx.uid)
+            principal = await self.uc_client.get_current_user_info(ctx)
             async with self._principal_cache_lock:
                 self._principal_cache[ctx.uid] = principal
                 if len(self._principal_cache) > self.max_entries:
