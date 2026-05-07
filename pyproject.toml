@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fuse4dbricks"
-version = "0.6.0"
+version = "0.6.1"
 description = "FUSE driver for Databricks Unity Catalog Volumes."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,7 +23,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
-    'pyfuse3>=3.2.0 ; platform_system != "Windows"',
+    'pyfuse3>=3.4.2 ; platform_system != "Windows"',
     "trio>=0.22.0",
     "msal>=1.20.0",
     "httpx>=0.24.0",

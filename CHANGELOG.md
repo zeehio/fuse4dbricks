@@ -1,3 +1,8 @@
+# 0.6.1 (2026-05-07)
+
+- Fix type issue
+- Depend on pyfuse3.4.2 to make sure 3.4.1 is not used (it's yanked)
+
 # 0.6.0 (2026-05-07)
 
 - Allow setting long access tokens (when token splits in more than one
