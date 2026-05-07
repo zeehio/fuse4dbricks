@@ -146,11 +146,11 @@ class DatabricksUnifiedAuthProvider:
 
     def _get_profile_and_config_file_name(self, env: dict[str, str], uid: int) -> tuple[str, str] | tuple[None, None]:
         """ Gets the databricks profile and config file name.
-        1. Check if env defines DATABRICKS_PROFILE and DATABRICKS_CONFIG_FILE
-        2. If not, default to DATABRICKS_PROFILE=DEFAULT and DATABRICKS_CONFIG_FILE=~/.databrickscfg (in the user's home directory)
+        1. Check if env defines DATABRICKS_CONFIG_PROFILE and DATABRICKS_CONFIG_FILE
+        2. If not, default to DATABRICKS_CONFIG_PROFILE=DEFAULT and DATABRICKS_CONFIG_FILE=~/.databrickscfg (in the user's home directory)
         """
         if env is not None:
-            profile = env.get("DATABRICKS_PROFILE", "DEFAULT")
+            profile = env.get("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
             config_file = env.get("DATABRICKS_CONFIG_FILE")
         else:
             profile = "DEFAULT"
@@ -163,6 +163,7 @@ class DatabricksUnifiedAuthProvider:
             if not Path(config_file).exists():
                 config_file = None       
         if config_file is None:
+            logger.error("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
             return None, None
         return profile, config_file
 
@@ -193,6 +194,7 @@ class DatabricksUnifiedAuthProvider:
         # The process does not define a token, but defines a profile or config file:
         profile, config_file = self._get_profile_and_config_file_name(env, ctx.uid)
         if profile is None or config_file is None:
+            logger.error("No databricks token found in environment variables for pid %s, and no profile or config file found for uid %s", ctx.pid, ctx.uid)
             return None
         return self._get_token_from_config(profile, config_file)
 

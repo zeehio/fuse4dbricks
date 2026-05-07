@@ -168,7 +168,7 @@ async def async_main():
             sys.exit(1)
 
     # Auth
-    logging.info("Initializing Authentication...")
+    logging.info(f"Initializing Authentication... with {args.unified_auth=}")
     auth_provider: AuthProvider = AuthProvider(unified_auth=args.unified_auth)
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
