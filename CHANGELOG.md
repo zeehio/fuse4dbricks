@@ -1,4 +1,4 @@
-# 0.5.3.9000 (unreleased)
+# 0.6.0 (2026-05-07)
 
 - Allow setting long access tokens (when token splits in more than one
   write syscall).
