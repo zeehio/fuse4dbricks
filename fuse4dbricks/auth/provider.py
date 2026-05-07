@@ -144,7 +144,7 @@ class DatabricksUnifiedAuthProvider:
             logger.error("Failed to read environ file %s for pid %s. Exception: %s", environ_file, pid, exc)
             return None
 
-    def _get_profile_and_config_file_name(self, env: dict[str, str], uid: int) -> tuple[str, str] | tuple[None, None]:
+    def _get_profile_and_config_file_name(self, env: dict[str, str]|None, uid: int) -> tuple[str, str] | tuple[None, None]:
         """ Gets the databricks profile and config file name.
         1. Check if env defines DATABRICKS_CONFIG_PROFILE and DATABRICKS_CONFIG_FILE
         2. If not, default to DATABRICKS_CONFIG_PROFILE=DEFAULT and DATABRICKS_CONFIG_FILE=~/.databrickscfg (in the user's home directory)
@@ -161,7 +161,7 @@ class DatabricksUnifiedAuthProvider:
             home_dir = self._home_for_uid(uid)
             config_file = os.path.join(home_dir, ".databrickscfg")
             if not Path(config_file).exists():
-                config_file = None       
+                config_file = None
         if config_file is None:
             logger.error("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
             return None, None
@@ -185,7 +185,7 @@ class DatabricksUnifiedAuthProvider:
             logger.error(f"'token' not found in profile '{profile}' of {config_file}")
             return None
 
-    async def get_access_token(self, ctx: pyfuse3.RequestContext) -> str:
+    async def get_access_token(self, ctx: pyfuse3.RequestContext) -> str|None:
         """ Gets the databricks token for the given request context by checking the environment variables of the requesting process and then the config file. """
         env = self._get_env_for_pid(ctx.pid)
         # The process defines an access token:

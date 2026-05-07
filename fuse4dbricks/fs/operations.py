@@ -52,7 +52,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         else:
             return "unity_catalog"
 
-    async def _check_permissions(self, inode: int, mode: int, ctx):
+    async def _check_permissions(self, inode: int, mode: int, ctx: pyfuse3.RequestContext):
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
