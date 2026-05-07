@@ -18,8 +18,7 @@ from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
-from fuse4dbricks.auth.provider import AuthProvider, PositWorkbenchAuthProvider
-from fuse4dbricks.auth.entra_id import EntraIDPublicAuthProvider
+from fuse4dbricks.auth.provider import AuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
 logger = logging.getLogger(__name__)
@@ -56,8 +55,8 @@ def parse_args():
     parser.add_argument("--allow-other", action="store_true",
         help="Use -o allow_other only if /etc/fuse.conf has user_allow_other"
     )
-    parser.add_argument("--posit-workbench", action="store_true", default=False,
-        help="Use the Posit Workbench databricks integration to obtain a token"
+    parser.add_argument("--unified-auth", action="store_true", default=True,
+        help="Use the Databricks Unified Authentication to obtain a token"
     )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
@@ -170,10 +169,7 @@ async def async_main():
 
     # Auth
     logging.info("Initializing Authentication...")
-    external_provider = None
-    if args.positworkbench:
-        external_provider = PositWorkbenchAuthProvider()
-    auth_provider: AuthProvider = AuthProvider(provider=external_provider)
+    auth_provider: AuthProvider = AuthProvider(unified_auth=args.unified_auth)
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
