@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, AsyncMock
 import httpx
 import pytest
 import respx
+import pyfuse3
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.api.errors import UcError
