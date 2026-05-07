@@ -2,8 +2,7 @@
 
 - Allow setting long access tokens (when token splits in more than one
   write syscall).
-- Add support for running as a service on a machine with Posit Workbench
-  reading the databricks token automatically.
+- Add Databricks Unified Auth support (Needs root permissions if running multiuser).
 
 
 # 0.5.3 (2026-02-24)

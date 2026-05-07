@@ -12,6 +12,8 @@ from enum import Enum
 from typing import AsyncGenerator
 
 import httpx
+import pyfuse3
+
 from fuse4dbricks.api.errors import (
     UcBadRequest,
     UcConflict,
@@ -21,7 +23,6 @@ from fuse4dbricks.api.errors import (
     UcRateLimited,
     UcUnavailable,
 )
-
 from fuse4dbricks.auth.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
