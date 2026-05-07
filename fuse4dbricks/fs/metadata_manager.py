@@ -185,7 +185,7 @@ class MetadataManager:
             principal = await self._get_principal(ctx)
             if principal is None:
                 raise pyfuse3.FUSEError(errno.EACCES)
-            permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx_uid=ctx.uid)
+            permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx=ctx)
             # Cache the result
             async with self._permissions_lock:
                 self._permissions_cache[(ctx.uid, securable)] = (time.time() + self._ttl, permissions_fullfilled)
@@ -267,7 +267,7 @@ class MetadataManager:
         # 3. Real API Lookup
         try:
             uc_path = fs_to_uc_path(child_fs_path)
-            uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx_uid=ctx.uid)
+            uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx=ctx)
             if uc_entry is None:
                 # Not found (negative cache could be implemented here if desired)
                 return None
@@ -308,7 +308,7 @@ class MetadataManager:
         try:
             # Fetch raw metadata (size, mtime, etc.) along with names
             uc_path = fs_to_uc_path(entry.fs_path)
-            uc_entries = await self.uc_client.get_path_contents(uc_path, ctx_uid=ctx.uid)
+            uc_entries = await self.uc_client.get_path_contents(uc_path, ctx=ctx)
             if (
                 uc_entries is None
             ):  # May this happen because of any other reason as not a directory?
@@ -425,7 +425,7 @@ class MetadataManager:
         uc_path = fs_to_uc_path(entry.fs_path)
         uc_entry = await self.uc_client.get_path_metadata(
             uc_path,
-            ctx_uid=ctx.uid,
+            ctx=ctx,
             expected_type=node_type
         )
         if uc_entry is None:

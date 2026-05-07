@@ -30,61 +30,71 @@ a virtual `/Volumes/README.txt` file appears, with instructions on how to add th
 
 In the future other auth options may be integrated.
 
-## Installation
+## Requirements
 
-*This package depends on pyfuse3, that requires the `libfuse3-dev` or `fuse3-devel` system package
-being installed. The package name depends on your specific linux distribution.*
+**This package depends on pyfuse3, that requires the `libfuse3-dev` or `fuse3-devel` system package
+being installed. The package name depends on your specific linux distribution.**
 
-You can install this package from pypi:
+- Debian / Ubuntu: `sudo apt install libfuse3-dev`
+- RedHat / Fedora: `sudo dnf install fuse3-devel`
+- SUSE: `sudo zypper install fuse3-devel`
 
-    pip install "fuse4dbricks"
-
-Or the development version:
-
-    pip install "git+https://github.com/zeehio/fuse4dbricks.git"
 
 ## Quickstart
 
-Assuming you are the only user:
+If you want to see databricks volumes as if you were on Databricks (in /Volumes) you will need admin
+privileges to create /Volumes directory on your computer. Otherwise you can use $HOME/Volumes or whatever
+directory you have access to.
 
-    sudo mkdir "/Volumes" # or any other directory, in your home, it's up to you
-    fuse4dbricks --workspace "https://adb-xxxx.azuredatabricks.net" /Volumes
-
-Open a new terminal:
-
-    # Provide your databricks access token:
-    echo "dapi0000000-2" > /Volumes/.auth/personal_access_token
-    # Access your catalog files:
-    ls /Volumes
+    pip install "fuse4dbricks"
+    mkdir "$HOME/Volumes" # or any other directory
+    fuse4dbricks --workspace "https://adb-xxxx.azuredatabricks.net" $HOME/Volumes
+    ls $HOME/Volumes
     # Your catalogs will appear
 
+This uses databricks unified authentication (e.g. searches for `$HOME/.databrickscfg` in your home). If no unified auth file
+is found, you will find a README file with instructions on how to provide a personal access token.
+
+If you are the only user (e.g. on your laptop) and you have admin permissions, feel free to use `/Volumes` so paths are like on databricks:
+
+    pip install "fuse4dbricks"
+    sudo mkdir /Volumes"
+	sudo chown $USER /Volumes
+    fuse4dbricks --workspace "https://adb-xxxx.azuredatabricks.net" /Volumes
+    ls /Volumes
+    # Your catalogs will appear on /Volumes
+
 ## Multi user setup
+
+If you are on a shared computer (e.g. an HPC), fuse4dbricks can run as a root service and use the access tokens from any user who
+aims to access unity catalog volumes.
+
+The databricks token used will depend on the user who asks for the file.
+
+A cache is shared so if many users read the same files the access speed is faster. Users can't access other users files, because each
+user has to provide its own access token.
 
 - Create a virtual environment and install fuse4dbricks there:
 
       # Note that fuse4dbricks requires python>=3.11
-      sudo mkdir /opt/fuse4dbricks
-      sudo chmod 755 /opt/fuse4dbricks
-      sudo python3.11 -m venv /opt/fuse4dbricks/venv
+	  sudo bash
+      mkdir /opt/fuse4dbricks
+      chmod 755 /opt/fuse4dbricks
+      python3.11 -m venv /opt/fuse4dbricks/venv
       source /opt/fuse4dbricks/venv/bin/activate
       python3 -m pip install fuse4dbricks
       deactivate
-
-- Create a system user account
-
-      sudo useradd --system --shell /usr/sbin/nologin fuse4dbricks
+	  exit # exit from sudo bash
 
 - Create the mount directory:
 
       sudo mkdir /Volumes
-      sudo chown fuse4dbricks /Volumes
-      sudo chmod 0700 /Volumes
+      sudo chmod 0755 /Volumes
 
 - Create the cache directory:
 
       sudo mkdir /var/cache/fuse4dbricks
       sudo chmod 0700 /var/cache/fuse4dbricks
-      sudo chown fuse4dbricks /var/cache/fuse4dbricks
 
 - Enable `user_allow_other` support in `/etc/fuse.conf`
 
@@ -118,7 +128,7 @@ Open a new terminal:
 
       [Service]
       Type=simple
-      User=fuse4dbricks
+      User=root
       WorkingDirectory=/opt/fuse4dbricks
       ExecStart=/opt/fuse4dbricks/fuse4dbricks_start.sh
       Restart=on-failure
