@@ -16,19 +16,19 @@ To mitigate latency and improve **performance**, file metadata is cached in-memo
 to a local cache directory (`--disk-cache-dir`) and partially to RAM as well. Options to control
 the sizes of those caches are available.
 
-**Credentials** are stored in RAM while the filesystem is mounted, and must be passed by writing a
+**Credentials** are stored in RAM while the filesystem is mounted.
+
+`DATABRICKS_CONFIG_PROFILE` and `DATABRICKS_CONFIG_FILE` are used to find the databricks configuration file and obtain a valid access token. Alternatively, credentials can be passed by writing a
 personal access token to a virtual file:
 
     echo "dapi0000000-2" > /Volumes/.auth/personal_access_token
 
+
 If fuse (`/etc/fuse.conf`) has `user_allow_other` activated, this driver supports the `--allow-other`,
-option so **multiple users** can access it. In this case, the process should typically run from a system user,
-(you may consider creating a fuse4dbricks user?) who should have exclusive access to `--disk-cache-dir`. Each user should provide its own personal access token as described. **Permissions are respected for each user**. The cache is shared among all users in this scenario.
+option so **multiple users** can access it. In this case, the fuse4dbricks process should run from a root account, who should have exclusive access to `--disk-cache-dir`. fuse4dbricks will inspect the environment variables of the requesting process, as well as the requesting user, in order to find the right credentials. This may require reading the `.databrickscfg` file from the requesting user. The cache is shared among all users in this scenario.
 
 When an access token is missing, revoked or expired, the unity catalog is not accessible anymore and only
-a virtual `/Volumes/README.txt` file appears, with instructions on how to add the access token.
-
-In the future other auth options may be integrated.
+a virtual `/Volumes/README.txt` file appears, with instructions on how to add the access token manually.
 
 ## Requirements
 
