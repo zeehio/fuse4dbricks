@@ -88,6 +88,12 @@ def parse_args():
         help="TTL for catalog metadata cache entries in seconds",
     )
     parser.add_argument(
+        "--metadata-cache-ttl-negative-sec",
+        type=int,
+        default=5,
+        help="TTL for negative (not-found) metadata cache entries in seconds",
+    )
+    parser.add_argument(
         "--metadata-cache-max-entries",
         type=int,
         default=20000,
@@ -172,7 +178,7 @@ async def async_main():
 
     inode_manager = InodeManager()
     data_manager = DataManager(uc_client, persistence, ram_cache_mb=args.ram_cache_mb)
-    metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec)
+    metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec, ttl_negative=args.metadata_cache_ttl_negative_sec)
     # On a 401, the token is invalidated and re-resolved (possibly to a
     # different principal); drop the cached principal so authz re-derives it.
     auth_provider.set_token_invalidation_callback(metadata_manager.forget_principal)

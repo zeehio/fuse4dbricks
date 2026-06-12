@@ -30,6 +30,14 @@
   only if the principal actually changed.
 - Cache catalog/schema permission grants with the longer catalog TTL (volume
   grants keep the shorter TTL for faster revocation).
+- Key the permission cache by principal (not uid) and drop the cached principal
+  whenever a token is invalidated (auth-file write or 401), so a uid switching
+  tokens to a different principal can never read the previous principal's
+  cached grants.
+- Add a short-lived, per-principal negative (not-found) cache so repeated
+  lookups of missing paths are answered without re-hitting Unity Catalog, and a
+  coalescing follower can tell "genuinely absent" (ENOENT) from "the lookup
+  failed" (retryable). TTL via `--metadata-cache-ttl-negative-sec` (5s default).
 - Fix a `lookup` race where a `forget` arriving during the `getattr` await
   could free a still-referenced inode (spurious `ENOENT`); the inode is now
   pinned before the await.
