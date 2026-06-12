@@ -100,14 +100,29 @@ If you are not seeing your catalogs or you get permission errors, you may need t
         file_type = _FS_PATH_TO_AUTHINODE[child_fs_path]
         return self._gen_attr(file_type)
 
+    def root_overlay(self) -> dict[str, InodeEntryAttr]:
+        """Virtual entries overlaid on the filesystem root.
+
+        operations.readdir merges these with the Unity Catalog listing at the
+        root. Keeping the definition here (instead of hardcoding names in
+        readdir) makes AuthManager the single source of truth for the auth
+        namespace: adding or renaming an auth entry is confined to this class.
+
+        Insertion order is significant — it determines the readdir offsets of
+        these entries.
+        """
+        return {
+            ".auth": self._gen_attr(AuthInode.AUTH_DIR),
+            "README.txt": self._gen_attr(AuthInode.README),
+        }
+
     async def list_directory(
         self, entry: InodeEntry, ctx: pyfuse3.RequestContext
     ) -> dict[str, InodeEntryAttr] | None:
         ftype = _FS_PATH_TO_AUTHINODE.get(entry.fs_path)
-        if entry == pyfuse3.ROOT_INODE:
-            return {
-                "README.txt":  self._gen_attr(AuthInode.README),
-            }
+        # The filesystem root is handled by operations.readdir, which merges
+        # root_overlay() with the Unity Catalog listing. This manager is only
+        # ever asked to list the "/.auth" directory.
         if ftype == AuthInode.AUTH_DIR:
             return {
                 "README.txt":  self._gen_attr(AuthInode.README),

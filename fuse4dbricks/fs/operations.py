@@ -209,52 +209,38 @@ class UnityCatalogFS(pyfuse3.Operations):
             if not ret:
                 return
 
-        if inode == pyfuse3.ROOT_INODE and start_id <= 2:
-            auth_attr = await self.auth_manager.lookup_child(entry, ".auth", ctx)
-            if auth_attr is None:
-                raise RuntimeError("Unexpected error: .auth not found. This should not happen")
-            logger.debug(" - .auth")
-            child_entry = self.inodes.add_entry(
-                parent_inode=inode,
-                name=".auth",
-                attr=auth_attr,
-            )
-            ret = pyfuse3.readdir_reply(
-                token,
-                name=child_entry.name.encode("utf-8"),
-                attr=self._entry_to_fuse_attr(child_entry),
-                next_id=3,
-            )
-            if ret:
-                self.inodes.increment_lookup_count(child_entry.inode)
-            else:
-                return
-
-        if inode == pyfuse3.ROOT_INODE and start_id <= 3:
-            readme_attr = await self.auth_manager.lookup_child(entry, "README.txt", ctx)
-            if readme_attr is None:
-                raise RuntimeError("Unexpected error: README.txt not found. This should not happen")
-            logger.debug(" - .README.txt")
-            child_entry = self.inodes.add_entry(
-                parent_inode=inode,
-                name="README.txt",
-                attr=readme_attr,
-            )
-            ret = pyfuse3.readdir_reply(
-                token,
-                name=child_entry.name.encode("utf-8"),
-                attr=self._entry_to_fuse_attr(child_entry),
-                next_id=4,
-            )
-            if ret:
-                self.inodes.increment_lookup_count(child_entry.inode)
-            else:
-                return
-
+        # Virtual entries overlaid on the root (the auth files). The auth
+        # manager owns their names/attributes; readdir only handles the
+        # incremental-offset bookkeeping. They follow . (next_id 1) and
+        # .. (next_id 2), so overlay entry i sits at next_id = 3 + i and is
+        # emitted only once the cursor (start_id) has reached it.
         if inode == pyfuse3.ROOT_INODE:
-            meta_attr = 4
+            overlay = self.auth_manager.root_overlay()
         else:
-            meta_attr = 2
+            overlay = {}
+
+        for i, (overlay_name, overlay_attr) in enumerate(overlay.items()):
+            threshold = 2 + i
+            if start_id > threshold:
+                continue
+            logger.debug(f" - {overlay_name}")
+            child_entry = self.inodes.add_entry(
+                parent_inode=inode,
+                name=overlay_name,
+                attr=overlay_attr,
+            )
+            ret = pyfuse3.readdir_reply(
+                token,
+                name=child_entry.name.encode("utf-8"),
+                attr=self._entry_to_fuse_attr(child_entry),
+                next_id=threshold + 1,
+            )
+            if ret:
+                self.inodes.increment_lookup_count(child_entry.inode)
+            else:
+                return
+
+        meta_attr = 2 + len(overlay)
 
         # Get Children from Cache/API
         if start_id <= meta_attr:
