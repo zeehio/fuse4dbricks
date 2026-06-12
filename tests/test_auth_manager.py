@@ -185,6 +185,30 @@ async def test_list_directory_nonexistent_returns_none(manager, ctx):
     assert items is None
 
 
+@pytest.mark.trio
+async def test_list_directory_root_returns_none(manager, root_entry, ctx):
+    # The root overlay is handled by operations.readdir via root_overlay(),
+    # not by list_directory; asking this manager to list "/" yields nothing.
+    assert await manager.list_directory(root_entry, ctx) is None
+
+
+# ---------------------------------------------------------------------------
+# root_overlay
+# ---------------------------------------------------------------------------
+
+
+def test_root_overlay_contains_auth_and_readme(manager):
+    overlay = manager.root_overlay()
+    # AuthManager is the single source of truth for the names overlaid at root.
+    assert list(overlay.keys()) == [".auth", "README.txt"]
+
+
+def test_root_overlay_entry_types(manager):
+    overlay = manager.root_overlay()
+    assert bool(overlay[".auth"].st_mode & stat.S_IFDIR)
+    assert bool(overlay["README.txt"].st_mode & stat.S_IFREG)
+
+
 # ---------------------------------------------------------------------------
 # read
 # ---------------------------------------------------------------------------

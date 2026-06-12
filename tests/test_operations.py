@@ -9,7 +9,8 @@ Covers:
   - open                   (permission flags; EISDIR for directories)
   - release                (state cleanup; delegates auth release)
   - read                   (routes to auth or data manager)
-  - write                  (auth files writable; non-auth → EIO via bug, noted inline)
+  - write                  (auth files writable; read-only catalog → EACCES)
+  - readdir                (root overlay merge + offset bookkeeping)
   - forget                 (delegates to inode_manager)
 """
 
@@ -436,3 +437,85 @@ async def test_forget_decrements_ref_count(fs, inode_manager):
 
     # ref = 0 → inode should be cleaned up
     assert inode_manager.get_entry(entry.inode) is None
+
+
+# ---------------------------------------------------------------------------
+# readdir
+# ---------------------------------------------------------------------------
+
+
+def _capture_readdir_replies(monkeypatch):
+    """Patch pyfuse3.readdir_reply to record (name, next_id) and always accept."""
+    calls: list = []
+
+    def fake_reply(token, name, attr, next_id):
+        calls.append((name, next_id))
+        return True
+
+    monkeypatch.setattr(pyfuse3, "readdir_reply", fake_reply)
+    return calls
+
+
+@pytest.mark.trio
+async def test_readdir_root_merges_auth_overlay_then_catalogs(fs, metadata_manager, auth_manager, ctx, monkeypatch):
+    # The auth manager owns the overlay names; readdir places them after . and ..
+    auth_manager.root_overlay = MagicMock(return_value={
+        ".auth": _make_attr(True),
+        "README.txt": _make_attr(False, size=100),
+    })
+    metadata_manager.list_directory = AsyncMock(return_value={"my_catalog": _make_attr(True)})
+
+    calls = _capture_readdir_replies(monkeypatch)
+
+    fh = await fs.opendir(pyfuse3.ROOT_INODE, ctx)
+    await fs.readdir(fh, 0, token=object())
+
+    assert calls == [
+        (b".", 1),
+        (b"..", 2),
+        (b".auth", 3),
+        (b"README.txt", 4),
+        (b"my_catalog", 5),
+    ]
+
+
+@pytest.mark.trio
+async def test_readdir_root_resumes_midway(fs, metadata_manager, auth_manager, ctx, monkeypatch):
+    # start_id=3 means . , .. and the first overlay entry (.auth) were already
+    # delivered; readdir must resume at README.txt without repeating them.
+    auth_manager.root_overlay = MagicMock(return_value={
+        ".auth": _make_attr(True),
+        "README.txt": _make_attr(False, size=100),
+    })
+    metadata_manager.list_directory = AsyncMock(return_value={"my_catalog": _make_attr(True)})
+
+    calls = _capture_readdir_replies(monkeypatch)
+
+    fh = await fs.opendir(pyfuse3.ROOT_INODE, ctx)
+    await fs.readdir(fh, 3, token=object())
+
+    assert calls == [
+        (b"README.txt", 4),
+        (b"my_catalog", 5),
+    ]
+
+
+@pytest.mark.trio
+async def test_readdir_non_root_has_no_overlay(fs, inode_manager, metadata_manager, auth_manager, ctx, monkeypatch):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    metadata_manager.list_directory = AsyncMock(return_value={"file.txt": _make_attr(False)})
+
+    calls = _capture_readdir_replies(monkeypatch)
+
+    fh = await fs.opendir(vol.inode, ctx)
+    await fs.readdir(fh, 0, token=object())
+
+    # No overlay for non-root dirs: children start right after . (1) and .. (2).
+    assert calls == [
+        (b".", 1),
+        (b"..", 2),
+        (b"file.txt", 3),
+    ]
+    auth_manager.root_overlay.assert_not_called()
