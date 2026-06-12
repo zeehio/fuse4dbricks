@@ -502,3 +502,104 @@ async def test_permission_cache_isolated_by_principal(manager, mock_uc_client, c
     # bob must not inherit alice's True; he gets his own (denied) decision.
     assert result is False
     mock_uc_client.check_permissions.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# negative (not-found) cache  (keyed by principal)
+# ---------------------------------------------------------------------------
+
+
+def test_negative_hit_semantics(manager):
+    # Unknown principal never hits.
+    assert manager._negative_hit(None, "/p") is False
+    # Expired entry is a miss and gets evicted.
+    manager._negative_cache[("alice", "/p")] = time.time() - 1
+    assert manager._negative_hit("alice", "/p") is False
+    assert ("alice", "/p") not in manager._negative_cache
+    # Live entry hits.
+    manager._negative_cache[("alice", "/p")] = time.time() + 100
+    assert manager._negative_hit("alice", "/p") is True
+
+
+@pytest.mark.trio
+async def test_lookup_child_records_negative_and_serves_from_cache(manager, mock_uc_client, ctx):
+    manager._principal_cache[ctx.uid] = "alice@example.com"
+    mock_uc_client.get_path_metadata = AsyncMock(return_value=None)
+    parent = _make_entry("/cat/sch/vol", is_dir=True)
+
+    assert await manager.lookup_child(parent, "missing.txt", ctx) is None
+    assert mock_uc_client.get_path_metadata.await_count == 1
+    # Second lookup is answered from the negative cache, no extra API call.
+    assert await manager.lookup_child(parent, "missing.txt", ctx) is None
+    assert mock_uc_client.get_path_metadata.await_count == 1
+
+
+@pytest.mark.trio
+async def test_negative_cache_is_per_principal(manager, mock_uc_client, ctx):
+    """A negative recorded for one principal must not answer another principal's
+    lookup (the token-switch / different-principal case)."""
+    mock_uc_client.get_path_metadata = AsyncMock(return_value=None)
+    parent = _make_entry("/cat/sch/vol", is_dir=True)
+
+    manager._principal_cache[ctx.uid] = "alice@example.com"
+    await manager.lookup_child(parent, "x.txt", ctx)
+    assert mock_uc_client.get_path_metadata.await_count == 1
+
+    # Same uid now resolves to bob: alice's negative does not apply.
+    manager._principal_cache[ctx.uid] = "bob@example.com"
+    await manager.lookup_child(parent, "x.txt", ctx)
+    assert mock_uc_client.get_path_metadata.await_count == 2
+
+
+@pytest.mark.trio
+async def test_lookup_child_unknown_principal_skips_negative(manager, mock_uc_client, ctx):
+    """With no resolved principal we must not store a negative under an
+    unverified identity, so repeated lookups re-hit the API."""
+    mock_uc_client.get_path_metadata = AsyncMock(return_value=None)
+    parent = _make_entry("/cat/sch/vol", is_dir=True)
+
+    assert await manager.lookup_child(parent, "x.txt", ctx) is None
+    assert len(manager._negative_cache) == 0
+    await manager.lookup_child(parent, "x.txt", ctx)
+    assert mock_uc_client.get_path_metadata.await_count == 2
+
+
+@pytest.mark.trio
+async def test_update_attr_cache_clears_only_that_principals_negative(manager):
+    manager._negative_cache[("alice@example.com", "/cat/sch/vol/x.txt")] = time.time() + 100
+    manager._negative_cache[("bob@example.com", "/cat/sch/vol/x.txt")] = time.time() + 100
+
+    await manager._update_attr_cache(
+        "/cat/sch/vol/x.txt", _make_attr(False), is_dir=False, principal="alice@example.com"
+    )
+
+    assert ("alice@example.com", "/cat/sch/vol/x.txt") not in manager._negative_cache
+    # Another identity's negative is untouched.
+    assert ("bob@example.com", "/cat/sch/vol/x.txt") in manager._negative_cache
+
+
+@pytest.mark.trio
+async def test_get_attributes_records_negative_on_not_found(manager, mock_uc_client, ctx):
+    manager._principal_cache[ctx.uid] = "alice@example.com"
+    mock_uc_client.get_path_metadata = AsyncMock(return_value=None)
+    entry = _make_entry("/cat/sch/vol/x.txt", is_dir=False)
+
+    assert await manager.get_attributes(entry, ctx) is None
+    assert mock_uc_client.get_path_metadata.await_count == 1
+    # Served from the negative cache.
+    assert await manager.get_attributes(entry, ctx) is None
+    assert mock_uc_client.get_path_metadata.await_count == 1
+
+
+@pytest.mark.trio
+async def test_get_attributes_follower_miss_raises_eagain(manager, ctx):
+    """A follower that wakes to neither a positive nor a negative means the
+    leader failed: surface EAGAIN, not a false ENOENT."""
+    entry = _make_entry("/cat/sch/vol/x.txt", is_dir=False)
+    done = trio.Event()
+    done.set()
+    manager._attr_coalescer._inflight[entry.fs_path] = done
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await manager.get_attributes(entry, ctx)
+    assert exc_info.value.errno == errno.EAGAIN

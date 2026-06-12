@@ -173,3 +173,10 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   file may appear owned by different users at different times. These values are irrelevant:
   access is never decided from POSIX ownership, only from a per-user Unity Catalog permission
   check. Do not rely on the reported owner or group for anything.
+
+- **Not-found results are briefly cached.** When a path is looked up and does not exist, that
+  "not found" answer is cached per user for a short time (`--metadata-cache-ttl-negative-sec`,
+  5 seconds by default) to avoid repeatedly asking Unity Catalog about missing paths. As a
+  result, a file created (or that becomes visible to you) just after you looked for it may not
+  appear until this short TTL expires. Unlike file metadata, these negative results are *not*
+  shared between users.

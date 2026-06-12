@@ -53,15 +53,19 @@ class MetadataManager:
         ttl: float=30.0,
         max_entries=20000,
         ttl_catalog=600.0,
+        ttl_negative: float=5.0,
     ):
         """
         :param uc_client: The Unity Catalog API client.
         :param ttl: Time-to-live in seconds for cached attributes.
         :param max_entries: Maximum number of metadata entries to keep in RAM.
+        :param ttl_negative: Time-to-live in seconds for negative (not-found)
+            cache entries. Kept short because it hides newly-created paths.
         """
         self.uc_client = uc_client
         self._ttl: float = ttl
         self._ttl_catalog = ttl_catalog
+        self._ttl_negative = ttl_negative
         self.max_entries = max_entries
 
         # --- Caches ---
@@ -71,6 +75,16 @@ class MetadataManager:
         """(fs_path, is_dir) -> (expires_at, InodeEntryAttr)
         (fs_path, is_dir) uniquely identifies an inode, even if the inode does not exist yet
         """
+
+        # Negative (not-found) cache, keyed by PRINCIPAL so one principal's
+        # 404 (which may be a disguised permission failure) never becomes a
+        # false ENOENT for another principal. Positive metadata stays global
+        # (the documented shared-metadata cache); a negative is identity-
+        # relative, so the two are asymmetric on purpose. A principal's own
+        # negative takes precedence over any global positive (see the read
+        # paths). Short TTL because it hides newly-created paths.
+        self._negative_cache: OrderedDict[Tuple[str, str], float] = OrderedDict()
+        """(principal, fs_path) -> expires_at"""
 
         # { fs_path: (expiration_ts, list_of_children_names) }
         self._dir_cache: OrderedDict[str, Tuple[float, OrderedDict[str, InodeEntryAttr]]] = (
@@ -147,6 +161,40 @@ class MetadataManager:
         under trio's cooperative scheduler, so no lock is required.
         """
         self._principal_cache.pop(uid, None)
+
+    def _peek_principal(self, uid: int) -> str | None:
+        """Cache-only principal lookup (no I/O). Used by the read paths so a
+        metadata read never gains an API dependency just to consult the negative
+        cache; if the principal isn't known yet, negative caching is skipped."""
+        return self._principal_cache.get(uid)
+
+    def _negative_hit(self, principal: str | None, fs_path: str) -> bool:
+        """Whether ``fs_path`` is known-absent for ``principal``. Caller must
+        hold ``self._cache_lock`` (mirrors ``_get_valid_cache``)."""
+        if principal is None:
+            return False
+        key = (principal, fs_path)
+        expires_at = self._negative_cache.get(key)
+        if expires_at is None:
+            return False
+        if time.time() < expires_at:
+            self._negative_cache.move_to_end(key)
+            return True
+        del self._negative_cache[key]
+        return False
+
+    async def _record_negative(self, principal: str | None, fs_path: str) -> None:
+        """Record that ``fs_path`` is absent for ``principal`` (true 404 only).
+        No-op when the principal is unknown, so we never store a negative under
+        an unverified identity. The positive cache is left untouched: a global
+        positive populated by a different principal stays valid for that other
+        identity, and the read paths check this principal's negative first."""
+        if principal is None:
+            return
+        async with self._cache_lock:
+            self._negative_cache[(principal, fs_path)] = time.time() + self._ttl_negative
+            if len(self._negative_cache) > self.max_entries:
+                self._negative_cache.popitem(last=False)
 
     async def _get_principal(self, ctx: pyfuse3.RequestContext) -> str|None:
         async with self._principal_cache_lock:
@@ -244,12 +292,15 @@ class MetadataManager:
         Flow: RAM Cache -> Coalescing Wait -> API Call (Type-Specific Validation).
         Returns None if the object no longer exists or changed type.
         """
-        # 1. Fast Check (Memory)
+        principal = self._peek_principal(ctx.uid)
+        # 1. Fast Check (Memory): this principal's own negative wins over any
+        # global positive, then the global positive.
         async with self._cache_lock:
+            if self._negative_hit(principal, entry.fs_path):
+                return None
             cached = self._get_valid_cache(
                 self._attr_cache, (entry.fs_path, entry.is_dir)
             )
-            # TODO: We should be able to tell difference between no cache entry and negative cache entry
             if cached:
                 return cached
 
@@ -260,14 +311,20 @@ class MetadataManager:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             async with self._cache_lock:
+                if self._negative_hit(principal, entry.fs_path):
+                    return None  # leader recorded "absent" -> ENOENT
                 attr = self._get_valid_cache(
                     self._attr_cache, (entry.fs_path, entry.is_dir)
                 )
+            if attr is not None:
                 return attr
+            # Leader recorded neither a positive nor our negative: it failed.
+            # Surface a retryable error instead of a false ENOENT.
+            raise pyfuse3.FUSEError(errno.EAGAIN)
 
         # 3. Real API Call (Leader Only)
         try:
-            attr = await self._refresh_entry_metadata(entry, ctx)
+            attr = await self._refresh_entry_metadata(entry, ctx, principal=principal)
         finally:
             await self._attr_coalescer.notify_done(entry.fs_path)
         return attr
@@ -285,8 +342,11 @@ class MetadataManager:
         else:
             child_fs_path = f"{parent_entry.fs_path}/{name}"
 
-        # 1. Fast Check
+        principal = self._peek_principal(ctx.uid)
+        # 1. Fast Check: own negative first, then global positive.
         async with self._cache_lock:
+            if self._negative_hit(principal, child_fs_path):
+                return None
             for is_dir in (False, True):
                 cached = self._get_valid_cache(
                     self._attr_cache, (child_fs_path, is_dir)
@@ -300,24 +360,34 @@ class MetadataManager:
         if not leader:
             await wait_event.wait()
             async with self._cache_lock:
+                if self._negative_hit(principal, child_fs_path):
+                    return None
                 for is_dir in (False, True):
                     cached = self._get_valid_cache(
                         self._attr_cache, (child_fs_path, is_dir)
                     )
                     if cached:
                         return cached
+            # Cache miss after waiting: fall through and do our own lookup
+            # (the leader may have failed). The real lookup below surfaces a
+            # transient error as an exception, mapped to EAGAIN upstream.
 
         # 3. Real API Lookup
         try:
             uc_path = fs_to_uc_path(child_fs_path)
             uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx=ctx)
             if uc_entry is None:
-                # Not found (negative cache could be implemented here if desired)
+                # True 404: record a negative for this principal so a repeated
+                # lookup is answered from cache instead of re-hitting the API.
+                # (The read paths check this principal's negative before any
+                # global positive, so no positive eviction is needed here.)
+                await self._record_negative(principal, child_fs_path)
                 return None
             is_dir = uc_entry.is_dir()
             attr = self._uc_to_inode_entry_attr(uc_entry, ctx)
             await self._update_attr_cache(
-                child_fs_path, attr, is_dir, ttl=self.get_ttl(uc_entry.entry_type)
+                child_fs_path, attr, is_dir, ttl=self.get_ttl(uc_entry.entry_type),
+                principal=principal,
             )
             return attr
         finally:
@@ -444,7 +514,8 @@ class MetadataManager:
         return attr
 
     async def _update_attr_cache(
-        self, fs_path: str, attr: InodeEntryAttr, is_dir: bool, ttl=None
+        self, fs_path: str, attr: InodeEntryAttr, is_dir: bool, ttl=None,
+        principal: str | None = None,
     ):
         if ttl is None:
             ttl = self._ttl
@@ -452,13 +523,17 @@ class MetadataManager:
             self._attr_cache[(fs_path, is_dir)] = (time.time() + ttl, attr)
             if (fs_path, not is_dir) in self._attr_cache:
                 del self._attr_cache[(fs_path, not is_dir)]
+            # The path now exists for this principal, so clear its negative
+            # entry (if any). Other principals' negatives are left alone.
+            if principal is not None:
+                self._negative_cache.pop((principal, fs_path), None)
             if len(self._attr_cache) > self.max_entries:
                 self._attr_cache.popitem(last=False)
 
     # --- API Interaction & Validation ---
 
     async def _refresh_entry_metadata(
-        self, entry: InodeEntry, ctx
+        self, entry: InodeEntry, ctx, principal: str | None = None
     ) -> InodeEntryAttr | None:
         """
         Refreshes metadata via API, checking for Type Consistency.
@@ -475,8 +550,11 @@ class MetadataManager:
             expected_type=node_type
         )
         if uc_entry is None:
-            # Not found, was probably deleted. Invalidate cache to trigger ENOENT on next access.
+            # Not found, was probably deleted. Invalidate cache to trigger ENOENT
+            # on next access, and record a negative for this principal so the
+            # next getattr is answered from cache instead of re-hitting the API.
             self.invalidate(entry.fs_path, entry.is_dir)
+            await self._record_negative(principal, entry.fs_path)
             return None
         # Convert to inode attributes
         attr = self._uc_to_inode_entry_attr(uc_entry=uc_entry, ctx=ctx)
@@ -489,10 +567,12 @@ class MetadataManager:
                 attr,
                 uc_entry.is_dir(),
                 ttl=self.get_ttl(uc_entry.entry_type),
+                principal=principal,
             )
             return None
         # All good, cache and return
         await self._update_attr_cache(
-            entry.fs_path, attr, entry.is_dir, ttl=self.get_ttl(uc_entry.entry_type)
+            entry.fs_path, attr, entry.is_dir, ttl=self.get_ttl(uc_entry.entry_type),
+            principal=principal,
         )
         return attr
