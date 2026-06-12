@@ -55,6 +55,8 @@ If you are not seeing your catalogs or you get permission errors, you may need t
         elif auth_inode == AuthInode.README:
             mode = (stat.S_IFREG | 0o444)
             size = len(self._gen_readme())
+        else:
+            raise ValueError(f"Unknown auth inode type: {auth_inode!r}")
         return InodeEntryAttr(
             st_mode = mode,
             st_nlink = 2 if auth_inode == AuthInode.AUTH_DIR else 1,
