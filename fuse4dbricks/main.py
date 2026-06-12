@@ -51,8 +51,8 @@ def parse_args():
     parser.add_argument("--allow-other", action="store_true",
         help="Use -o allow_other only if /etc/fuse.conf has user_allow_other"
     )
-    parser.add_argument("--unified-auth", action="store_true", default=True,
-        help="Use the Databricks Unified Authentication to obtain a token"
+    parser.add_argument("--no-unified-auth", action="store_false", dest="unified_auth",
+        help="Disable Databricks Unified Authentication; users must provide a token manually"
     )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
