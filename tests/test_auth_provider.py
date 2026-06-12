@@ -267,3 +267,15 @@ def test_authprovider_invalidate_removes_local_token():
     assert 1000 not in prov._uid_to_access_token
     # Invalidating an absent uid is a no-op (must not raise).
     prov.invalidate_access_token(_ctx(uid=4242))
+
+
+def test_authprovider_invalidate_notifies_callback():
+    prov = AuthProvider(unified_auth=False)
+    seen = []
+    prov.set_token_invalidation_callback(seen.append)
+    prov.set_access_token(1000, "local")
+    prov.invalidate_access_token(_ctx(uid=1000))
+    # The callback fires with the uid even when no token was cached, so the
+    # 401 path always drops principal-derived caches.
+    prov.invalidate_access_token(_ctx(uid=4242))
+    assert seen == [1000, 4242]
