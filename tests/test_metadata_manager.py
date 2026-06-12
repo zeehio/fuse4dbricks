@@ -283,6 +283,23 @@ async def test_check_access_follower_miss_raises_eagain(manager, mock_uc_client,
 
 
 @pytest.mark.trio
+async def test_check_access_unresolved_principal_raises_eagain(manager, mock_uc_client, ctx):
+    """If identity can't be resolved (the _get_principal leader failed and a
+    follower woke to no cached principal), check_access surfaces a retryable
+    EAGAIN rather than a permanent EACCES."""
+    entry = _make_entry("/my_catalog", is_dir=True)
+    # Force the _get_principal follower path to wake to an empty principal cache.
+    done = trio.Event()
+    done.set()
+    manager._principal_coalescer._inflight[ctx.uid] = done
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await manager.check_access(entry, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EAGAIN
+    mock_uc_client.check_permissions.assert_not_awaited()
+
+
+@pytest.mark.trio
 async def test_check_access_volume_uses_read_volume_privilege(manager, mock_uc_client, ctx):
     entry = _make_entry("/cat/sch/vol", is_dir=True)
     await manager.check_access(entry, mode=4, ctx=ctx)
@@ -603,3 +620,24 @@ async def test_get_attributes_follower_miss_raises_eagain(manager, ctx):
     with pytest.raises(pyfuse3.FUSEError) as exc_info:
         await manager.get_attributes(entry, ctx)
     assert exc_info.value.errno == errno.EAGAIN
+
+
+@pytest.mark.trio
+async def test_list_directory_clears_listing_principals_negative(manager, mock_uc_client, ctx):
+    """Listing a directory must clear the requesting principal's stale negative
+    for a listed child, so `ls` and a subsequent `stat` agree."""
+    principal = "alice@example.com"
+    manager._principal_cache[ctx.uid] = principal
+    child_fs = "/cat/sch/vol/file.txt"
+    manager._negative_cache[(principal, child_fs)] = time.time() + 100
+    manager._negative_cache[("bob@example.com", child_fs)] = time.time() + 100
+    mock_uc_client.get_path_contents = AsyncMock(return_value=[
+        _uc_entry("file.txt", "/Volumes/cat/sch/vol/file.txt", UcNodeType.FILE, size=5)
+    ])
+
+    await manager.list_directory(_make_entry("/cat/sch/vol", is_dir=True), ctx)
+
+    # The lister's own negative is cleared...
+    assert (principal, child_fs) not in manager._negative_cache
+    # ...but another identity's negative is untouched.
+    assert ("bob@example.com", child_fs) in manager._negative_cache
