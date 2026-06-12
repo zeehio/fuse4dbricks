@@ -98,14 +98,23 @@ class UnityCatalogFS(pyfuse3.Operations):
             if self._dispatch(entry.fs_path) == "auth":
                 attr = await self.auth_manager.get_attributes(entry, ctx)
             else:
-                # check ttl and update entry in-place
                 attr = await self.metadata_manager.get_attributes(entry, ctx)
-            if attr is None:
-                # File was deleted or is now a folder or... inode not valid anyway
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            return self._entry_to_fuse_attr(entry)
-        except Exception:
+        except pyfuse3.FUSEError:
+            # Already-mapped errno (e.g. EACCES from a permission check): propagate as-is.
+            raise
+        except Exception as exc:
+            # Map domain errors (UcNotFound -> ENOENT, etc.); falls back to EIO.
+            self._raise_fuse_error(exc, fs_path=entry.fs_path, op="getattr")
             raise pyfuse3.FUSEError(errno.EIO)
+
+        if attr is None:
+            # File was deleted or is now a folder or... inode not valid anyway
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        # Apply the refreshed attributes to the inode in-place so the reply
+        # reflects the current size/mtime instead of whatever was cached at
+        # add_entry time.
+        entry.attr.update(attr)
+        return self._entry_to_fuse_attr(entry)
 
     async def lookup(
         self, parent_inode: int, name_b: bytes, ctx: pyfuse3.RequestContext
@@ -124,7 +133,11 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         existing = self.inodes.get_inode_by_path(full_path)
         if existing:
-            return await self.getattr(existing, ctx=ctx)
+            fuse_attr = await self.getattr(existing, ctx=ctx)
+            # Every lookup reply increments the kernel lookup count; mirror it
+            # here so the matching forget() does not free a still-referenced inode.
+            self.inodes.increment_lookup_count(existing)
+            return fuse_attr
 
         # 2. Ask Cache/API
         try:
@@ -132,6 +145,8 @@ class UnityCatalogFS(pyfuse3.Operations):
                 attr = await self.auth_manager.lookup_child(parent_entry, name, ctx)
             else:
                 attr = await self.metadata_manager.lookup_child(parent_entry, name, ctx)
+        except pyfuse3.FUSEError:
+            raise
         except Exception as exc:
             self._raise_fuse_error(exc, fs_path=full_path, op="lookup")
 
@@ -139,7 +154,9 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         # 3. Create Inode
         entry = self.inodes.add_entry(parent_inode, name, attr)
-        return await self.getattr(entry.inode, ctx)
+        fuse_attr = await self.getattr(entry.inode, ctx)
+        self.inodes.increment_lookup_count(entry.inode)
+        return fuse_attr
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
         logger.debug(f"opendir(inode={inode})")
@@ -361,6 +378,8 @@ class UnityCatalogFS(pyfuse3.Operations):
                     entry.attr.st_size,
                     ctx=ctx,
                 )
+        except pyfuse3.FUSEError:
+            raise
         except Exception as e:
             logger.exception("read failed op=read path=%s uid=%s. %s", entry.fs_path, getattr(ctx, "uid", None), e)
             self._raise_fuse_error(e, fs_path=entry.fs_path, op="read")
@@ -386,10 +405,14 @@ class UnityCatalogFS(pyfuse3.Operations):
                     buffer,
                     ctx=ctx,
                 )
-            else:
-                raise pyfuse3.FUSEError(errno.EACCES)
+            # The Unity Catalog filesystem is read-only.
+            raise pyfuse3.FUSEError(errno.EACCES)
+        except pyfuse3.FUSEError:
+            # Preserve the intended errno (EACCES for read-only paths) instead
+            # of collapsing every failure to EIO.
+            raise
         except Exception as e:
-            logger.error(f"Read error reading {entry.fs_path}: {e}")
+            logger.error("write error on %s: %s", entry.fs_path, e)
             raise pyfuse3.FUSEError(errno.EIO)
 
 

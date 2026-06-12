@@ -395,11 +395,11 @@ async def test_write_auth_file_delegates_to_auth_manager(fs, inode_manager, auth
 
 
 @pytest.mark.trio
-async def test_write_uc_file_raises_eio(fs, inode_manager, metadata_manager, ctx):
+async def test_write_uc_file_raises_eacces(fs, inode_manager, metadata_manager, ctx):
     """
-    Writing to a non-auth file raises pyfuse3.FUSEError(EACCES) inside the try block,
-    which is caught by `except Exception` and re-raised as EIO.
-    This is a known bug in operations.py; this test documents the current behaviour.
+    The Unity Catalog filesystem is read-only: writing to a non-auth file must
+    surface EACCES. (Previously this errno was incorrectly collapsed to EIO by a
+    catch-all `except Exception`.)
     """
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
     sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
@@ -411,8 +411,7 @@ async def test_write_uc_file_raises_eio(fs, inode_manager, metadata_manager, ctx
 
     with pytest.raises(pyfuse3.FUSEError) as exc_info:
         await fs.write(fh, offset=0, buffer=b"data")
-    # EACCES is swallowed by generic except→EIO; document actual behaviour:
-    assert exc_info.value.errno == errno.EIO
+    assert exc_info.value.errno == errno.EACCES
 
 
 @pytest.mark.trio
