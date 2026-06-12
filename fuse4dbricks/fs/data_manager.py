@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import errno
+import logging
 from typing import Tuple
 from collections import OrderedDict
 import trio
@@ -11,6 +12,8 @@ from fuse4dbricks.fs.utils import fs_to_uc_path, InflightCoalescer
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.storage.persistence import DiskPersistence
 from fuse4dbricks.fs.ram_cache import RamCache
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -67,7 +70,19 @@ class DownloadScheduler:
                 except trio.EndOfChannel:
                     return
                 continue
-            await self._process_request(chunk_request, priority)
+            # A failed download must never escape the worker: otherwise the
+            # exception would propagate to the nursery and tear down the whole
+            # mount for every user. _process_request always wakes waiters (via
+            # notify_done in its finally), so they observe a missing chunk and
+            # the read fails with EIO in isolation. trio.Cancelled is a
+            # BaseException and still propagates, so shutdown is unaffected.
+            try:
+                await self._process_request(chunk_request, priority)
+            except Exception:
+                logger.exception(
+                    "Chunk download worker failed for %s (chunk %s, mtime %s)",
+                    chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime,
+                )
 
     async def _poke_worker(self) -> None:
         # Non-blocking "poke"; if buffer is full, a worker is already awake.
