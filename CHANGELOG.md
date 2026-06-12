@@ -20,6 +20,30 @@
   `README.txt`) are now defined by `AuthManager.root_overlay()` instead of
   being hardcoded in `readdir`, removing the names/offset coupling. Dead,
   type-confused root branch in `AuthManager.list_directory` removed.
+- Security: don't turn transient authorization failures into a permanent
+  `EACCES`. A rate limit or server outage during a permission check (and a
+  coalescing follower that woke to no cached decision) previously looked like
+  "permission denied"; transient failures now surface a retryable `EAGAIN`,
+  reserving `EACCES` for genuine denials.
+- Re-evaluate cached identity when a user's token changes: writing a new token
+  refreshes the cached principal and drops that user's cached permission grants
+  only if the principal actually changed.
+- Cache catalog/schema permission grants with the longer catalog TTL (volume
+  grants keep the shorter TTL for faster revocation).
+- Fix a `lookup` race where a `forget` arriving during the `getattr` await
+  could free a still-referenced inode (spurious `ENOENT`); the inode is now
+  pinned before the await.
+- Robustness: read `/proc/<pid>/environ` as bytes so a single non-UTF-8
+  variable no longer discards the requesting process's whole environment.
+- CLI: replace the inert `--unified-auth` flag (it defaulted to on and could
+  never be turned off) with `--no-unified-auth`.
+- Raise a clear error for an unknown auth inode instead of an
+  `UnboundLocalError`; drop a stray `print(traceback)` in the directory-listing
+  error path in favor of `logger.exception`.
+- Document known limitations: the attribute cache is global (names, sizes and
+  modification times may leak between users, but never file contents), users
+  map to tokens 1-to-1, and reported file owner/group (`st_uid`/`st_gid`) are
+  meaningless.
 - Improve test coverage
 
 # 0.6.1 (2026-05-07)
