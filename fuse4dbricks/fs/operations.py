@@ -133,11 +133,19 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         existing = self.inodes.get_inode_by_path(full_path)
         if existing:
-            fuse_attr = await self.getattr(existing, ctx=ctx)
             # Every lookup reply increments the kernel lookup count; mirror it
-            # here so the matching forget() does not free a still-referenced inode.
+            # by pinning the inode BEFORE the getattr await. The get+increment
+            # pair is synchronous (atomic under trio's cooperative scheduler),
+            # so a forget() racing during the await decrements from 2->1 instead
+            # of 1->0 and cannot free a still-referenced inode.
             self.inodes.increment_lookup_count(existing)
-            return fuse_attr
+            try:
+                return await self.getattr(existing, ctx=ctx)
+            except BaseException:
+                # The reply never reached the kernel, so no matching forget will
+                # come; release the pin to avoid leaking the inode.
+                self.inodes.forget(existing, 1)
+                raise
 
         # 2. Ask Cache/API
         try:
@@ -152,11 +160,16 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         if attr is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        # 3. Create Inode
+        # 3. Create the inode (or pick up one a concurrent lookup created during
+        # the awaits above). Pin before the getattr await, same as the existing
+        # path: add_entry + increment are synchronous and therefore atomic.
         entry = self.inodes.add_entry(parent_inode, name, attr)
-        fuse_attr = await self.getattr(entry.inode, ctx)
         self.inodes.increment_lookup_count(entry.inode)
-        return fuse_attr
+        try:
+            return await self.getattr(entry.inode, ctx)
+        except BaseException:
+            self.inodes.forget(entry.inode, 1)
+            raise
 
     async def opendir(self, inode: int, ctx: pyfuse3.RequestContext):
         logger.debug(f"opendir(inode={inode})")
