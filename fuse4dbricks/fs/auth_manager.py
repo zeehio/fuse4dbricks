@@ -23,9 +23,10 @@ _FS_PATH_TO_AUTHINODE = {
 
 
 class AuthManager:
-    def __init__(self, uc_client, auth_provider, workspace):
+    def __init__(self, uc_client, auth_provider, metadata_manager, workspace):
         self._uc_client = uc_client
         self._auth_provider = auth_provider
+        self._metadata_manager = metadata_manager
         self._workspace = workspace
         self._write_buffers = {}
 
@@ -168,6 +169,7 @@ If you are not seeing your catalogs or you get permission errors, you may need t
                 except Exception:
                     buffer_txt = ""
                 self._auth_provider.set_access_token(ctx_uid=ctx.uid, access_token=buffer_txt)
+                await self._metadata_manager.reauthorize(ctx)
         return
 
     async def write(self, fs_path: str, offset: int, buffer: bytes, ctx: pyfuse3.RequestContext) -> int:

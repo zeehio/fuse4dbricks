@@ -409,3 +409,59 @@ def test_invalidate_removes_parent_dir_cache(manager, ctx):
 
 def test_invalidate_nonexistent_path_does_not_raise(manager):
     manager.invalidate("/nonexistent/path/file.txt", is_dir=False)  # Must not raise
+
+
+# ---------------------------------------------------------------------------
+# reauthorize  (token change -> refresh principal, drop grants iff principal changed)
+# ---------------------------------------------------------------------------
+
+
+def _seed_permission(manager, uid: int, securable: str, granted: bool = True) -> None:
+    manager._permissions_cache[(uid, securable)] = (time.time() + 100, granted)
+
+
+@pytest.mark.trio
+async def test_reauthorize_same_principal_keeps_permission_cache(manager, mock_uc_client, ctx):
+    """A token that maps to the same principal must not invalidate cached grants."""
+    manager._principal_cache[ctx.uid] = "user@example.com"
+    mock_uc_client.get_current_user_info = AsyncMock(return_value="user@example.com")
+    _seed_permission(manager, ctx.uid, "cat")
+    _seed_permission(manager, ctx.uid, "cat.sch")
+
+    await manager.reauthorize(ctx)
+
+    assert (ctx.uid, "cat") in manager._permissions_cache
+    assert (ctx.uid, "cat.sch") in manager._permissions_cache
+    assert manager._principal_cache[ctx.uid] == "user@example.com"
+
+
+@pytest.mark.trio
+async def test_reauthorize_changed_principal_drops_only_that_uid(manager, mock_uc_client, ctx):
+    """A token mapping to a different principal drops that uid's grants, not others'."""
+    other_uid = ctx.uid + 1
+    manager._principal_cache[ctx.uid] = "old@example.com"
+    mock_uc_client.get_current_user_info = AsyncMock(return_value="new@example.com")
+    _seed_permission(manager, ctx.uid, "cat")
+    _seed_permission(manager, ctx.uid, "cat.sch")
+    _seed_permission(manager, other_uid, "cat")
+
+    await manager.reauthorize(ctx)
+
+    assert (ctx.uid, "cat") not in manager._permissions_cache
+    assert (ctx.uid, "cat.sch") not in manager._permissions_cache
+    assert (other_uid, "cat") in manager._permissions_cache
+    assert manager._principal_cache[ctx.uid] == "new@example.com"
+
+
+@pytest.mark.trio
+async def test_reauthorize_fetch_failure_drops_grants(manager, mock_uc_client, ctx):
+    """If the new token's principal can't be resolved, no stale grant may survive."""
+    manager._principal_cache[ctx.uid] = "old@example.com"
+    mock_uc_client.get_current_user_info = AsyncMock(side_effect=RuntimeError("401"))
+    _seed_permission(manager, ctx.uid, "cat")
+
+    await manager.reauthorize(ctx)
+
+    assert (ctx.uid, "cat") not in manager._permissions_cache
+    # Unresolved principal must not stay cached.
+    assert ctx.uid not in manager._principal_cache
