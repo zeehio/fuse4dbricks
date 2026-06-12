@@ -6,10 +6,7 @@ import errno
 import logging
 from itertools import islice
 
-try:
-    import pyfuse3
-except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+import pyfuse3
 
 from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.data_manager import DataManager

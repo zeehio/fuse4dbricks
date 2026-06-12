@@ -12,10 +12,7 @@ import stat
 import traceback
 from typing import Optional
 
-try:
-    import pyfuse3
-except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type:ignore[no-redef]
+import pyfuse3
 
 
 logger = logging.getLogger(__name__)
