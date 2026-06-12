@@ -1,11 +1,7 @@
 import stat
 
 import pytest
-
-try:
-    import pyfuse3
-except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+import pyfuse3
 
 from fuse4dbricks.fs.inode_manager import InodeEntryAttr, InodeManager
 

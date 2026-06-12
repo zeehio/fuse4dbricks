@@ -6,11 +6,7 @@ import traceback
 import sys
 
 import trio
-
-try:
-    import pyfuse3
-except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+import pyfuse3
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
 from fuse4dbricks.fs.data_manager import DataManager

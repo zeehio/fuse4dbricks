@@ -4,10 +4,7 @@ from typing import Tuple
 from collections import OrderedDict
 import trio
 
-try:
-    import pyfuse3
-except ImportError:
-    import fuse4dbricks.mock.pyfuse3 as pyfuse3  # type: ignore[no-redef]
+import pyfuse3
 
 from fuse4dbricks.fs.utils import fs_to_uc_path, InflightCoalescer
 
