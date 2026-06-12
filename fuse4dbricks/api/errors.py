@@ -32,6 +32,7 @@ class UcConflict(UcError):
     pass
 
 
+@dataclass
 class UcRateLimited(UcError):
     retry_after_s: float | None = None
 

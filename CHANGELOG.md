@@ -1,6 +1,9 @@
 # 0.6.2 (2026-06-12)
 
 - Security: A user could use DATABRICKS_CONFIG_PROFILE to make fuse4dbricks read any user profile if it ran as root.
+- Retry transient API failures (429 rate limits, 5xx server errors and
+  connection errors) with exponential backoff and jitter, honoring the
+  `Retry-After` header on 429 responses.
 - Improve test coverage
 
 # 0.6.1 (2026-05-07)
