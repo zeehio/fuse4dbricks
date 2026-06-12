@@ -245,8 +245,12 @@ class MetadataManager:
         # previous principal's cached grants.
         principal = await self._get_principal(ctx)
         if principal is None:
+            # Identity could not be resolved: the leader's get_current_user_info
+            # failed and a coalescing follower woke to no cached principal. That
+            # is a retryable condition, not a denial, so surface EAGAIN instead
+            # of laundering a transient failure into a permanent EACCES.
             logger.error(f"Unable to get principal for {ctx=}")
-            raise pyfuse3.FUSEError(errno.EACCES)
+            raise pyfuse3.FUSEError(errno.EAGAIN)
         cache_key = (principal, securable)
         # 1. Permission Check with Caching
         async with self._permissions_lock:
@@ -429,15 +433,21 @@ class MetadataManager:
 
             results = OrderedDict()
             now = time.time()
+            principal = self._peek_principal(ctx.uid)
             for uc_entry in uc_entries:
                 attr = self._uc_to_inode_entry_attr(uc_entry, ctx)
                 results[uc_entry.name] = attr
-                # read ahead: Cache attributes of children to speed up subsequent getattr and lookups
+                # read ahead: Cache attributes of children to speed up subsequent
+                # getattr and lookups. Pass principal so a listed child clears
+                # this principal's stale negative entry; otherwise `ls` could show
+                # a file that a subsequent stat reports as ENOENT until the
+                # negative TTL expires.
                 await self._update_attr_cache(
                     fs_path=uc_to_fs_path(uc_entry.uc_path),
                     attr=attr,
                     is_dir=uc_entry.is_dir(),
                     ttl=self.get_ttl(uc_entry.entry_type),
+                    principal=principal,
                 )
 
             # Store Directory Listing

@@ -38,6 +38,12 @@
   lookups of missing paths are answered without re-hitting Unity Catalog, and a
   coalescing follower can tell "genuinely absent" (ENOENT) from "the lookup
   failed" (retryable). TTL via `--metadata-cache-ttl-negative-sec` (5s default).
+- Surface a retryable `EAGAIN` (instead of a permanent `EACCES`) when identity
+  resolution fails transiently and a coalescing follower wakes to no cached
+  principal.
+- Clear the listing principal's stale negative entries when a directory is
+  listed, so a freshly-created file shown by `ls` is no longer reported as
+  missing by a subsequent `stat` until the negative TTL expires.
 - Fix a `lookup` race where a `forget` arriving during the `getattr` await
   could free a still-referenced inode (spurious `ENOENT`); the inode is now
   pinned before the await.
