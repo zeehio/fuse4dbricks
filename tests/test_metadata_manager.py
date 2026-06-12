@@ -265,12 +265,15 @@ async def test_check_access_follower_miss_raises_eagain(manager, mock_uc_client,
     would have cached False for a real denial)."""
     entry = _make_entry("/my_catalog", is_dir=True)
     securable = "my_catalog"
+    principal = "user@example.com"
+    manager._principal_cache[ctx.uid] = principal
     # Simulate a leader already in flight that finished without caching a
-    # decision (i.e. it errored): pre-arm the coalescer with an already-set
-    # event so our call takes the follower path and wakes immediately.
+    # decision (i.e. it errored): pre-arm the coalescer (keyed by principal)
+    # with an already-set event so our call takes the follower path and wakes
+    # immediately.
     done = trio.Event()
     done.set()
-    manager._permissions_coalescer._inflight[(ctx.uid, securable)] = done
+    manager._permissions_coalescer._inflight[(principal, securable)] = done
 
     with pytest.raises(pyfuse3.FUSEError) as exc_info:
         await manager.check_access(entry, mode=4, ctx=ctx)
@@ -434,56 +437,60 @@ def test_invalidate_nonexistent_path_does_not_raise(manager):
 
 
 # ---------------------------------------------------------------------------
-# reauthorize  (token change -> refresh principal, drop grants iff principal changed)
+# reauthorize  (token change -> refresh the uid -> principal mapping)
 # ---------------------------------------------------------------------------
 
 
-def _seed_permission(manager, uid: int, securable: str, granted: bool = True) -> None:
-    manager._permissions_cache[(uid, securable)] = (time.time() + 100, granted)
+def _seed_permission(manager, principal: str, securable: str, granted: bool = True) -> None:
+    manager._permissions_cache[(principal, securable)] = (time.time() + 100, granted)
 
 
 @pytest.mark.trio
-async def test_reauthorize_same_principal_keeps_permission_cache(manager, mock_uc_client, ctx):
-    """A token that maps to the same principal must not invalidate cached grants."""
-    manager._principal_cache[ctx.uid] = "user@example.com"
-    mock_uc_client.get_current_user_info = AsyncMock(return_value="user@example.com")
-    _seed_permission(manager, ctx.uid, "cat")
-    _seed_permission(manager, ctx.uid, "cat.sch")
-
-    await manager.reauthorize(ctx)
-
-    assert (ctx.uid, "cat") in manager._permissions_cache
-    assert (ctx.uid, "cat.sch") in manager._permissions_cache
-    assert manager._principal_cache[ctx.uid] == "user@example.com"
-
-
-@pytest.mark.trio
-async def test_reauthorize_changed_principal_drops_only_that_uid(manager, mock_uc_client, ctx):
-    """A token mapping to a different principal drops that uid's grants, not others'."""
-    other_uid = ctx.uid + 1
+async def test_reauthorize_refreshes_principal_on_change(manager, mock_uc_client, ctx):
     manager._principal_cache[ctx.uid] = "old@example.com"
     mock_uc_client.get_current_user_info = AsyncMock(return_value="new@example.com")
-    _seed_permission(manager, ctx.uid, "cat")
-    _seed_permission(manager, ctx.uid, "cat.sch")
-    _seed_permission(manager, other_uid, "cat")
 
     await manager.reauthorize(ctx)
 
-    assert (ctx.uid, "cat") not in manager._permissions_cache
-    assert (ctx.uid, "cat.sch") not in manager._permissions_cache
-    assert (other_uid, "cat") in manager._permissions_cache
     assert manager._principal_cache[ctx.uid] == "new@example.com"
 
 
 @pytest.mark.trio
-async def test_reauthorize_fetch_failure_drops_grants(manager, mock_uc_client, ctx):
-    """If the new token's principal can't be resolved, no stale grant may survive."""
-    manager._principal_cache[ctx.uid] = "old@example.com"
-    mock_uc_client.get_current_user_info = AsyncMock(side_effect=RuntimeError("401"))
-    _seed_permission(manager, ctx.uid, "cat")
+async def test_reauthorize_refreshes_principal_when_unchanged(manager, mock_uc_client, ctx):
+    manager._principal_cache[ctx.uid] = "user@example.com"
+    mock_uc_client.get_current_user_info = AsyncMock(return_value="user@example.com")
 
     await manager.reauthorize(ctx)
 
-    assert (ctx.uid, "cat") not in manager._permissions_cache
-    # Unresolved principal must not stay cached.
+    assert manager._principal_cache[ctx.uid] == "user@example.com"
+
+
+@pytest.mark.trio
+async def test_reauthorize_fetch_failure_leaves_principal_unresolved(manager, mock_uc_client, ctx):
+    """If the new token's principal can't be resolved, it must not stay cached
+    so the next request re-derives it."""
+    manager._principal_cache[ctx.uid] = "old@example.com"
+    mock_uc_client.get_current_user_info = AsyncMock(side_effect=RuntimeError("401"))
+
+    await manager.reauthorize(ctx)
+
     assert ctx.uid not in manager._principal_cache
+
+
+@pytest.mark.trio
+async def test_permission_cache_isolated_by_principal(manager, mock_uc_client, ctx):
+    """Keying the permission cache by principal means a uid that switches tokens
+    to a different principal cannot read the previous principal's cached grant."""
+    entry = _make_entry("/cat", is_dir=True)
+    # alice has a cached grant for the catalog.
+    manager._principal_cache[ctx.uid] = "alice@example.com"
+    _seed_permission(manager, "alice@example.com", "cat", granted=True)
+    mock_uc_client.check_permissions = AsyncMock(return_value=False)
+
+    # Same uid, but now resolves to bob (as after a token swap + reauthorize).
+    manager._principal_cache[ctx.uid] = "bob@example.com"
+    result = await manager.check_access(entry, mode=4, ctx=ctx)
+
+    # bob must not inherit alice's True; he gets his own (denied) decision.
+    assert result is False
+    mock_uc_client.check_permissions.assert_awaited_once()

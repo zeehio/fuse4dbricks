@@ -90,17 +90,20 @@ class MetadataManager:
         self._dir_coalescer: InflightCoalescer[str] = InflightCoalescer()
 
         self._permissions_cache: OrderedDict[
-            Tuple[int, str], Tuple[float, bool]
+            Tuple[str, str], Tuple[float, bool]
         ] = OrderedDict()
         self._permissions_lock = trio.Lock()
-        self._permissions_coalescer: InflightCoalescer[Tuple[int, str]] = InflightCoalescer()
+        self._permissions_coalescer: InflightCoalescer[Tuple[str, str]] = InflightCoalescer()
 
         self._principal_cache: OrderedDict[int, str] = OrderedDict()
         self._principal_cache_lock = trio.Lock()
         self._principal_coalescer: InflightCoalescer[int] = InflightCoalescer()
 
-        """(uid, securable) -> (expires_at, has_permission)
-        Caches permission checks to avoid redundant API calls for the same user and securable.
+        """(principal, securable) -> (expires_at, has_permission)
+        Caches permission checks to avoid redundant API calls for the same
+        principal and securable. Keyed by principal (not uid) so a uid that
+        switches tokens to a different principal cannot read the previous
+        principal's cached grants.
         """
 
     def get_ttl(self, uc_type: UcNodeType | None):
@@ -116,31 +119,26 @@ class MetadataManager:
     async def reauthorize(self, ctx: pyfuse3.RequestContext) -> None:
         """Re-evaluate a uid's identity after its access token changed.
 
-        Refreshes the cached principal for ``ctx.uid`` using the (now updated)
-        token. The permission cache is keyed by ``(uid, securable)`` and its
-        entries are only valid for a given principal, so we drop them *only if
-        the principal actually changed* (or could not be resolved). A token
-        that maps to the same principal leaves the permission cache untouched.
+        Refreshes the ``uid -> principal`` mapping using the (now updated)
+        token. The permission cache is keyed by *principal*, so once this
+        mapping is refreshed, requests under the new token naturally address
+        that principal's own cache entries while the previous principal's
+        grants are simply never looked up again (and expire by TTL). No
+        explicit permission-cache purge is required.
         """
         async with self._principal_cache_lock:
-            old_principal = self._principal_cache.pop(ctx.uid, None)
+            self._principal_cache.pop(ctx.uid, None)
 
         try:
             new_principal = await self.uc_client.get_current_user_info(ctx)
         except Exception:
             # Token invalid/expired or transient failure: we can't confirm the
-            # identity, so don't keep stale grants around.
+            # identity. Leave it unresolved so the next request re-derives it.
             new_principal = None
 
         if new_principal is not None:
             async with self._principal_cache_lock:
                 self._principal_cache[ctx.uid] = new_principal
-
-        if old_principal != new_principal:
-            async with self._permissions_lock:
-                stale = [k for k in self._permissions_cache if k[0] == ctx.uid]
-                for key in stale:
-                    del self._permissions_cache[key]
 
     async def _get_principal(self, ctx: pyfuse3.RequestContext) -> str|None:
         async with self._principal_cache_lock:
@@ -186,21 +184,29 @@ class MetadataManager:
         else:
             logger.error(f"Unexpected securable type for path {entry.fs_path}")
             raise pyfuse3.FUSEError(errno.EACCES)
+        # Resolve identity first: the permission cache is keyed by principal, so
+        # a uid that switches tokens to a different principal can never read the
+        # previous principal's cached grants.
+        principal = await self._get_principal(ctx)
+        if principal is None:
+            logger.error(f"Unable to get principal for {ctx=}")
+            raise pyfuse3.FUSEError(errno.EACCES)
+        cache_key = (principal, securable)
         # 1. Permission Check with Caching
         async with self._permissions_lock:
-            cached = self._get_valid_cache(self._permissions_cache, (ctx.uid, securable))
+            cached = self._get_valid_cache(self._permissions_cache, cache_key)
             # TODO: We should be able to tell difference between no cache entry and negative cache entry (e.g. path does not exist)
             if cached is not None:
                 return cached
         # 2. Request Coalescing
-        (wait_event, leader) = await self._permissions_coalescer.join_or_lead((ctx.uid, securable))
+        (wait_event, leader) = await self._permissions_coalescer.join_or_lead(cache_key)
 
         if not leader:
             await wait_event.wait()
             # Wake up: Check cache again (Leader should have filled it)
             async with self._permissions_lock:
                 permissions_fullfilled = self._get_valid_cache(
-                    self._permissions_cache, (ctx.uid, securable)
+                    self._permissions_cache, cache_key
                 )
             if permissions_fullfilled is None:
                 # A genuine denial is cached as False, so a missing entry means
@@ -211,21 +217,17 @@ class MetadataManager:
             return permissions_fullfilled
         # 3. Real API Call (Leader Only)
         try:
-            principal = await self._get_principal(ctx)
-            if principal is None:
-                logger.error(f"Unable to get principal for {ctx=}")
-                raise pyfuse3.FUSEError(errno.EACCES)
             permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx=ctx)
             # Cache the result. Catalog/schema grants change rarely and use the
             # longer catalog TTL (matching get_ttl); volume grants gate file
             # contents, so they use the shorter default TTL for faster revocation.
             perm_ttl = self._ttl_catalog if securable_type in ("catalog", "schema") else self._ttl
             async with self._permissions_lock:
-                self._permissions_cache[(ctx.uid, securable)] = (time.time() + perm_ttl, permissions_fullfilled)
+                self._permissions_cache[cache_key] = (time.time() + perm_ttl, permissions_fullfilled)
                 if len(self._permissions_cache) > self.max_entries:
                     self._permissions_cache.popitem(last=False)
         finally:
-            await self._permissions_coalescer.notify_done((ctx.uid, securable))
+            await self._permissions_coalescer.notify_done(cache_key)
         return permissions_fullfilled
 
     async def get_attributes(self, entry: InodeEntry, ctx) -> InodeEntryAttr | None:
