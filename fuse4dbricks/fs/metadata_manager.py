@@ -420,6 +420,11 @@ class MetadataManager:
             st_ctime=ctime,
             st_mtime=mtime,
             st_atime=0,
+            # st_uid/st_gid are meaningless: the attr is cached globally, so
+            # these end up reflecting whoever populated the shared cache first,
+            # not the real owner. Access is decided by per-user Unity Catalog
+            # permission checks, never from POSIX ownership. See README's
+            # "Known limitations".
             st_uid=ctx.uid,
             st_gid=ctx.gid,
         )

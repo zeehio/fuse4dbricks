@@ -166,3 +166,10 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   to access different Unity Catalog principals at the same time (for example by setting a
   different `DATABRICKS_CONFIG_PROFILE` per process). The first token resolved for a user is
   reused for all of that user's processes.
+
+- **File owner and group are meaningless.** The user and group reported for a file or
+  directory (`st_uid`/`st_gid`, what `ls -l` shows in the owner and group columns) are simply
+  whoever happened to populate the shared metadata cache for that entry first, so the same
+  file may appear owned by different users at different times. These values are irrelevant:
+  access is never decided from POSIX ownership, only from a per-user Unity Catalog permission
+  check. Do not rely on the reported owner or group for anything.
