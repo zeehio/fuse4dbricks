@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import pwd
+import stat
 import traceback
 from typing import Optional
 
@@ -155,6 +156,25 @@ class DatabricksUnifiedAuthProvider:
         else:
             profile = "DEFAULT"
             config_file = None
+
+        # If the config file is not a regular file, not owned by uid, or not readable
+        # by the owner, ignore it and log an error
+        if config_file is not None:
+            try:
+                st = os.stat(config_file)
+            except OSError as exc:
+                logger.error("Cannot stat config file %s: %s", config_file, exc)
+                config_file = None
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    logger.error("Config file %s is not a regular file, ignoring", config_file)
+                    config_file = None
+                elif st.st_uid != uid or not (st.st_mode & stat.S_IRUSR):
+                    logger.error(
+                        "Config file %s is not owned and readable by uid %s, ignoring",
+                        config_file, uid,
+                    )
+                    config_file = None
 
         if config_file is None:
             # Default to ~/.databrickscfg in the user's home directory
