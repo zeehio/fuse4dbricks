@@ -1,6 +1,7 @@
 # 0.6.2 (2026-06-12)
 
 - Security: A user could use DATABRICKS_CONFIG_PROFILE to make fuse4dbricks read any user profile if it ran as root.
+- Improve test coverage
 
 # 0.6.1 (2026-05-07)
 
