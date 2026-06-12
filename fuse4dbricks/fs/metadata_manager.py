@@ -113,6 +113,35 @@ class MetadataManager:
     # Public API
     # =========================================================================
 
+    async def reauthorize(self, ctx: pyfuse3.RequestContext) -> None:
+        """Re-evaluate a uid's identity after its access token changed.
+
+        Refreshes the cached principal for ``ctx.uid`` using the (now updated)
+        token. The permission cache is keyed by ``(uid, securable)`` and its
+        entries are only valid for a given principal, so we drop them *only if
+        the principal actually changed* (or could not be resolved). A token
+        that maps to the same principal leaves the permission cache untouched.
+        """
+        async with self._principal_cache_lock:
+            old_principal = self._principal_cache.pop(ctx.uid, None)
+
+        try:
+            new_principal = await self.uc_client.get_current_user_info(ctx)
+        except Exception:
+            # Token invalid/expired or transient failure: we can't confirm the
+            # identity, so don't keep stale grants around.
+            new_principal = None
+
+        if new_principal is not None:
+            async with self._principal_cache_lock:
+                self._principal_cache[ctx.uid] = new_principal
+
+        if old_principal != new_principal:
+            async with self._permissions_lock:
+                stale = [k for k in self._permissions_cache if k[0] == ctx.uid]
+                for key in stale:
+                    del self._permissions_cache[key]
+
     async def _get_principal(self, ctx: pyfuse3.RequestContext) -> str|None:
         async with self._principal_cache_lock:
             principal = self._principal_cache.get(ctx.uid)

@@ -13,7 +13,7 @@ Covers:
 import errno
 import stat
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pyfuse3
@@ -55,6 +55,7 @@ def manager(auth_provider):
     return AuthManager(
         uc_client=MagicMock(),
         auth_provider=auth_provider,
+        metadata_manager=AsyncMock(),
         workspace="https://workspace.example.com",
     )
 
