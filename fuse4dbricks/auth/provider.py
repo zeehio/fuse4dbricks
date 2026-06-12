@@ -134,10 +134,23 @@ class DatabricksUnifiedAuthProvider:
             logger.error("Environ file %s does not exist for pid %s", environ_file, pid)
             return None
         try:
-            with open(environ_file, "r") as f:
-                env_vars = f.read().split("\0")
-                env_dict = dict(var.split("=", 1) for var in env_vars if "=" in var)
-                return env_dict
+            # /proc/<pid>/environ is raw bytes; a single non-UTF-8 variable must
+            # not discard the whole environment, so read binary and decode each
+            # entry independently, skipping any that don't decode.
+            with open(environ_file, "rb") as f:
+                raw = f.read()
+            env_dict: dict[str, str] = {}
+            for entry in raw.split(b"\0"):
+                if not entry:
+                    continue
+                try:
+                    text = entry.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                key, sep, value = text.partition("=")
+                if sep:
+                    env_dict[key] = value
+            return env_dict
         except Exception as exc:
             logger.error("Failed to read environ file %s for pid %s. Exception: %s", environ_file, pid, exc)
             return None

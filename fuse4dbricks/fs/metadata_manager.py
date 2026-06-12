@@ -213,9 +213,12 @@ class MetadataManager:
                 logger.error(f"Unable to get principal for {ctx=}")
                 raise pyfuse3.FUSEError(errno.EACCES)
             permissions_fullfilled = await self.uc_client.check_permissions(securable, securable_type, privileges=req_privileges, principal=principal, ctx=ctx)
-            # Cache the result
+            # Cache the result. Catalog/schema grants change rarely and use the
+            # longer catalog TTL (matching get_ttl); volume grants gate file
+            # contents, so they use the shorter default TTL for faster revocation.
+            perm_ttl = self._ttl_catalog if securable_type in ("catalog", "schema") else self._ttl
             async with self._permissions_lock:
-                self._permissions_cache[(ctx.uid, securable)] = (time.time() + self._ttl, permissions_fullfilled)
+                self._permissions_cache[(ctx.uid, securable)] = (time.time() + perm_ttl, permissions_fullfilled)
                 if len(self._permissions_cache) > self.max_entries:
                     self._permissions_cache.popitem(last=False)
         finally:
@@ -362,10 +365,8 @@ class MetadataManager:
             # Many errors may happen. An access denied error should be raised.
             if isinstance(e, pyfuse3.FUSEError) and e.errno == errno.EACCES:
                 raise
-            # Other errors should be logged and we should return None?
-            import traceback
-            logger.error(f"List directory failed for {entry.fs_path}: {e}")
-            print(traceback.format_exc())
+            # Other errors are logged and surfaced as "no listing" (None).
+            logger.exception("List directory failed for %s: %s", entry.fs_path, e)
             return None
         finally:
             await self._dir_coalescer.notify_done(entry.fs_path)
