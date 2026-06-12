@@ -147,3 +147,22 @@ user has to provide its own access token.
 
       sudo systemctl enable fuse4dbricks
       sudo systemctl start fuse4dbricks
+
+## Known limitations
+
+These are intentional design trade-offs in the current implementation. We are open to
+discussing them, so feel free to open an issue if any of them is a problem for your use case.
+
+- **The attribute cache is global.** File and directory metadata (names, sizes and
+  modification times) is cached in memory and shared across all users of a single mount.
+  As a consequence, names, sizes and modification times of files may leak between users,
+  even between users who do not have access to read them. **File contents never leak**:
+  reading data always goes through a per-user permission check against Unity Catalog using
+  that user's own token. The metadata cache is shared for performance reasons, to avoid
+  repeating Unity Catalog API calls for objects that several users access.
+
+- **Users are mapped to tokens 1-to-1.** fuse4dbricks associates a single access token with
+  each user (uid). It is therefore not possible for two processes belonging to the same user
+  to access different Unity Catalog principals at the same time (for example by setting a
+  different `DATABRICKS_CONFIG_PROFILE` per process). The first token resolved for a user is
+  reused for all of that user's processes.
