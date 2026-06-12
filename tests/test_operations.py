@@ -310,6 +310,45 @@ async def test_open_missing_inode_raises_enoent(fs, ctx, metadata_manager):
 
 
 @pytest.mark.trio
+async def test_check_permissions_transient_error_surfaces_eagain(fs, inode_manager, metadata_manager, ctx):
+    """A transient failure during the permission check must surface EAGAIN
+    (retryable), not be collapsed into a permanent EACCES."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    metadata_manager.check_access = AsyncMock(side_effect=UcUnavailable("503"))
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.access(cat.inode, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EAGAIN
+
+
+@pytest.mark.trio
+async def test_check_permissions_rate_limited_surfaces_eagain(fs, inode_manager, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    metadata_manager.check_access = AsyncMock(side_effect=UcRateLimited("429"))
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.access(cat.inode, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EAGAIN
+
+
+@pytest.mark.trio
+async def test_check_permissions_denied_surfaces_eacces(fs, inode_manager, metadata_manager, ctx):
+    """A genuine denial (UcPermissionDenied, or granted=False) stays EACCES."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    metadata_manager.check_access = AsyncMock(side_effect=UcPermissionDenied("403"))
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.access(cat.inode, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EACCES
+
+
+@pytest.mark.trio
+async def test_check_permissions_granted_false_surfaces_eacces(fs, inode_manager, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    metadata_manager.check_access = AsyncMock(return_value=False)
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.access(cat.inode, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EACCES
+
+
+@pytest.mark.trio
 async def test_release_removes_file_handle_state(fs, inode_manager, metadata_manager, ctx):
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
     sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))

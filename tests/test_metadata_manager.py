@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pyfuse3
+import trio
 
 from fuse4dbricks.api.uc_client import UcNodeType, UnityCatalogEntry
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
@@ -255,6 +256,27 @@ async def test_check_access_result_cached(manager, mock_uc_client, ctx):
     await manager.check_access(entry, mode=4, ctx=ctx)
     await manager.check_access(entry, mode=4, ctx=ctx)
     assert mock_uc_client.check_permissions.await_count == 1
+
+
+@pytest.mark.trio
+async def test_check_access_follower_miss_raises_eagain(manager, mock_uc_client, ctx):
+    """A coalescing follower that wakes to no cached decision must surface a
+    retryable EAGAIN, not a fabricated deny: the leader's request failed (it
+    would have cached False for a real denial)."""
+    entry = _make_entry("/my_catalog", is_dir=True)
+    securable = "my_catalog"
+    # Simulate a leader already in flight that finished without caching a
+    # decision (i.e. it errored): pre-arm the coalescer with an already-set
+    # event so our call takes the follower path and wakes immediately.
+    done = trio.Event()
+    done.set()
+    manager._permissions_coalescer._inflight[(ctx.uid, securable)] = done
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await manager.check_access(entry, mode=4, ctx=ctx)
+    assert exc_info.value.errno == errno.EAGAIN
+    # It must not have fabricated the answer via its own API call.
+    mock_uc_client.check_permissions.assert_not_awaited()
 
 
 @pytest.mark.trio

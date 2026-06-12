@@ -59,10 +59,18 @@ class UnityCatalogFS(pyfuse3.Operations):
                 granted = await self.auth_manager.check_access(entry, mode, ctx)
             else:
                 granted = await self.metadata_manager.check_access(entry, mode, ctx)
-            if not granted:
-                raise pyfuse3.FUSEError(errno.EACCES)
-        except Exception as e:
-            raise pyfuse3.FUSEError(errno.EACCES) from e
+        except pyfuse3.FUSEError:
+            # Already-mapped errno: a genuine denial (EACCES) or a transient
+            # failure surfaced as EAGAIN by a coalescing follower. Do not
+            # collapse a rate-limit/outage into a permanent "permission denied".
+            raise
+        except Exception as exc:
+            # Map domain errors (transient -> EAGAIN, UcPermissionDenied ->
+            # EACCES, ...); falls back to EIO rather than a false EACCES.
+            self._raise_fuse_error(exc, fs_path=entry.fs_path, op="check_permissions")
+            raise pyfuse3.FUSEError(errno.EIO)  # defensive; _raise_fuse_error always raises
+        if not granted:
+            raise pyfuse3.FUSEError(errno.EACCES)
         return True
 
     def _raise_fuse_error(self, exc: Exception, *, fs_path: str | None = None, op: str | None = None):
