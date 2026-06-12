@@ -202,10 +202,13 @@ class MetadataManager:
                 permissions_fullfilled = self._get_valid_cache(
                     self._permissions_cache, (ctx.uid, securable)
                 )
-                if permissions_fullfilled is None:
-                    # Cache miss after waiting means the leader did not find the securable or an error occurred. Deny access.
-                    return False
-                return permissions_fullfilled
+            if permissions_fullfilled is None:
+                # A genuine denial is cached as False, so a missing entry means
+                # the leader's request failed (e.g. rate limit/outage after the
+                # HTTP-layer retries). Surface a retryable error instead of
+                # fabricating a permanent "permission denied".
+                raise pyfuse3.FUSEError(errno.EAGAIN)
+            return permissions_fullfilled
         # 3. Real API Call (Leader Only)
         try:
             principal = await self._get_principal(ctx)
