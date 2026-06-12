@@ -140,6 +140,14 @@ class MetadataManager:
             async with self._principal_cache_lock:
                 self._principal_cache[ctx.uid] = new_principal
 
+    def forget_principal(self, uid: int) -> None:
+        """Drop the cached principal for a uid after its token is invalidated
+        (e.g. on a 401); the next request re-resolves it. Synchronous so it can
+        be called from the (sync) token-invalidation callback; the pop is atomic
+        under trio's cooperative scheduler, so no lock is required.
+        """
+        self._principal_cache.pop(uid, None)
+
     async def _get_principal(self, ctx: pyfuse3.RequestContext) -> str|None:
         async with self._principal_cache_lock:
             principal = self._principal_cache.get(ctx.uid)

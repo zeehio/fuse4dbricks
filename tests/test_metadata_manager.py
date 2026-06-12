@@ -477,6 +477,14 @@ async def test_reauthorize_fetch_failure_leaves_principal_unresolved(manager, mo
     assert ctx.uid not in manager._principal_cache
 
 
+def test_forget_principal_drops_cached_principal(manager, ctx):
+    manager._principal_cache[ctx.uid] = "alice@example.com"
+    manager.forget_principal(ctx.uid)
+    assert ctx.uid not in manager._principal_cache
+    # Forgetting an absent uid is a no-op (must not raise).
+    manager.forget_principal(999999)
+
+
 @pytest.mark.trio
 async def test_permission_cache_isolated_by_principal(manager, mock_uc_client, ctx):
     """Keying the permission cache by principal means a uid that switches tokens

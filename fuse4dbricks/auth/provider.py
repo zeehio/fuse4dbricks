@@ -10,7 +10,7 @@ from pathlib import Path
 import pwd
 import stat
 import traceback
-from typing import Optional
+from typing import Callable, Optional
 
 import pyfuse3
 
@@ -233,11 +233,21 @@ class AuthProvider:
         self._uid_to_access_token: dict[int, str] = {}
         "uid -> access_token"
         self._unified_auth = DatabricksUnifiedAuthProvider() if unified_auth else None
+        self._on_token_invalidated: Optional[Callable[[int], None]] = None
+        "Optional listener notified (with the uid) when a uid's token is invalidated."
 
+    def set_token_invalidation_callback(self, callback: Callable[[int], None]) -> None:
+        """Register a listener invoked with the uid whenever its token is
+        invalidated (e.g. on a 401), so principal-derived caches can be dropped."""
+        self._on_token_invalidated = callback
 
     def invalidate_access_token(self, ctx: pyfuse3.RequestContext):
         if ctx.uid in self._uid_to_access_token:
             del self._uid_to_access_token[ctx.uid]
+        # A 401 invalidation may re-resolve to a token for a different principal;
+        # notify listeners so they drop principal-derived caches and re-derive.
+        if self._on_token_invalidated is not None:
+            self._on_token_invalidated(ctx.uid)
 
     async def get_access_token(self, ctx: pyfuse3.RequestContext) -> str:
         """
