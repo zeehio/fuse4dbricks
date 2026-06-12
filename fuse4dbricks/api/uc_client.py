@@ -5,6 +5,7 @@ Handles pagination, robust authentication, and asynchronous streaming for FUSE.
 
 import logging
 import os
+import random
 import urllib.parse
 from dataclasses import dataclass
 from email.utils import formatdate, parsedate_to_datetime
@@ -13,6 +14,7 @@ from typing import AsyncGenerator
 
 import httpx
 import pyfuse3
+import trio
 
 from fuse4dbricks.api.errors import (
     UcBadRequest,
@@ -26,6 +28,36 @@ from fuse4dbricks.api.errors import (
 from fuse4dbricks.auth.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
+
+# Transient failures are retried with exponential backoff and jitter:
+# 429 (rate limited), 5xx (server unavailable) and connection-level errors.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_DEFAULT_MAX_RETRIES = 4
+_BACKOFF_BASE_S = 0.5
+_BACKOFF_CAP_S = 20.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header expressed as a number of seconds."""
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        # Retry-After may also be an HTTP date; we don't honor that form.
+        return None
+
+
+def _backoff_delay(attempt: int, retry_after_s: float | None) -> float:
+    """Seconds to wait before retry ``attempt`` (0-based).
+
+    Honors a server-provided Retry-After when present, otherwise uses
+    exponential backoff with full jitter, capped at ``_BACKOFF_CAP_S``.
+    """
+    if retry_after_s is not None:
+        return retry_after_s
+    ceiling = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2**attempt))
+    return random.uniform(0.0, ceiling)
 
 
 class UcNodeType(Enum):
@@ -99,15 +131,14 @@ class UnityCatalogClient:
             raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 429:
-            exc = UcRateLimited(msg, status_code=429, uc_path=uc_path, url=url, request_id=request_id)
-            # Optional: parse Retry-After
             ra = resp.headers.get("retry-after")
+            retry_after_s = None
             if ra:
                 try:
-                    exc.retry_after_s = float(ra)
+                    retry_after_s = float(ra)
                 except ValueError:
                     pass
-            raise exc
+            raise UcRateLimited(msg, status_code=429, uc_path=uc_path, url=url, request_id=request_id, retry_after_s=retry_after_s)
 
         if resp.status_code in (500, 502, 503, 504):
             raise UcUnavailable(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
@@ -115,9 +146,16 @@ class UnityCatalogClient:
         raise UcError(msg, status_code=resp.status_code, uc_path=uc_path, url=url, request_id=request_id)
 
 
-    async def _request(self, method, url, *, ctx: pyfuse3.RequestContext, params=None, headers=None, stream=False, uc_path=None):
+    async def _request(
+        self, method, url, *, ctx: pyfuse3.RequestContext, params=None, headers=None,
+        stream=False, uc_path=None, max_retries: int = _DEFAULT_MAX_RETRIES,
+    ):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
+
+        Transient failures (429 rate limits, 5xx server errors and connection
+        errors) are retried up to ``max_retries`` times with exponential backoff,
+        honoring a ``Retry-After`` header on 429 responses when present.
         """
         if headers is None:
             headers = {}
@@ -125,44 +163,75 @@ class UnityCatalogClient:
         base_headers = await self._get_headers(ctx=ctx)
         headers.update(base_headers)
 
-        request = self.client.build_request(method, url, params=params, headers=headers)
+        attempt = 0
+        while True:
+            request = self.client.build_request(method, url, params=params, headers=headers)
 
-        try:
-            response = await self.client.send(request, stream=stream)
-        except httpx.ConnectError as e:
-            logger.error(f"Connection error to {url}: {e}")
-            raise
+            try:
+                response = await self.client.send(request, stream=stream)
+            except httpx.TransportError as e:
+                # Connection-level errors (connect/read timeouts, resets) are transient.
+                if attempt < max_retries:
+                    delay = _backoff_delay(attempt, None)
+                    logger.warning(
+                        f"Transport error to {url}: {e}. "
+                        f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})."
+                    )
+                    await trio.sleep(delay)
+                    attempt += 1
+                    continue
+                logger.error(f"Connection error to {url}: {e}")
+                raise
 
-        # 401 Retry Logic (Token Expiration)
-        if response.status_code == 401:
-            logger.warning("Token expired (401). Refreshing and retrying...")
-            self.auth_provider.invalidate_access_token(ctx=ctx)
-            await self.auth_provider.get_access_token(ctx=ctx)
+            # 401 Retry Logic (Token Expiration)
+            if response.status_code == 401:
+                logger.warning("Token expired (401). Refreshing and retrying...")
+                self.auth_provider.invalidate_access_token(ctx=ctx)
+                await self.auth_provider.get_access_token(ctx=ctx)
 
-            headers.update(await self._get_headers(ctx=ctx))
-            # For stream=True, we must ensure the first response is closed before retrying
-            if stream:
+                headers.update(await self._get_headers(ctx=ctx))
+                # For stream=True, we must ensure the first response is closed before retrying
+                if stream:
+                    await response.aclose()
+
+                request = self.client.build_request(
+                    method, url, params=params, headers=headers
+                )
+                response = await self.client.send(request, stream=stream)
+
+            # Transient server-side failures: back off and retry.
+            if response.status_code in _RETRY_STATUS and attempt < max_retries:
+                retry_after_s = (
+                    _parse_retry_after(response.headers.get("retry-after"))
+                    if response.status_code == 429
+                    else None
+                )
+                # Release the connection before sleeping/retrying.
+                if stream:
+                    await response.aclose()
+                delay = _backoff_delay(attempt, retry_after_s)
+                logger.warning(
+                    f"Transient error {response.status_code} for {url}. "
+                    f"Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})."
+                )
+                await trio.sleep(delay)
+                attempt += 1
+                continue
+
+            if not stream:
+                if response.status_code == 404:
+                    return None
+                self._raise_for_status(response, uc_path=uc_path)
+
+                if method == "HEAD":
+                    return response
+                return response.json()
+
+            # For streams, we return the response object to be used in a context manager
+            if response.status_code >= 400:
                 await response.aclose()
-
-            request = self.client.build_request(
-                method, url, params=params, headers=headers
-            )
-            response = await self.client.send(request, stream=stream)
-
-        if not stream:
-            if response.status_code == 404:
-                return None
-            self._raise_for_status(response, uc_path=uc_path)
-
-            if method == "HEAD":
-                return response
-            return response.json()
-
-        # For streams, we return the response object to be used in a context manager
-        if response.status_code >= 400:
-            await response.aclose()
-            self._raise_for_status(response, uc_path=uc_path)
-        return response
+                self._raise_for_status(response, uc_path=uc_path)
+            return response
 
     # --- Discovery Layer (Pagination Support) ---
 

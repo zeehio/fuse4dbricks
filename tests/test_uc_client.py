@@ -7,7 +7,7 @@ import pytest
 import pyfuse3
 
 from fuse4dbricks.api.uc_client import UnityCatalogClient
-from fuse4dbricks.api.errors import UcError
+from fuse4dbricks.api.errors import UcError, UcRateLimited, UcUnavailable
 
 # --- FIXTURES ---
 
@@ -167,3 +167,154 @@ async def test_download_chunk_stream_412_precondition_failed(client):
 
     assert excinfo.value.status_code == 412
     mock_response.aclose.assert_awaited()
+
+
+# --- TESTS: TRANSIENT ERROR RETRY / BACKOFF ---
+
+
+def _error_response(status_code, headers=None):
+    """Build a mock httpx.Response for an error status code."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.headers = headers or {}
+    resp.request = MagicMock(spec=httpx.Request)
+    resp.request.url = "https://test-workspace.net/test"
+    return resp
+
+
+@pytest.fixture
+def backoff(monkeypatch):
+    """Record backoff decisions and collapse the wait to an instant checkpoint.
+
+    Patches the module-level ``_backoff_delay`` (only the retry path calls it) so
+    we avoid real sleeps without globally monkeypatching ``trio.sleep``. Each
+    entry is the ``retry_after_s`` value passed for that retry.
+    """
+    retry_afters = []
+
+    def fake_backoff(attempt, retry_after_s):
+        retry_afters.append(retry_after_s)
+        return 0.0  # trio.sleep(0.0) is an instant checkpoint
+
+    monkeypatch.setattr("fuse4dbricks.api.uc_client._backoff_delay", fake_backoff)
+    return retry_afters
+
+
+@pytest.mark.trio
+async def test_request_429_retries_then_succeeds(client, backoff):
+    """A 429 is retried with backoff and then succeeds."""
+    response_200 = MagicMock(spec=httpx.Response)
+    response_200.status_code = 200
+    response_200.json.return_value = {"ok": True}
+
+    client.client.send.side_effect = [_error_response(429), response_200]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
+
+    assert result == {"ok": True}
+    assert client.client.send.call_count == 2
+    assert len(backoff) == 1  # backed off once
+
+
+@pytest.mark.trio
+async def test_request_429_honors_retry_after(client, backoff):
+    """A Retry-After header overrides the computed backoff delay."""
+    response_200 = MagicMock(spec=httpx.Response)
+    response_200.status_code = 200
+    response_200.json.return_value = {"ok": True}
+
+    client.client.send.side_effect = [
+        _error_response(429, headers={"retry-after": "2"}),
+        response_200,
+    ]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
+
+    assert result == {"ok": True}
+    assert backoff == [2.0]
+
+
+@pytest.mark.trio
+async def test_request_5xx_retries_then_succeeds(client, backoff):
+    """A 503 is retried with backoff and then succeeds."""
+    response_200 = MagicMock(spec=httpx.Response)
+    response_200.status_code = 200
+    response_200.json.return_value = {"ok": True}
+
+    client.client.send.side_effect = [_error_response(503), response_200]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
+
+    assert result == {"ok": True}
+    assert client.client.send.call_count == 2
+
+
+@pytest.mark.trio
+async def test_request_429_exhausts_retries_raises(client, backoff):
+    """When retries are exhausted, the original UcRateLimited is raised."""
+    client.client.send.side_effect = [
+        _error_response(429, headers={"retry-after": "3"}) for _ in range(3)
+    ]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcRateLimited) as excinfo:
+        await client._request("GET", "/test", ctx=ctx, max_retries=2)
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after_s == 3.0
+    # initial attempt + 2 retries
+    assert client.client.send.call_count == 3
+    assert len(backoff) == 2
+
+
+@pytest.mark.trio
+async def test_request_5xx_exhausts_retries_raises(client, backoff):
+    """When retries are exhausted, a 5xx surfaces as UcUnavailable."""
+    client.client.send.side_effect = [_error_response(500) for _ in range(2)]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcUnavailable):
+        await client._request("GET", "/test", ctx=ctx, max_retries=1)
+
+    assert client.client.send.call_count == 2
+
+
+@pytest.mark.trio
+async def test_request_transport_error_retries_then_succeeds(client, backoff):
+    """Connection-level errors are retried before surfacing."""
+    response_200 = MagicMock(spec=httpx.Response)
+    response_200.status_code = 200
+    response_200.json.return_value = {"ok": True}
+
+    client.client.send.side_effect = [
+        httpx.ConnectError("boom"),
+        response_200,
+    ]
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    result = await client._request("GET", "/test", ctx=ctx)
+
+    assert result == {"ok": True}
+    assert client.client.send.call_count == 2
+
+
+@pytest.mark.trio
+async def test_request_transport_error_exhausts_retries_raises(client, backoff):
+    """A persistent connection error is re-raised after exhausting retries."""
+    client.client.send.side_effect = httpx.ConnectError("boom")
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(httpx.ConnectError):
+        await client._request("GET", "/test", ctx=ctx, max_retries=2)
+
+    assert client.client.send.call_count == 3
+
+
+def test_uc_rate_limited_carries_retry_after():
+    """Regression: UcRateLimited must accept retry_after_s in its constructor."""
+    err = UcRateLimited("rate limited", status_code=429, retry_after_s=5.0)
+    assert err.retry_after_s == 5.0
+    assert err.status_code == 429
