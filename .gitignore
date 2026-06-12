@@ -36,6 +36,9 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# fuse4dbricks end-to-end test mountpoint (default FUSE4DBRICKS_TEST_MOUNTPOINT)
+.e2e_mount/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
