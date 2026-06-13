@@ -110,12 +110,31 @@ def auth_manager():
 
 
 @pytest.fixture
-def fs(inode_manager, metadata_manager, data_manager, auth_manager):
+def uc_client():
+    mgr = MagicMock()
+    mgr.upload_file = AsyncMock()
+    mgr.delete_file = AsyncMock()
+    mgr.delete_directory = AsyncMock()
+    mgr.create_directory = AsyncMock()
+    return mgr
+
+
+@pytest.fixture
+def writes_dir(tmp_path):
+    d = tmp_path / "writes"
+    d.mkdir()
+    return str(d)
+
+
+@pytest.fixture
+def fs(inode_manager, metadata_manager, data_manager, auth_manager, uc_client, writes_dir):
     return UnityCatalogFS(
         inode_manager=inode_manager,
         metadata_manager=metadata_manager,
         data_manager=data_manager,
         auth_manager=auth_manager,
+        uc_client=uc_client,
+        writes_dir=writes_dir,
     )
 
 
@@ -558,3 +577,429 @@ async def test_readdir_non_root_has_no_overlay(fs, inode_manager, metadata_manag
         (b"file.txt", 3),
     ]
     auth_manager.root_overlay.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# write path — O_WRONLY
+# ---------------------------------------------------------------------------
+
+
+def _make_vol_file(inode_manager, filename="data.txt", size=512):
+    """Add cat/sch/vol/<filename> to the inode tree and return the file entry."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    f = inode_manager.add_entry(vol.inode, filename, attr=_make_attr(False, size=size))
+    return vol, f
+
+
+@pytest.mark.trio
+async def test_open_wronly_creates_write_buffer(fs, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    state = fs._open_state[fh]
+    assert state["writable"] is True
+    assert state["write_buffer"] is not None
+    assert state["dirty"] is False
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_write_updates_st_size(fs, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    data = b"x" * 1000
+    n = await fs.write(fh, offset=0, buffer=data)
+    assert n == 1000
+    assert f.attr.st_size == 1000
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_write_at_nonzero_offset_extends_buffer_size(fs, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=100, buffer=b"X")
+    state = fs._open_state[fh]
+    assert state["write_buffer"].size() == 101
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_write_sets_dirty_flag(fs, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    assert fs._open_state[fh]["dirty"] is False
+    await fs.write(fh, offset=0, buffer=b"data")
+    assert fs._open_state[fh]["dirty"] is True
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_release_no_upload_when_not_dirty(fs, inode_manager, uc_client, ctx):
+    """Open O_WRONLY without writing: release must skip the upload."""
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_release_upload_on_dirty(fs, inode_manager, uc_client, ctx):
+    """Write then release: upload_file is called with the correct uc_path."""
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"content")
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
+    call_args = uc_client.upload_file.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+
+
+@pytest.mark.trio
+async def test_release_invalidates_cache_on_success(fs, inode_manager, metadata_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    metadata_manager.invalidate = MagicMock()
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"new content")
+    await fs.release(pyfuse3.FileHandleT(fh))
+    metadata_manager.invalidate.assert_called_once_with(f.fs_path, is_dir=False)
+
+
+@pytest.mark.trio
+async def test_release_upload_failure_returns_eio(fs, inode_manager, uc_client, metadata_manager, ctx):
+    """Upload failure: release raises EIO and does NOT invalidate the cache."""
+    _vol, f = _make_vol_file(inode_manager)
+    uc_client.upload_file = AsyncMock(side_effect=UcUnavailable("503"))
+    metadata_manager.invalidate = MagicMock()
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"data")
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.release(pyfuse3.FileHandleT(fh))
+    assert exc_info.value.errno == errno.EIO
+    metadata_manager.invalidate.assert_not_called()
+
+
+@pytest.mark.trio
+async def test_release_cleans_tempfile_on_failure(fs, inode_manager, uc_client, ctx):
+    """Tempfile must be deleted even when the upload raises."""
+    import os
+    _vol, f = _make_vol_file(inode_manager)
+    uc_client.upload_file = AsyncMock(side_effect=RuntimeError("network error"))
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"data")
+    tmppath = fs._open_state[fh]["write_buffer"].path
+    assert os.path.exists(tmppath)
+    with pytest.raises(pyfuse3.FUSEError):
+        await fs.release(pyfuse3.FileHandleT(fh))
+    assert not os.path.exists(tmppath)
+
+
+# ---------------------------------------------------------------------------
+# write path — create()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_create_returns_attrs_and_file_handle(fs, inode_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    attrs, file_info = await fs.create(vol.inode, b"newfile.txt", 0o644, 0, ctx)
+    assert attrs.st_size == 0
+    assert int(file_info.fh) in fs._open_state
+
+
+@pytest.mark.trio
+async def test_create_dirty_true_uploads_on_release(fs, inode_manager, uc_client, ctx):
+    """create() marks the handle dirty so release() always uploads (even with no writes)."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    _attrs, file_info = await fs.create(vol.inode, b"empty.txt", 0o644, 0, ctx)
+    fh = int(file_info.fh)
+    # No explicit write — but dirty=True from create()
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
+    call_args = uc_client.upload_file.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/empty.txt"
+
+
+@pytest.mark.trio
+async def test_create_then_write_then_release(fs, inode_manager, uc_client, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    _attrs, file_info = await fs.create(vol.inode, b"out.txt", 0o644, 0, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"hello world")
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
+    call_args = uc_client.upload_file.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/out.txt"
+
+
+# ---------------------------------------------------------------------------
+# write path — O_RDWR
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_rdwr_downloads_existing_file_on_open(fs, inode_manager, data_manager, ctx):
+    """open(O_RDWR) without O_TRUNC must download the existing file into the buffer."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    data_manager.read.assert_awaited_once()
+    assert fs._open_state[fh]["write_buffer"] is not None
+    assert fs._open_state[fh]["write_buffer"].size() == 5
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_rdwr_trunc_skips_download(fs, inode_manager, data_manager, ctx):
+    """open(O_RDWR | O_TRUNC) must NOT download — buffer starts empty."""
+    _vol, f = _make_vol_file(inode_manager)
+    O_RDWR = 2
+    O_TRUNC = 0o1000
+    file_info = await fs.open(f.inode, O_RDWR | O_TRUNC, ctx)
+    fh = int(file_info.fh)
+    data_manager.read.assert_not_awaited()
+    assert fs._open_state[fh]["write_buffer"].size() == 0
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_rdwr_read_served_from_buffer(fs, inode_manager, data_manager, ctx):
+    """Reads on an O_RDWR handle are served from the local buffer, not DataManager."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    data_manager.read.reset_mock()
+    result = await fs.read(fh, offset=0, length=5)
+    assert result == b"hello"
+    data_manager.read.assert_not_awaited()
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_rdwr_sees_own_writes(fs, inode_manager, data_manager, ctx):
+    """A write followed by a read on the same O_RDWR handle returns the new content."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"world")
+    result = await fs.read(fh, offset=0, length=5)
+    assert result == b"world"
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_rdwr_not_dirty_no_upload(fs, inode_manager, data_manager, uc_client, ctx):
+    """Open O_RDWR, only read, release: no upload should happen."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    await fs.read(fh, offset=0, length=5)
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_rdwr_dirty_uploads(fs, inode_manager, data_manager, uc_client, ctx):
+    """Open O_RDWR, write something, release: upload is called."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"world")
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# mkdir
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_mkdir_calls_create_directory(fs, inode_manager, uc_client, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    metadata_manager.invalidate = MagicMock()
+
+    attrs = await fs.mkdir(vol.inode, b"newdir", 0o755, ctx)
+
+    assert bool(attrs.st_mode & stat.S_IFDIR)
+    uc_client.create_directory.assert_awaited_once()
+    call_args = uc_client.create_directory.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/newdir"
+    # Invalidate child path so parent's dir listing is refreshed.
+    metadata_manager.invalidate.assert_called_once_with("/cat/sch/vol/newdir", is_dir=True)
+
+
+@pytest.mark.trio
+async def test_mkdir_eacces_without_write_permission(fs, inode_manager, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    metadata_manager.check_access = AsyncMock(side_effect=pyfuse3.FUSEError(errno.EACCES))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.mkdir(vol.inode, b"newdir", 0o755, ctx)
+    assert exc_info.value.errno == errno.EACCES
+
+
+# ---------------------------------------------------------------------------
+# unlink
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_unlink_calls_delete_file(fs, inode_manager, uc_client, metadata_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    metadata_manager.invalidate = MagicMock()
+
+    await fs.unlink(f.parent_inode, b"data.txt", ctx)
+
+    uc_client.delete_file.assert_awaited_once()
+    call_args = uc_client.delete_file.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+    metadata_manager.invalidate.assert_called_once_with("/cat/sch/vol/data.txt", is_dir=False)
+    # Inode should be pruned
+    assert inode_manager.get_inode_by_path("/cat/sch/vol/data.txt") is None
+
+
+@pytest.mark.trio
+async def test_unlink_notfound_returns_enoent(fs, inode_manager, uc_client, ctx):
+    _vol, f = _make_vol_file(inode_manager)
+    uc_client.delete_file = AsyncMock(side_effect=UcNotFound("404"))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.unlink(f.parent_inode, b"data.txt", ctx)
+    assert exc_info.value.errno == errno.ENOENT
+
+
+# ---------------------------------------------------------------------------
+# rmdir
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_rmdir_calls_delete_directory(fs, inode_manager, uc_client, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    subdir = inode_manager.add_entry(vol.inode, "subdir", attr=_make_attr(True))
+    metadata_manager.invalidate = MagicMock()
+
+    await fs.rmdir(vol.inode, b"subdir", ctx)
+
+    uc_client.delete_directory.assert_awaited_once()
+    call_args = uc_client.delete_directory.call_args
+    assert call_args.args[0] == "/Volumes/cat/sch/vol/subdir"
+    metadata_manager.invalidate.assert_called_once_with("/cat/sch/vol/subdir", is_dir=True)
+    assert inode_manager.get_inode_by_path("/cat/sch/vol/subdir") is None
+
+
+@pytest.mark.trio
+async def test_rmdir_nonempty_returns_enotempty(fs, inode_manager, uc_client, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    inode_manager.add_entry(vol.inode, "subdir", attr=_make_attr(True))
+    uc_client.delete_directory = AsyncMock(side_effect=UcBadRequest("400 non-empty"))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.rmdir(vol.inode, b"subdir", ctx)
+    assert exc_info.value.errno == errno.ENOTEMPTY
+
+
+# ---------------------------------------------------------------------------
+# POSIX behaviour documentation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_posix_write_hidden_until_release(fs, inode_manager, data_manager, uc_client, ctx):
+    """
+    A reader that opened the file before the writer's release() sees the pre-upload
+    content. The write is not visible until release() completes the upload.
+
+    This is the guaranteed behaviour: readers always see a complete file — either the
+    pre-write or the post-write version, never a partial upload.
+    """
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"old  ")
+
+    # Reader opens the file (O_RDONLY)
+    read_info = await fs.open(f.inode, 0, ctx)
+    rfh = int(read_info.fh)
+
+    # Writer opens O_WRONLY and writes new content
+    O_WRONLY = 1
+    write_info = await fs.open(f.inode, O_WRONLY, ctx)
+    wfh = int(write_info.fh)
+    await fs.write(wfh, offset=0, buffer=b"new!!")
+
+    # Reader still sees old content via DataManager (writer hasn't released yet)
+    read_data = await fs.read(rfh, offset=0, length=5)
+    assert read_data == b"old  "
+    uc_client.upload_file.assert_not_awaited()
+
+    # Writer releases — upload happens now
+    await fs.release(pyfuse3.FileHandleT(wfh))
+    uc_client.upload_file.assert_awaited_once()
+
+    await fs.release(pyfuse3.FileHandleT(rfh))
+
+
+@pytest.mark.trio
+async def test_posix_concurrent_writers_last_wins(fs, inode_manager, uc_client, ctx):
+    """
+    Two independent writable handles both call release(). The second upload overwrites
+    the first silently. No error is returned to either writer. This matches object-store
+    (S3/ADLS/GCS) semantics and is documented as an accepted deviation from POSIX.
+    """
+    _vol, f = _make_vol_file(inode_manager)
+    O_WRONLY = 1
+    info_a = await fs.open(f.inode, O_WRONLY, ctx)
+    info_b = await fs.open(f.inode, O_WRONLY, ctx)
+    fha, fhb = int(info_a.fh), int(info_b.fh)
+
+    await fs.write(fha, offset=0, buffer=b"writer-A")
+    await fs.write(fhb, offset=0, buffer=b"writer-B")
+
+    # Both release without error
+    await fs.release(pyfuse3.FileHandleT(fha))
+    await fs.release(pyfuse3.FileHandleT(fhb))
+
+    assert uc_client.upload_file.await_count == 2
