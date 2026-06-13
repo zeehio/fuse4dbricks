@@ -203,6 +203,7 @@ class UnityCatalogClient:
     async def _request(
         self, method, url, *, ctx: pyfuse3.RequestContext, params=None, headers=None,
         stream=False, uc_path=None, max_retries: int = _DEFAULT_MAX_RETRIES,
+        raise_on_not_found: bool = False,
     ):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
@@ -210,6 +211,12 @@ class UnityCatalogClient:
         Transient failures (429 rate limits, 5xx server errors and connection
         errors) are retried up to ``max_retries`` times with exponential backoff,
         honoring a ``Retry-After`` header on 429 responses when present.
+
+        By default a 404 response is returned as ``None`` so that read-path
+        callers can treat "not found" as an expected outcome. Pass
+        ``raise_on_not_found=True`` for write operations where 404 is an error
+        (distinguishes it from a 200 with an empty body, which also returns
+        ``None`` by default).
         """
         if headers is None:
             headers = {}
@@ -274,6 +281,12 @@ class UnityCatalogClient:
 
             if not stream:
                 if response.status_code == 404:
+                    if raise_on_not_found:
+                        raise UcNotFound(
+                            f"Not found: {uc_path or url}",
+                            status_code=404,
+                            uc_path=uc_path,
+                        )
                     return None
                 self._raise_for_status(response, uc_path=uc_path)
 
@@ -640,23 +653,17 @@ class UnityCatalogClient:
 
     async def delete_file(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
         encoded_path = self._quote_path(uc_path)
-        result = await self._request(
-            "DELETE", f"/api/2.0/fs/files{encoded_path}", ctx=ctx, uc_path=uc_path
+        await self._request(
+            "DELETE", f"/api/2.0/fs/files{encoded_path}",
+            ctx=ctx, uc_path=uc_path, raise_on_not_found=True,
         )
-        if result is None:
-            raise UcNotFound(
-                f"File not found: {uc_path}", status_code=404, uc_path=uc_path
-            )
 
     async def delete_directory(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
         encoded_path = self._quote_path(uc_path)
-        result = await self._request(
-            "DELETE", f"/api/2.0/fs/directories{encoded_path}", ctx=ctx, uc_path=uc_path
+        await self._request(
+            "DELETE", f"/api/2.0/fs/directories{encoded_path}",
+            ctx=ctx, uc_path=uc_path, raise_on_not_found=True,
         )
-        if result is None:
-            raise UcNotFound(
-                f"Directory not found: {uc_path}", status_code=404, uc_path=uc_path
-            )
 
     async def create_directory(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
         encoded_path = self._quote_path(uc_path)
