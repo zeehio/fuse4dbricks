@@ -29,6 +29,22 @@ from fuse4dbricks.auth.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
 
+try:
+    from databricks.sdk.errors.platform import (
+        TooManyRequests as _SdkTooManyRequests,
+        TemporarilyUnavailable as _SdkTemporarilyUnavailable,
+        InternalError as _SdkInternalError,
+        DeadlineExceeded as _SdkDeadlineExceeded,
+    )
+    _SDK_TRANSIENT_ERRORS: tuple = (
+        _SdkTooManyRequests,
+        _SdkTemporarilyUnavailable,
+        _SdkInternalError,
+        _SdkDeadlineExceeded,
+    )
+except ImportError:
+    _SDK_TRANSIENT_ERRORS = ()
+
 # Transient failures are retried with exponential backoff and jitter:
 # 429 (rate limited), 5xx (server unavailable) and connection-level errors.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -100,6 +116,44 @@ class UnityCatalogClient:
 
     async def close(self):
         await self.client.aclose()
+
+    async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
+        """
+        Retry an async callable with exponential backoff and jitter.
+
+        Handles transient errors from both the httpx path (UcRateLimited,
+        UcUnavailable) and the databricks-sdk path (TooManyRequests,
+        TemporarilyUnavailable, InternalError, DeadlineExceeded).
+        """
+        attempt = 0
+        while True:
+            try:
+                return await operation()
+            except (UcRateLimited, UcUnavailable) as exc:
+                if attempt >= max_retries:
+                    raise
+                retry_after_s = getattr(exc, "retry_after_s", None)
+                delay = _backoff_delay(attempt, retry_after_s)
+                logger.warning(
+                    "Transient error %s (attempt %d/%d), retrying in %.1fs",
+                    exc, attempt + 1, max_retries, delay,
+                )
+                await trio.sleep(delay)
+                attempt += 1
+            except Exception as exc:
+                if _SDK_TRANSIENT_ERRORS and isinstance(exc, _SDK_TRANSIENT_ERRORS):
+                    if attempt >= max_retries:
+                        raise
+                    retry_after_s = getattr(exc, "retry_after_secs", None)
+                    delay = _backoff_delay(attempt, retry_after_s)
+                    logger.warning(
+                        "SDK transient error %s (attempt %d/%d), retrying in %.1fs",
+                        exc, attempt + 1, max_retries, delay,
+                    )
+                    await trio.sleep(delay)
+                    attempt += 1
+                else:
+                    raise
 
     async def _get_headers(self, ctx: pyfuse3.RequestContext) -> dict[str, str]:
         token = await self.auth_provider.get_access_token(ctx=ctx)
@@ -225,7 +279,12 @@ class UnityCatalogClient:
 
                 if method == "HEAD":
                     return response
-                return response.json()
+                if response.content:
+                    try:
+                        return response.json()
+                    except Exception:
+                        return None
+                return None
 
             # For streams, we return the response object to be used in a context manager
             if response.status_code >= 400:
@@ -548,6 +607,7 @@ class UnityCatalogClient:
         if len(parts) == 4:
             return await self._get_volumes(catalog, schema, ctx=ctx)
         return await self._list_directory_contents(uc_path, ctx=ctx)
+
     async def download_chunk_stream(
         self,
         path: str,
