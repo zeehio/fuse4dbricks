@@ -539,6 +539,92 @@ class UnityCatalogFS(pyfuse3.Operations):
             logger.error("write error on %s: %s", entry.fs_path, e)
             raise pyfuse3.FUSEError(errno.EIO)
 
+    async def mkdir(self, parent_inode, name, mode, ctx):
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if self._dispatch(parent_entry.fs_path) != "unity_catalog":
+            raise pyfuse3.FUSEError(errno.EACCES)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.create_directory(uc_path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="mkdir")
+
+        now = time.time()
+        attr = InodeEntryAttr(
+            st_mode=(stat.S_IFDIR | 0o755),
+            st_nlink=2,
+            st_size=4096,
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_uid=ctx.uid,
+            st_gid=ctx.gid,
+        )
+        entry = self.inodes.add_entry(parent_inode, name_str, attr)
+        # Invalidate child path: deletes child's stale attr entry and the parent's
+        # dir listing cache so the new directory is visible on the next readdir.
+        self.metadata_manager.invalidate(entry.fs_path, is_dir=True)
+        return self._entry_to_fuse_attr(entry)
+
+    async def unlink(self, parent_inode, name, ctx):
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.delete_file(uc_path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="unlink")
+
+        child_inode = self.inodes.get_inode_by_path(child_fs_path)
+        if child_inode is not None:
+            self.inodes._prune_subtree(child_inode)
+        self.metadata_manager.invalidate(child_fs_path, is_dir=False)
+
+    async def rmdir(self, parent_inode, name, ctx):
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.delete_directory(uc_path, ctx=ctx)
+        except UcBadRequest as e:
+            # The Files API returns 400 when the directory is non-empty.
+            raise pyfuse3.FUSEError(errno.ENOTEMPTY) from e
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="rmdir")
+
+        child_inode = self.inodes.get_inode_by_path(child_fs_path)
+        if child_inode is not None:
+            self.inodes._prune_subtree(child_inode)
+        self.metadata_manager.invalidate(child_fs_path, is_dir=True)
+
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:
             self.inodes.forget(inode, nlookup)
