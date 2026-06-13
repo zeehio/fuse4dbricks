@@ -225,18 +225,22 @@ class MetadataManager:
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
         #R_OK = 4
         W_OK = 2
-        if (mode & W_OK):
-            logger.error("Write access not supported")
-            raise pyfuse3.FUSEError(errno.EACCES)
         (securable, securable_type) = fs_to_securable(entry.fs_path)
         if securable == "":
             return True
         if securable_type == "catalog":
+            if (mode & W_OK):
+                raise pyfuse3.FUSEError(errno.EACCES)
             req_privileges = ["USE_CATALOG"]
         elif securable_type == "schema":
+            if (mode & W_OK):
+                raise pyfuse3.FUSEError(errno.EACCES)
             req_privileges = ["USE_SCHEMA"]
         elif securable_type == "volume":
-            req_privileges = ["READ_VOLUME"]
+            if (mode & W_OK):
+                req_privileges = ["READ_VOLUME", "WRITE_VOLUME"]
+            else:
+                req_privileges = ["READ_VOLUME"]
         else:
             logger.error(f"Unexpected securable type for path {entry.fs_path}")
             raise pyfuse3.FUSEError(errno.EACCES)
