@@ -93,6 +93,7 @@ def metadata_manager():
 def data_manager():
     mgr = MagicMock()
     mgr.read = AsyncMock(return_value=b"hello")
+    mgr.chunk_size = 8 * 1024 * 1024  # 8 MB, same as the real DataManager
     return mgr
 
 
@@ -764,15 +765,34 @@ async def test_create_then_write_then_release(fs, inode_manager, uc_client, ctx)
 
 @pytest.mark.trio
 async def test_rdwr_downloads_existing_file_on_open(fs, inode_manager, data_manager, ctx):
-    """open(O_RDWR) without O_TRUNC must download the existing file into the buffer."""
+    """open(O_RDWR) without O_TRUNC streams the existing file into the buffer one chunk
+    at a time so memory usage is O(chunk_size), not O(file_size)."""
     _vol, f = _make_vol_file(inode_manager, size=5)
     data_manager.read = AsyncMock(return_value=b"hello")
     O_RDWR = 2
     file_info = await fs.open(f.inode, O_RDWR, ctx)
     fh = int(file_info.fh)
+    # File fits in one chunk → read called exactly once
     data_manager.read.assert_awaited_once()
     assert fs._open_state[fh]["write_buffer"] is not None
     assert fs._open_state[fh]["write_buffer"].size() == 5
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_rdwr_multi_chunk_streams_in_pieces(fs, inode_manager, data_manager, ctx):
+    """open(O_RDWR) on a file larger than one chunk calls data_manager.read once per chunk."""
+    chunk_size = data_manager.chunk_size  # 8 MB
+    file_size = chunk_size * 3  # three full chunks
+    chunk_data = b"x" * chunk_size
+    _vol, f = _make_vol_file(inode_manager, size=file_size)
+    data_manager.read = AsyncMock(return_value=chunk_data)
+    O_RDWR = 2
+    file_info = await fs.open(f.inode, O_RDWR, ctx)
+    fh = int(file_info.fh)
+    # Three chunks → three separate read() calls, each getting chunk_size bytes
+    assert data_manager.read.await_count == 3
+    assert fs._open_state[fh]["write_buffer"].size() == file_size
     await fs.release(pyfuse3.FileHandleT(fh))
 
 
