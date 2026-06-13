@@ -339,20 +339,28 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         if writable and self._dispatch(entry.fs_path) == "unity_catalog":
             if (flags & _O_RDWR) and not (flags & _O_TRUNC):
-                # O_RDWR without O_TRUNC: download existing content so
-                # subsequent reads serve the local copy (which reflects any
-                # in-progress writes) rather than DataManager.
+                # O_RDWR without O_TRUNC: stream existing content into the
+                # write buffer one chunk at a time so memory usage stays at
+                # O(chunk_size) regardless of file size.
                 logger.info(
-                    "O_RDWR open on %s (size=%d): downloading into write buffer",
+                    "O_RDWR open on %s (size=%d): streaming into write buffer",
                     entry.fs_path, entry.attr.st_size,
                 )
                 write_buffer = WriteBuffer(self._writes_dir)
                 try:
-                    data = await self.data_manager.read(
-                        entry.fs_path, 0, entry.attr.st_size,
-                        entry.attr.st_mtime, entry.attr.st_size, ctx=ctx,
-                    )
-                    write_buffer.write(0, data)
+                    file_size = entry.attr.st_size
+                    pos = 0
+                    chunk_size = self.data_manager.chunk_size
+                    while pos < file_size:
+                        length = min(chunk_size, file_size - pos)
+                        chunk = await self.data_manager.read(
+                            entry.fs_path, pos, length,
+                            entry.attr.st_mtime, file_size, ctx=ctx,
+                        )
+                        if len(chunk) == 0:
+                            break
+                        write_buffer.write(pos, chunk)
+                        pos += len(chunk)
                 except Exception as e:
                     write_buffer.close()
                     self._raise_fuse_error(e, fs_path=entry.fs_path, op="open/rdwr")
