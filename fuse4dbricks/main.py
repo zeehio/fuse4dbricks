@@ -100,6 +100,10 @@ def parse_args():
         help="Maximum number of metadata cache entries",
     )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--read-only", action="store_true",
+        help="Disallow all writes to Unity Catalog volumes (token writes to .auth still work)",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +164,14 @@ async def async_main():
     os.chmod(auth_cache_dir, mode=0o700)
     os.makedirs(data_cache_dir, exist_ok=True, mode=0o700)
     os.chmod(data_cache_dir, mode=0o700)
+    writes_dir = os.path.join(root_cache_dir, "writes")
+    os.makedirs(writes_dir, exist_ok=True, mode=0o700)
+    os.chmod(writes_dir, mode=0o700)
+    for _fname in os.listdir(writes_dir):
+        try:
+            os.unlink(os.path.join(writes_dir, _fname))
+        except OSError:
+            pass
 
     if args.workspace != "":
         workspace = args.workspace
@@ -183,7 +195,10 @@ async def async_main():
     # different principal); drop the cached principal so authz re-derives it.
     auth_provider.set_token_invalidation_callback(metadata_manager.forget_principal)
     auth_manager = AuthManager(uc_client, auth_provider, metadata_manager, workspace=workspace)
-    operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
+    operations = UnityCatalogFS(
+        inode_manager, metadata_manager, data_manager, auth_manager,
+        uc_client=uc_client, writes_dir=writes_dir, read_only=args.read_only,
+    )
     stopped_evt = trio.Event()
     try:
         async with trio.open_nursery() as nursery:

@@ -4,14 +4,12 @@ Core FUSE operations module.
 
 import errno
 import logging
+import stat
+import time
 from itertools import islice
 
 import pyfuse3
 
-from fuse4dbricks.fs.auth_manager import AuthManager
-from fuse4dbricks.fs.data_manager import DataManager
-from fuse4dbricks.fs.inode_manager import InodeEntry, InodeManager
-from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.api.errors import (
     UcBadRequest,
     UcConflict,
@@ -21,8 +19,23 @@ from fuse4dbricks.api.errors import (
     UcRateLimited,
     UcUnavailable,
 )
+from fuse4dbricks.api.uc_client import UnityCatalogClient
+from fuse4dbricks.fs.auth_manager import AuthManager
+from fuse4dbricks.fs.data_manager import DataManager
+from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr, InodeManager
+from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.fs.utils import fs_to_uc_path
+from fuse4dbricks.fs.write_buffer import WriteBuffer
 
 logger = logging.getLogger(__name__)
+
+# Open-flag constants (POSIX values)
+_O_WRONLY = 1
+_O_RDWR = 2
+_O_TRUNC = 0o1000  # 512
+
+_R_OK = 4
+_W_OK = 2
 
 
 class UnityCatalogFS(pyfuse3.Operations):
@@ -32,12 +45,18 @@ class UnityCatalogFS(pyfuse3.Operations):
         metadata_manager: MetadataManager,
         data_manager: DataManager,
         auth_manager: AuthManager,
+        uc_client: UnityCatalogClient,
+        writes_dir: str,
+        read_only: bool = False,
     ):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
         self.metadata_manager = metadata_manager
         self.data_manager = data_manager
         self.auth_manager = auth_manager
+        self.uc_client = uc_client
+        self._writes_dir = writes_dir
+        self._read_only = read_only
         self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
         self._open_fh_count = 0
@@ -303,17 +322,12 @@ class UnityCatalogFS(pyfuse3.Operations):
                 return
 
     async def open(self, inode, flags, ctx):
-        R_OK = 4
-        W_OK = 2
-        O_RDWR = 2
-        O_WRONLY = 1
-        #O_RDONLY = 0
-        if flags & O_RDWR:
-            required_mode = R_OK | W_OK
-        elif flags & O_WRONLY:
-            required_mode = W_OK
+        if flags & _O_RDWR:
+            required_mode = _R_OK | _W_OK
+        elif flags & _O_WRONLY:
+            required_mode = _W_OK
         else:
-            required_mode = R_OK
+            required_mode = _R_OK
         if not await self._check_permissions(inode, required_mode, ctx):
             raise pyfuse3.FUSEError(errno.EACCES)
         entry = self.inodes.get_entry(inode)
@@ -321,51 +335,158 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
+        if self._read_only and (flags & (_O_WRONLY | _O_RDWR)) and self._dispatch(entry.fs_path) == "unity_catalog":
+            raise pyfuse3.FUSEError(errno.EROFS)
+
+        writable = bool(flags & (_O_WRONLY | _O_RDWR))
+        write_buffer: WriteBuffer | None = None
+
+        if writable and self._dispatch(entry.fs_path) == "unity_catalog":
+            if (flags & _O_RDWR) and not (flags & _O_TRUNC):
+                # O_RDWR without O_TRUNC: stream existing content into the
+                # write buffer one chunk at a time so memory usage stays at
+                # O(chunk_size) regardless of file size.
+                logger.info(
+                    "O_RDWR open on %s (size=%d): streaming into write buffer",
+                    entry.fs_path, entry.attr.st_size,
+                )
+                write_buffer = WriteBuffer(self._writes_dir)
+                try:
+                    file_size = entry.attr.st_size
+                    pos = 0
+                    chunk_size = self.data_manager.chunk_size
+                    while pos < file_size:
+                        length = min(chunk_size, file_size - pos)
+                        chunk = await self.data_manager.read(
+                            entry.fs_path, pos, length,
+                            entry.attr.st_mtime, file_size, ctx=ctx,
+                        )
+                        if len(chunk) == 0:
+                            break
+                        write_buffer.write(pos, chunk)
+                        pos += len(chunk)
+                except Exception as e:
+                    write_buffer.close()
+                    self._raise_fuse_error(e, fs_path=entry.fs_path, op="open/rdwr")
+            else:
+                write_buffer = WriteBuffer(self._writes_dir)
+
         fh = self._open_fh_count
         self._open_fh_count += 1
         self._open_state[fh] = {
             "inode": inode,
             "ctx": ctx,
+            "write_buffer": write_buffer,
+            "writable": writable,
+            "dirty": False,
         }
         return pyfuse3.FileInfo(fh=fh)
+
+    async def create(self, parent_inode, name, mode, flags, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if self._dispatch(parent_entry.fs_path) != "unity_catalog":
+            raise pyfuse3.FUSEError(errno.EACCES)
+
+        name_str = name.decode("utf-8")
+        now = time.time()
+        attr = InodeEntryAttr(
+            st_mode=(stat.S_IFREG | 0o644),
+            st_nlink=1,
+            st_size=0,
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_uid=ctx.uid,
+            st_gid=ctx.gid,
+        )
+        entry = self.inodes.add_entry(parent_inode, name_str, attr)
+
+        fh = self._open_fh_count
+        self._open_fh_count += 1
+        self._open_state[fh] = {
+            "inode": entry.inode,
+            "ctx": ctx,
+            "write_buffer": WriteBuffer(self._writes_dir),
+            "writable": True,
+            # Mark dirty immediately: create() semantics guarantee the file
+            # exists after release(), even if nothing is written into it.
+            "dirty": True,
+        }
+        return (pyfuse3.FileInfo(fh=fh), self._entry_to_fuse_attr(entry))
 
     async def release(self, fh: pyfuse3.FileHandleT) -> None:
         if fh not in self._open_state:
             # This should not happen, but we want to be resilient to it. Just ignore.
             return
 
-        inode = self._open_state[fh]["inode"]
-        ctx = self._open_state[fh]["ctx"]
+        state = self._open_state[fh]
+        inode = state["inode"]
+        ctx = state["ctx"]
+        write_buffer: WriteBuffer | None = state.get("write_buffer")
+        dirty: bool = state.get("dirty", False)
 
         entry = self.inodes.get_entry(inode)
         if entry is None:
+            if write_buffer is not None:
+                write_buffer.close()
+            del self._open_state[fh]
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
-            if self._dispatch(entry.fs_path) == "auth":
-                await self.auth_manager.release(
-                    entry.fs_path,
-                    ctx=ctx,
-                )
-        except Exception as e:
-            logger.error(f"release/close error on {entry.fs_path}: {e}")
-            raise pyfuse3.FUSEError(errno.EIO)
-
-        if fh in self._open_state:
-            del self._open_state[fh]
+            if write_buffer is not None and dirty:
+                uc_path = fs_to_uc_path(entry.fs_path)
+                try:
+                    await self.uc_client.upload_file(
+                        uc_path, write_buffer.path, ctx=ctx
+                    )
+                except Exception as e:
+                    logger.error("Upload failed for %s: %s", entry.fs_path, e)
+                    # Remote file is unchanged: do NOT invalidate the cache.
+                    raise pyfuse3.FUSEError(errno.EIO) from e
+                else:
+                    # Bust caches so subsequent reads see the new file.
+                    self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
+            elif write_buffer is not None:
+                # Opened writable but never written — discard buffer silently.
+                pass
+            elif self._dispatch(entry.fs_path) == "auth":
+                try:
+                    await self.auth_manager.release(entry.fs_path, ctx=ctx)
+                except Exception as e:
+                    logger.error(f"release/close error on {entry.fs_path}: {e}")
+                    raise pyfuse3.FUSEError(errno.EIO)
+        finally:
+            if write_buffer is not None:
+                write_buffer.close()
+            if fh in self._open_state:
+                del self._open_state[fh]
 
     async def read(self, fh, offset, length):
         if fh not in self._open_state:
             raise pyfuse3.FUSEError(errno.EIO)
 
-        inode = self._open_state[fh]["inode"]
-        ctx = self._open_state[fh]["ctx"]
+        state = self._open_state[fh]
+        inode = state["inode"]
+        ctx = state["ctx"]
 
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
+
+        # O_RDWR handles: serve reads from the local write buffer, which holds
+        # the full file content downloaded at open() plus any in-progress writes.
+        write_buffer: WriteBuffer | None = state.get("write_buffer")
+        if state.get("writable") and write_buffer is not None:
+            return write_buffer.read(offset, length)
+
         try:
             if self._dispatch(entry.fs_path) == "auth":
                 return await self.auth_manager.read(
@@ -396,15 +517,18 @@ class UnityCatalogFS(pyfuse3.Operations):
         if fh not in self._open_state:
             raise pyfuse3.FUSEError(errno.EIO)
 
-        inode = self._open_state[fh]["inode"]
-        ctx = self._open_state[fh]["ctx"]
+        state = self._open_state[fh]
+        inode = state["inode"]
+        ctx = state["ctx"]
 
         entry = self.inodes.get_entry(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
+
         try:
+            # Auth files are handled by auth_manager (no write_buffer involved).
             if self._dispatch(entry.fs_path) == "auth":
                 return await self.auth_manager.write(
                     entry.fs_path,
@@ -412,16 +536,114 @@ class UnityCatalogFS(pyfuse3.Operations):
                     buffer,
                     ctx=ctx,
                 )
-            # The Unity Catalog filesystem is read-only.
-            raise pyfuse3.FUSEError(errno.EACCES)
+
+            write_buffer: WriteBuffer | None = state.get("write_buffer")
+            if write_buffer is None:
+                # File was opened read-only.
+                raise pyfuse3.FUSEError(errno.EACCES)
+
+            n = write_buffer.write(offset, buffer)
+            state["dirty"] = True
+            # Keep st_size current so getattr() reflects the in-progress size.
+            entry.attr.st_size = write_buffer.size()
+            return n
         except pyfuse3.FUSEError:
-            # Preserve the intended errno (EACCES for read-only paths) instead
-            # of collapsing every failure to EIO.
             raise
         except Exception as e:
             logger.error("write error on %s: %s", entry.fs_path, e)
             raise pyfuse3.FUSEError(errno.EIO)
 
+    async def mkdir(self, parent_inode, name, mode, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if self._dispatch(parent_entry.fs_path) != "unity_catalog":
+            raise pyfuse3.FUSEError(errno.EACCES)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.create_directory(uc_path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="mkdir")
+
+        now = time.time()
+        attr = InodeEntryAttr(
+            st_mode=(stat.S_IFDIR | 0o755),
+            st_nlink=2,
+            st_size=4096,
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_uid=ctx.uid,
+            st_gid=ctx.gid,
+        )
+        entry = self.inodes.add_entry(parent_inode, name_str, attr)
+        # Invalidate child path: deletes child's stale attr entry and the parent's
+        # dir listing cache so the new directory is visible on the next readdir.
+        self.metadata_manager.invalidate(entry.fs_path, is_dir=True)
+        return self._entry_to_fuse_attr(entry)
+
+    async def unlink(self, parent_inode, name, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.delete_file(uc_path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="unlink")
+
+        child_inode = self.inodes.get_inode_by_path(child_fs_path)
+        if child_inode is not None:
+            self.inodes._prune_subtree(child_inode)
+        self.metadata_manager.invalidate(child_fs_path, is_dir=False)
+
+    async def rmdir(self, parent_inode, name, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
+        await self._check_permissions(parent_inode, _W_OK, ctx)
+
+        parent_entry = self.inodes.get_entry(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        name_str = name.decode("utf-8")
+        child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        uc_path = fs_to_uc_path(child_fs_path)
+
+        try:
+            await self.uc_client.delete_directory(uc_path, ctx=ctx)
+        except UcBadRequest as e:
+            # The Files API returns 400 when the directory is non-empty.
+            raise pyfuse3.FUSEError(errno.ENOTEMPTY) from e
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as e:
+            self._raise_fuse_error(e, fs_path=child_fs_path, op="rmdir")
+
+        child_inode = self.inodes.get_inode_by_path(child_fs_path)
+        if child_inode is not None:
+            self.inodes._prune_subtree(child_inode)
+        self.metadata_manager.invalidate(child_fs_path, is_dir=True)
 
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:

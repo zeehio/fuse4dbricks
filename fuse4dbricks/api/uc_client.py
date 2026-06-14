@@ -29,6 +29,22 @@ from fuse4dbricks.auth.provider import AuthProvider
 
 logger = logging.getLogger(__name__)
 
+try:
+    from databricks.sdk.errors.platform import (
+        TooManyRequests as _SdkTooManyRequests,
+        TemporarilyUnavailable as _SdkTemporarilyUnavailable,
+        InternalError as _SdkInternalError,
+        DeadlineExceeded as _SdkDeadlineExceeded,
+    )
+    _SDK_TRANSIENT_ERRORS: tuple = (
+        _SdkTooManyRequests,
+        _SdkTemporarilyUnavailable,
+        _SdkInternalError,
+        _SdkDeadlineExceeded,
+    )
+except ImportError:
+    _SDK_TRANSIENT_ERRORS = ()
+
 # Transient failures are retried with exponential backoff and jitter:
 # 429 (rate limited), 5xx (server unavailable) and connection-level errors.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -101,6 +117,44 @@ class UnityCatalogClient:
     async def close(self):
         await self.client.aclose()
 
+    async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
+        """
+        Retry an async callable with exponential backoff and jitter.
+
+        Handles transient errors from both the httpx path (UcRateLimited,
+        UcUnavailable) and the databricks-sdk path (TooManyRequests,
+        TemporarilyUnavailable, InternalError, DeadlineExceeded).
+        """
+        attempt = 0
+        while True:
+            try:
+                return await operation()
+            except (UcRateLimited, UcUnavailable) as exc:
+                if attempt >= max_retries:
+                    raise
+                retry_after_s = getattr(exc, "retry_after_s", None)
+                delay = _backoff_delay(attempt, retry_after_s)
+                logger.warning(
+                    "Transient error %s (attempt %d/%d), retrying in %.1fs",
+                    exc, attempt + 1, max_retries, delay,
+                )
+                await trio.sleep(delay)
+                attempt += 1
+            except Exception as exc:
+                if _SDK_TRANSIENT_ERRORS and isinstance(exc, _SDK_TRANSIENT_ERRORS):
+                    if attempt >= max_retries:
+                        raise
+                    retry_after_s = getattr(exc, "retry_after_secs", None)
+                    delay = _backoff_delay(attempt, retry_after_s)
+                    logger.warning(
+                        "SDK transient error %s (attempt %d/%d), retrying in %.1fs",
+                        exc, attempt + 1, max_retries, delay,
+                    )
+                    await trio.sleep(delay)
+                    attempt += 1
+                else:
+                    raise
+
     async def _get_headers(self, ctx: pyfuse3.RequestContext) -> dict[str, str]:
         token = await self.auth_provider.get_access_token(ctx=ctx)
         return {
@@ -149,6 +203,7 @@ class UnityCatalogClient:
     async def _request(
         self, method, url, *, ctx: pyfuse3.RequestContext, params=None, headers=None,
         stream=False, uc_path=None, max_retries: int = _DEFAULT_MAX_RETRIES,
+        raise_on_not_found: bool = False,
     ):
         """
         Internal wrapper to handle Authentication and Token Refreshing automatically.
@@ -156,6 +211,12 @@ class UnityCatalogClient:
         Transient failures (429 rate limits, 5xx server errors and connection
         errors) are retried up to ``max_retries`` times with exponential backoff,
         honoring a ``Retry-After`` header on 429 responses when present.
+
+        By default a 404 response is returned as ``None`` so that read-path
+        callers can treat "not found" as an expected outcome. Pass
+        ``raise_on_not_found=True`` for write operations where 404 is an error
+        (distinguishes it from a 200 with an empty body, which also returns
+        ``None`` by default).
         """
         if headers is None:
             headers = {}
@@ -220,12 +281,23 @@ class UnityCatalogClient:
 
             if not stream:
                 if response.status_code == 404:
+                    if raise_on_not_found:
+                        raise UcNotFound(
+                            f"Not found: {uc_path or url}",
+                            status_code=404,
+                            uc_path=uc_path,
+                        )
                     return None
                 self._raise_for_status(response, uc_path=uc_path)
 
                 if method == "HEAD":
                     return response
-                return response.json()
+                if response.content:
+                    try:
+                        return response.json()
+                    except Exception:
+                        return None
+                return None
 
             # For streams, we return the response object to be used in a context manager
             if response.status_code >= 400:
@@ -548,6 +620,57 @@ class UnityCatalogClient:
         if len(parts) == 4:
             return await self._get_volumes(catalog, schema, ctx=ctx)
         return await self._list_directory_contents(uc_path, ctx=ctx)
+
+    # --- Write Layer (Files API 2.0 + SDK for multipart) ---
+
+    async def upload_file(
+        self,
+        uc_path: str,
+        local_path: str,
+        *,
+        overwrite: bool = True,
+        ctx: pyfuse3.RequestContext,
+    ) -> None:
+        """Upload a local file to Unity Catalog via the Databricks SDK.
+
+        Uses databricks-sdk so multipart upload is engaged automatically for
+        files above the SDK's internal threshold (>5 GB). WorkspaceClient is
+        cheap to construct: it makes no API calls at instantiation time.
+        """
+        token = await self.auth_provider.get_access_token(ctx=ctx)
+        base_url = self.base_url
+
+        async def _attempt():
+            def _do_upload():
+                from databricks.sdk import WorkspaceClient
+                from databricks.sdk.config import Config
+                w = WorkspaceClient(config=Config(host=base_url, token=token))
+                with open(local_path, "rb") as f:
+                    w.files.upload(file_path=uc_path, contents=f, overwrite=overwrite)
+            await trio.to_thread.run_sync(_do_upload)
+
+        await self._with_retry(_attempt, uc_path=uc_path)
+
+    async def delete_file(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
+        encoded_path = self._quote_path(uc_path)
+        await self._request(
+            "DELETE", f"/api/2.0/fs/files{encoded_path}",
+            ctx=ctx, uc_path=uc_path, raise_on_not_found=True,
+        )
+
+    async def delete_directory(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
+        encoded_path = self._quote_path(uc_path)
+        await self._request(
+            "DELETE", f"/api/2.0/fs/directories{encoded_path}",
+            ctx=ctx, uc_path=uc_path, raise_on_not_found=True,
+        )
+
+    async def create_directory(self, uc_path: str, *, ctx: pyfuse3.RequestContext) -> None:
+        encoded_path = self._quote_path(uc_path)
+        await self._request(
+            "PUT", f"/api/2.0/fs/directories{encoded_path}", ctx=ctx, uc_path=uc_path
+        )
+
     async def download_chunk_stream(
         self,
         path: str,
