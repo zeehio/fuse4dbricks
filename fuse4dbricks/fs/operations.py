@@ -410,6 +410,11 @@ class UnityCatalogFS(pyfuse3.Operations):
             st_gid=ctx.gid,
         )
         entry = self.inodes.add_entry(parent_inode, name_str, attr)
+        # create() returns an EntryAttributes to the kernel just like lookup(),
+        # so the kernel holds a reference and will send a matching forget().
+        # Mirror that with a lookup-count increment, otherwise the new inode
+        # sits at ref_count 0 while still referenced and can be freed early.
+        self.inodes.increment_lookup_count(entry.inode)
 
         fh = self._open_fh_count
         self._open_fh_count += 1
