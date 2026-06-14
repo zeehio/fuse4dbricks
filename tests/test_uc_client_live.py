@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from fuse4dbricks.api.errors import UcBadRequest, UcNotFound
+from fuse4dbricks.api.errors import UcBadRequest, UcConflict, UcNotFound
 from fuse4dbricks.api.uc_client import UcNodeType, UnityCatalogClient
 
 HOST = os.environ.get("DATABRICKS_HOST")
@@ -202,10 +202,10 @@ async def test_live_delete_directory_file_path_raises_ucnotfound(tmp_path):
 
 @requires_databricks_write
 @pytest.mark.trio
-async def test_live_create_directory_path_is_file_raises_ucbadrequest(tmp_path):
-    """PUT /directories/{path} where path is an existing file → UcBadRequest (400).
+async def test_live_create_directory_path_is_file_raises_ucconflict(tmp_path):
+    """PUT /directories/{path} where path is an existing file → UcConflict (409).
 
-    Databricks returns 400 when asked to create a directory at a path that is
+    Databricks returns 409 when asked to create a directory at a path that is
     already occupied by a file. mkdir() currently raises EINVAL for this case;
     POSIX would prefer EEXIST. This test documents the real API behavior.
     """
@@ -218,7 +218,7 @@ async def test_live_create_directory_path_is_file_raises_ucbadrequest(tmp_path):
     try:
         await client.upload_file(uc_path, str(local), ctx=ctx)
 
-        with pytest.raises(UcBadRequest):
+        with pytest.raises(UcConflict):
             await client.create_directory(uc_path, ctx=ctx)
     finally:
         try:
@@ -231,11 +231,11 @@ async def test_live_create_directory_path_is_file_raises_ucbadrequest(tmp_path):
 @requires_databricks_write
 @pytest.mark.trio
 async def test_live_create_directory_parent_is_file_raises(tmp_path):
-    """PUT /directories/{path/subdir} where path is a file → UcBadRequest or UcNotFound.
+    """PUT /directories/{path/subdir} where path is a file → UcBadRequest, UcConflict or UcNotFound.
 
     When a parent path component is a regular file, Databricks rejects the
-    request. The exact status code (400 or 404) is what this test verifies —
-    it must be one of UcBadRequest or UcNotFound, and NOT a successful creation.
+    request. The exact status code (400, 409 or 404) is what this test verifies —
+    it must be one of those errors, and NOT a successful creation.
     Update the assertion if Databricks changes this behavior.
     """
     local = tmp_path / "file.txt"
@@ -248,7 +248,7 @@ async def test_live_create_directory_parent_is_file_raises(tmp_path):
     try:
         await client.upload_file(uc_parent, str(local), ctx=ctx)
 
-        with pytest.raises((UcBadRequest, UcNotFound)):
+        with pytest.raises((UcBadRequest, UcConflict, UcNotFound)):
             await client.create_directory(uc_child, ctx=ctx)
     finally:
         try:
