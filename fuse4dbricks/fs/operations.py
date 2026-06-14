@@ -47,6 +47,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         auth_manager: AuthManager,
         uc_client: UnityCatalogClient,
         writes_dir: str,
+        read_only: bool = False,
     ):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
@@ -55,6 +56,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         self.auth_manager = auth_manager
         self.uc_client = uc_client
         self._writes_dir = writes_dir
+        self._read_only = read_only
         self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
         self._open_fh_count = 0
@@ -333,6 +335,8 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         if entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR)
+        if self._read_only and (flags & (_O_WRONLY | _O_RDWR)) and self._dispatch(entry.fs_path) == "unity_catalog":
+            raise pyfuse3.FUSEError(errno.EROFS)
 
         writable = bool(flags & (_O_WRONLY | _O_RDWR))
         write_buffer: WriteBuffer | None = None
@@ -379,6 +383,8 @@ class UnityCatalogFS(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=fh)
 
     async def create(self, parent_inode, name, mode, flags, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
         await self._check_permissions(parent_inode, _W_OK, ctx)
 
         parent_entry = self.inodes.get_entry(parent_inode)
@@ -548,6 +554,8 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO)
 
     async def mkdir(self, parent_inode, name, mode, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
         await self._check_permissions(parent_inode, _W_OK, ctx)
 
         parent_entry = self.inodes.get_entry(parent_inode)
@@ -585,6 +593,8 @@ class UnityCatalogFS(pyfuse3.Operations):
         return self._entry_to_fuse_attr(entry)
 
     async def unlink(self, parent_inode, name, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
         await self._check_permissions(parent_inode, _W_OK, ctx)
 
         parent_entry = self.inodes.get_entry(parent_inode)
@@ -608,6 +618,8 @@ class UnityCatalogFS(pyfuse3.Operations):
         self.metadata_manager.invalidate(child_fs_path, is_dir=False)
 
     async def rmdir(self, parent_inode, name, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
         await self._check_permissions(parent_inode, _W_OK, ctx)
 
         parent_entry = self.inodes.get_entry(parent_inode)

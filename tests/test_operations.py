@@ -139,6 +139,19 @@ def fs(inode_manager, metadata_manager, data_manager, auth_manager, uc_client, w
     )
 
 
+@pytest.fixture
+def fs_ro(inode_manager, metadata_manager, data_manager, auth_manager, uc_client, writes_dir):
+    return UnityCatalogFS(
+        inode_manager=inode_manager,
+        metadata_manager=metadata_manager,
+        data_manager=data_manager,
+        auth_manager=auth_manager,
+        uc_client=uc_client,
+        writes_dir=writes_dir,
+        read_only=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _dispatch
 # ---------------------------------------------------------------------------
@@ -1023,3 +1036,87 @@ async def test_posix_concurrent_writers_last_wins(fs, inode_manager, uc_client, 
     await fs.release(pyfuse3.FileHandleT(fhb))
 
     assert uc_client.upload_file.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# --read-only mount flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_read_only_open_wronly_raises_erofs(fs_ro, inode_manager, ctx):
+    """open(O_WRONLY) on a UC file when read_only=True raises EROFS."""
+    _vol, f = _make_vol_file(inode_manager)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.open(f.inode, 1, ctx)  # O_WRONLY = 1
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_open_rdwr_raises_erofs(fs_ro, inode_manager, ctx):
+    """open(O_RDWR) on a UC file when read_only=True raises EROFS."""
+    _vol, f = _make_vol_file(inode_manager)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.open(f.inode, 2, ctx)  # O_RDWR = 2
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_open_rdonly_succeeds(fs_ro, inode_manager, ctx):
+    """open(O_RDONLY) on a UC file is still allowed when read_only=True."""
+    _vol, f = _make_vol_file(inode_manager)
+    file_info = await fs_ro.open(f.inode, 0, ctx)  # O_RDONLY = 0
+    await fs_ro.release(pyfuse3.FileHandleT(int(file_info.fh)))
+
+
+@pytest.mark.trio
+async def test_read_only_create_raises_erofs(fs_ro, inode_manager, ctx):
+    """create() raises EROFS when read_only=True."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.create(vol.inode, b"new.txt", 0o644, 0, ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_mkdir_raises_erofs(fs_ro, inode_manager, ctx):
+    """mkdir() raises EROFS when read_only=True."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.mkdir(vol.inode, b"newdir", 0o755, ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_unlink_raises_erofs(fs_ro, inode_manager, ctx):
+    """unlink() raises EROFS when read_only=True."""
+    vol, f = _make_vol_file(inode_manager)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.unlink(vol.inode, f.name.encode(), ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_rmdir_raises_erofs(fs_ro, inode_manager, ctx):
+    """rmdir() raises EROFS when read_only=True."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    subdir = inode_manager.add_entry(vol.inode, "subdir", attr=_make_attr(True))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.rmdir(vol.inode, subdir.name.encode(), ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_read_only_auth_write_still_allowed(fs_ro, inode_manager, auth_manager, ctx):
+    """Writing to .auth is still allowed even when read_only=True."""
+    auth_root = inode_manager.add_entry(pyfuse3.ROOT_INODE, ".auth", attr=_make_attr(True))
+    token_file = inode_manager.add_entry(auth_root.inode, "token", attr=_make_attr(False))
+    # open O_WRONLY on an auth file — must NOT raise EROFS
+    file_info = await fs_ro.open(token_file.inode, 1, ctx)  # O_WRONLY = 1
+    await fs_ro.release(pyfuse3.FileHandleT(int(file_info.fh)))

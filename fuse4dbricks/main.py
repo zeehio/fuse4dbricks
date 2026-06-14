@@ -100,6 +100,10 @@ def parse_args():
         help="Maximum number of metadata cache entries",
     )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--read-only", action="store_true",
+        help="Disallow all writes to Unity Catalog volumes (token writes to .auth still work)",
+    )
     return parser.parse_args()
 
 
@@ -193,7 +197,7 @@ async def async_main():
     auth_manager = AuthManager(uc_client, auth_provider, metadata_manager, workspace=workspace)
     operations = UnityCatalogFS(
         inode_manager, metadata_manager, data_manager, auth_manager,
-        uc_client=uc_client, writes_dir=writes_dir,
+        uc_client=uc_client, writes_dir=writes_dir, read_only=args.read_only,
     )
     stopped_evt = trio.Event()
     try:
