@@ -90,6 +90,22 @@ async def test_retrieve_missing_chunk(persistence):
     assert result is None
 
 
+@pytest.mark.trio
+async def test_get_chunk_path_is_pure_no_dir_created(persistence):
+    """_get_chunk_path must not touch the filesystem: it runs on every read,
+    so it must not create (empty) shard dirs for never-written chunks."""
+    path = persistence._get_chunk_path("never_written", 0, 0.0)
+    assert not os.path.exists(os.path.dirname(path))
+
+
+@pytest.mark.trio
+async def test_retrieve_missing_chunk_creates_no_dir(persistence):
+    """A read miss must not leave an empty shard dir behind."""
+    await persistence.retrieve_chunk("ghost_file", 7, 0.0)
+    path = persistence._get_chunk_path("ghost_file", 7, 0.0)
+    assert not os.path.exists(os.path.dirname(path))
+
+
 # --- 2. STREAMING & ATOMICITY ---
 
 
@@ -392,8 +408,10 @@ async def test_self_healing_on_retrieve(persistence):
     data = b"I am a ghost"
 
     # 1. Manually create the file on disk (Bypassing persistence logic)
-    # We use the internal helper to get the path, but don't update map/heap
+    # We use the internal helper to get the path, but don't update map/heap.
+    # _get_chunk_path is pure now, so create the shard dir ourselves.
     path = persistence._get_chunk_path(file_id, chunk_index, 0.0)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
 
