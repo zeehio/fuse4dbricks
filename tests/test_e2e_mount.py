@@ -18,12 +18,14 @@ process), so it must be present in the shell that runs pytest:
     pytest tests/test_e2e_mount.py -v
 """
 
+import errno
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -86,19 +88,34 @@ def _wait_until_mounted(mnt: Path, proc: subprocess.Popen, log: tempfile.Tempora
     raise TimeoutError(f"Mount did not become ready within {MOUNT_TIMEOUT_S}s at {mnt}")
 
 
-@pytest.fixture(scope="module")
-def mountpoint():
+def _resolve_mountpoint(suffix: str = "") -> Path:
     raw = os.environ.get("FUSE4DBRICKS_TEST_MOUNTPOINT")
     mnt = Path(raw) if raw else DEFAULT_MOUNTPOINT
     if not mnt.is_absolute():
         mnt = (REPO_ROOT / mnt).resolve()
+    if suffix:
+        mnt = mnt.parent / (mnt.name + suffix)
+    return mnt
 
+
+@contextmanager
+def _mounted(extra_args=(), suffix: str = ""):
+    """Mount fuse4dbricks at a (possibly suffixed) mountpoint, yield it, unmount."""
+    mnt = _resolve_mountpoint(suffix)
     mnt.mkdir(parents=True, exist_ok=True)
     _unmount(mnt)  # in case a previous run left it mounted
 
     log = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "fuse4dbricks.main", "--workspace", HOST, str(mnt)],
+        [
+            sys.executable,
+            "-m",
+            "fuse4dbricks.main",
+            "--workspace",
+            HOST,
+            *extra_args,
+            str(mnt),
+        ],
         stdout=log,
         stderr=subprocess.STDOUT,
         text=True,
@@ -117,10 +134,24 @@ def mountpoint():
             proc.wait(timeout=10)
         log.close()
         try:
-            if mnt == DEFAULT_MOUNTPOINT:
+            # Only remove dirs we created under the default scheme, never a
+            # user-supplied FUSE4DBRICKS_TEST_MOUNTPOINT.
+            if mnt.name.startswith(DEFAULT_MOUNTPOINT.name):
                 mnt.rmdir()  # only if empty
         except OSError:
             pass
+
+
+@pytest.fixture(scope="module")
+def mountpoint():
+    with _mounted() as mnt:
+        yield mnt
+
+
+@pytest.fixture(scope="module")
+def readonly_mountpoint():
+    with _mounted(extra_args=("--read-only",), suffix="_ro") as mnt:
+        yield mnt
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +216,11 @@ def test_read_known_file_matches_size(mountpoint):
 
 @requires_live_mount
 @pytest.mark.skipif(not TEST_FILE_REL, reason="FUSE4DBRICKS_TEST_FILE not set")
-def test_write_is_rejected_read_only(mountpoint):
-    # The catalog is read-only: opening for write must fail with EACCES.
-    path = os.path.join(mountpoint, _volume_relpath(), TEST_FILE_REL)
-    with pytest.raises(PermissionError):
+def test_write_is_rejected_read_only(readonly_mountpoint):
+    # Mounted with --read-only: opening a Unity Catalog file for write must
+    # fail with EROFS (a read-only filesystem), surfaced as OSError.
+    path = os.path.join(readonly_mountpoint, _volume_relpath(), TEST_FILE_REL)
+    with pytest.raises(OSError) as excinfo:
         with open(path, "wb"):
             pass
+    assert excinfo.value.errno == errno.EROFS
