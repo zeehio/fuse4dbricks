@@ -737,7 +737,7 @@ async def test_create_returns_attrs_and_file_handle(fs, inode_manager, ctx):
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
     sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
     vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
-    attrs, file_info = await fs.create(vol.inode, b"newfile.txt", 0o644, 0, ctx)
+    file_info, attrs = await fs.create(vol.inode, b"newfile.txt", 0o644, 0, ctx)
     assert attrs.st_size == 0
     assert int(file_info.fh) in fs._open_state
 
@@ -748,7 +748,7 @@ async def test_create_dirty_true_uploads_on_release(fs, inode_manager, uc_client
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
     sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
     vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
-    _attrs, file_info = await fs.create(vol.inode, b"empty.txt", 0o644, 0, ctx)
+    file_info, _attrs = await fs.create(vol.inode, b"empty.txt", 0o644, 0, ctx)
     fh = int(file_info.fh)
     # No explicit write — but dirty=True from create()
     await fs.release(pyfuse3.FileHandleT(fh))
@@ -762,7 +762,7 @@ async def test_create_then_write_then_release(fs, inode_manager, uc_client, ctx)
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
     sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
     vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
-    _attrs, file_info = await fs.create(vol.inode, b"out.txt", 0o644, 0, ctx)
+    file_info, _attrs = await fs.create(vol.inode, b"out.txt", 0o644, 0, ctx)
     fh = int(file_info.fh)
     await fs.write(fh, offset=0, buffer=b"hello world")
     await fs.release(pyfuse3.FileHandleT(fh))
