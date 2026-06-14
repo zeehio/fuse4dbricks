@@ -154,14 +154,33 @@ def test_profile_config_default_home_file(unified, tmp_path, monkeypatch):
     home.mkdir()
     (home / ".databrickscfg").write_text("[DEFAULT]\ntoken=x\n")
     monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(home))
-    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=1000)
+    # The default file must also pass the ownership check, so the resolved uid
+    # has to match the file owner (the test user that just created it).
+    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
     assert profile == "DEFAULT"
     assert config_file == str(home / ".databrickscfg")
 
 
+def test_profile_config_default_home_file_not_owned_is_rejected(unified, tmp_path, monkeypatch):
+    # Trust-boundary regression: under root + allow_other, the default
+    # ~/.databrickscfg is resolved from another user's home and could be a
+    # symlink the user planted to a victim's config. os.stat follows the link,
+    # so the file appears owned by the victim (not the requesting uid) and must
+    # be rejected — root must not cache the victim's token under the attacker.
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".databrickscfg").write_text("[DEFAULT]\ntoken=victim-secret\n")
+    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(home))
+    # A uid that does not own the file -> rejected, nothing resolved.
+    profile, config_file = unified._get_profile_and_config_file_name(
+        env=None, uid=os.getuid() + 424242
+    )
+    assert (profile, config_file) == (None, None)
+
+
 def test_profile_config_nothing_found(unified, tmp_path, monkeypatch):
     monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "empty"))
-    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=1000)
+    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
     assert (profile, config_file) == (None, None)
 
 

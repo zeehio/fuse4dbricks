@@ -155,10 +155,43 @@ class DatabricksUnifiedAuthProvider:
             logger.error("Failed to read environ file %s for pid %s. Exception: %s", environ_file, pid, exc)
             return None
 
+    def _is_safe_config_file(self, config_file: str, uid: int) -> bool:
+        """Return True only if ``config_file`` is safe to read on behalf of ``uid``.
+
+        When fuse4dbricks runs as root (the allow_other deployment), it reads
+        config files out of arbitrary users' home directories. A user who
+        controls their own ``~/.databrickscfg`` could symlink it at another
+        user's config file; root would follow the link and cache the *victim's*
+        token under the *attacker's* uid. ``os.stat`` follows symlinks, so the
+        ``st_uid == uid`` check is what defeats that: a symlinked-to victim file
+        is owned by the victim, not the requesting uid, and is rejected. This is
+        applied to *every* config file path, env-supplied or default, never just
+        one branch.
+        """
+        try:
+            st = os.stat(config_file)
+        except OSError as exc:
+            logger.error("Cannot stat config file %s: %s", config_file, exc)
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            logger.error("Config file %s is not a regular file, ignoring", config_file)
+            return False
+        if st.st_uid != uid or not (st.st_mode & stat.S_IRUSR):
+            logger.error(
+                "Config file %s is not owned and readable by uid %s, ignoring",
+                config_file, uid,
+            )
+            return False
+        return True
+
     def _get_profile_and_config_file_name(self, env: dict[str, str]|None, uid: int) -> tuple[str, str] | tuple[None, None]:
         """ Gets the databricks profile and config file name.
         1. Check if env defines DATABRICKS_CONFIG_PROFILE and DATABRICKS_CONFIG_FILE
         2. If not, default to DATABRICKS_CONFIG_PROFILE=DEFAULT and DATABRICKS_CONFIG_FILE=~/.databrickscfg (in the user's home directory)
+
+        Whichever path is selected must be owned by and readable for ``uid``
+        (see ``_is_safe_config_file``); an env-supplied path that fails the
+        check falls through to the default location.
         """
         if env is not None:
             profile = env.get("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
@@ -167,31 +200,20 @@ class DatabricksUnifiedAuthProvider:
             profile = "DEFAULT"
             config_file = None
 
-        # If the config file is not a regular file, not owned by uid, or not readable
-        # by the owner, ignore it and log an error
-        if config_file is not None:
-            try:
-                st = os.stat(config_file)
-            except OSError as exc:
-                logger.error("Cannot stat config file %s: %s", config_file, exc)
-                config_file = None
-            else:
-                if not stat.S_ISREG(st.st_mode):
-                    logger.error("Config file %s is not a regular file, ignoring", config_file)
-                    config_file = None
-                elif st.st_uid != uid or not (st.st_mode & stat.S_IRUSR):
-                    logger.error(
-                        "Config file %s is not owned and readable by uid %s, ignoring",
-                        config_file, uid,
-                    )
-                    config_file = None
+        # An env-supplied config file that fails validation is ignored, falling
+        # through to the default location below.
+        if config_file is not None and not self._is_safe_config_file(config_file, uid):
+            config_file = None
 
         if config_file is None:
-            # Default to ~/.databrickscfg in the user's home directory
+            # Default to ~/.databrickscfg in the user's home directory. This path
+            # is validated identically: under root it may live in another user's
+            # home and must still be owned by the requesting uid.
             home_dir = self._home_for_uid(uid)
-            config_file = os.path.join(home_dir, ".databrickscfg")
-            if not Path(config_file).exists():
-                config_file = None
+            default_config = os.path.join(home_dir, ".databrickscfg")
+            if self._is_safe_config_file(default_config, uid):
+                config_file = default_config
+
         if config_file is None:
             logger.error("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
             return None, None
