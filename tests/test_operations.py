@@ -792,6 +792,26 @@ async def test_create_returns_attrs_and_file_handle(fs, inode_manager, ctx):
 
 
 @pytest.mark.trio
+async def test_create_pins_inode_like_lookup(fs, inode_manager, ctx):
+    """create() returns an EntryAttributes, so the kernel holds a reference and
+    will send a matching forget(). The new inode must be pinned (ref_count == 1)
+    so that single forget brings it to 0 — not below — and it isn't freed while
+    still referenced."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    _file_info, _attrs = await fs.create(vol.inode, b"pinned.txt", 0o644, 0, ctx)
+
+    inode = inode_manager.get_inode_by_path("/cat/sch/vol/pinned.txt")
+    assert inode is not None
+    assert inode_manager.get_entry(inode).ref_count == 1
+
+    # The kernel's matching forget for the create reply takes it to 0.
+    inode_manager.forget(inode, 1)
+    assert inode_manager.get_entry(inode) is None
+
+
+@pytest.mark.trio
 async def test_create_dirty_true_uploads_on_release(fs, inode_manager, uc_client, ctx):
     """create() marks the handle dirty so release() always uploads (even with no writes)."""
     cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
