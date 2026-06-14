@@ -8,9 +8,9 @@ This is not an official databricks package. I, the author of this package, am no
 
 ## Features
 
-The filesystem is read only.
-
 This filesystem uses the [public databricks API](https://docs.databricks.com/api/azure/workspace/introduction) to retrieve files, directories and access permissions from the Unity Catalog.
+
+**Read and write** access is supported for Unity Catalog Volumes. Users with `WRITE_VOLUME` privilege can create, overwrite and delete files and directories. Files above 5 GB are uploaded via multipart upload handled transparently by the Databricks SDK. Pass `--read-only` to disable all writes to Unity Catalog (useful when mounting a shared volume that should not be modified).
 
 To mitigate latency and improve **performance**, file metadata is cached in-memory. Data is cached
 to a local cache directory (`--disk-cache-dir`) and partially to RAM as well. Options to control
@@ -180,3 +180,15 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   result, a file created (or that becomes visible to you) just after you looked for it may not
   appear until this short TTL expires. Unlike file metadata, these negative results are *not*
   shared between users.
+
+- **Writes are object-store semantics, not POSIX semantics.** The Databricks Files API is a
+  full-replace store: a file is not visible to other processes until the writing process closes
+  it (`release`). Concurrent writers follow last-write-wins — there is no locking. Deleting a
+  file while another process has it open will cause that process to receive an I/O error on its
+  next network fetch. These are intentional trade-offs for performance on object storage.
+
+- **Opening a large file O_RDWR without O_TRUNC downloads the entire file first.** Because
+  writes are buffered locally and uploaded on close, the full existing content must be
+  downloaded into a temporary file before the open returns. For very large files (multi-GB)
+  this can be slow. Use `O_WRONLY` or `O_RDWR | O_TRUNC` when you intend to overwrite the
+  file completely.
