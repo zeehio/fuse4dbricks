@@ -37,6 +37,21 @@ class WriteBuffer:
         self._tmp.seek(offset)
         return self._tmp.read(length)
 
+    def finalize(self) -> None:
+        """Flush and close the write handle, keeping the file on disk.
+
+        Writes go through a buffered file object, so data may sit in Python's
+        in-memory buffer (~8 KB) rather than on disk. The upload path opens
+        ``self.path`` with a *separate* handle and streams it; without closing
+        the write handle first, a write smaller than the buffer would be read
+        back as an empty file and silently uploaded as zero bytes. Closing the
+        handle flushes the buffer to disk (and frees the fd for the duration of
+        the upload) while ``self.path`` stays valid. Idempotent; ``read()`` and
+        ``write()`` must not be called afterwards.
+        """
+        if not self._tmp.closed:
+            self._tmp.close()
+
     def size(self) -> int:
         return self._size
 
@@ -45,9 +60,11 @@ class WriteBuffer:
         return self._tmp.name
 
     def close(self) -> None:
-        """Close and delete the tempfile. Always call this, even on error."""
+        """Close the handle (if still open) and delete the tempfile. Always
+        call this, even on error. Safe to call after ``finalize()``."""
         try:
-            self._tmp.close()
+            if not self._tmp.closed:
+                self._tmp.close()
         finally:
             try:
                 os.unlink(self._tmp.name)

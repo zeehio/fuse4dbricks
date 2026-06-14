@@ -342,15 +342,21 @@ class UnityCatalogFS(pyfuse3.Operations):
         write_buffer: WriteBuffer | None = None
 
         if writable and self._dispatch(entry.fs_path) == "unity_catalog":
-            if (flags & _O_RDWR) and not (flags & _O_TRUNC):
-                # O_RDWR without O_TRUNC: stream existing content into the
-                # write buffer one chunk at a time so memory usage stays at
-                # O(chunk_size) regardless of file size.
+            write_buffer = WriteBuffer(self._writes_dir)
+            # Without O_TRUNC, POSIX preserves any bytes the caller does not
+            # overwrite, so the buffer must start as a copy of the current
+            # remote file. Otherwise a partial write (e.g. rewriting only the
+            # first few bytes of a large file) would upload a truncated file on
+            # release and silently destroy the rest. This applies to BOTH
+            # O_WRONLY and O_RDWR; only O_TRUNC (or a brand-new file via
+            # create()) legitimately starts from an empty buffer. Stream the
+            # existing content in one chunk at a time so memory stays at
+            # O(chunk_size) regardless of file size.
+            if not (flags & _O_TRUNC) and entry.attr.st_size > 0:
                 logger.info(
-                    "O_RDWR open on %s (size=%d): streaming into write buffer",
+                    "writable open on %s (size=%d) without O_TRUNC: pre-loading existing content",
                     entry.fs_path, entry.attr.st_size,
                 )
-                write_buffer = WriteBuffer(self._writes_dir)
                 try:
                     file_size = entry.attr.st_size
                     pos = 0
@@ -367,9 +373,7 @@ class UnityCatalogFS(pyfuse3.Operations):
                         pos += len(chunk)
                 except Exception as e:
                     write_buffer.close()
-                    self._raise_fuse_error(e, fs_path=entry.fs_path, op="open/rdwr")
-            else:
-                write_buffer = WriteBuffer(self._writes_dir)
+                    self._raise_fuse_error(e, fs_path=entry.fs_path, op="open/preload")
 
         fh = self._open_fh_count
         self._open_fh_count += 1
@@ -442,6 +446,10 @@ class UnityCatalogFS(pyfuse3.Operations):
             if write_buffer is not None and dirty:
                 uc_path = fs_to_uc_path(entry.fs_path)
                 try:
+                    # Flush + close the write handle so the upload reads the
+                    # complete file from disk (buffered writes smaller than
+                    # ~8 KB would otherwise upload as zero bytes).
+                    write_buffer.finalize()
                     await self.uc_client.upload_file(
                         uc_path, write_buffer.path, ctx=ctx
                     )

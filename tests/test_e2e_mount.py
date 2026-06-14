@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -154,6 +155,29 @@ def readonly_mountpoint():
         yield mnt
 
 
+def _read_back(path: str, expected: bytes, timeout_s: float = 20.0) -> bytes:
+    """Read a file through the mount until its content equals ``expected``.
+
+    Retries on both OSError (a freshly-created path is hidden by the negative
+    cache for its short TTL, and a just-uploaded object has a brief
+    read-after-write window) and on a not-yet-consistent body (e.g. a transient
+    zero-length read), so the test does not race the live API.
+    """
+    deadline = time.monotonic() + timeout_s
+    last: object = "no attempt"
+    while time.monotonic() < deadline:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if data == expected:
+                return data
+            last = f"content not settled (len={len(data)}, want {len(expected)})"
+        except OSError as exc:
+            last = exc
+        time.sleep(0.5)
+    raise AssertionError(f"read-back of {path} did not settle within {timeout_s}s: {last}")
+
+
 # ---------------------------------------------------------------------------
 # readdir: the root overlay is merged with the live catalog listing
 # ---------------------------------------------------------------------------
@@ -224,3 +248,38 @@ def test_write_is_rejected_read_only(readonly_mountpoint):
         with open(path, "wb"):
             pass
     assert excinfo.value.errno == errno.EROFS
+
+
+@requires_live_mount
+def test_partial_wronly_write_preserves_tail(mountpoint):
+    # Regression for silent truncation through the real upload path: opening an
+    # existing file O_WRONLY *without* O_TRUNC and rewriting only the leading
+    # bytes must preserve the rest of the file on the volume. Two bugs used to
+    # break this: (1) the write buffer started empty for O_WRONLY, and (2) small
+    # buffered writes were never flushed, so the upload read back zero bytes.
+    name = f"fuse4dbricks_e2e_partial_{uuid.uuid4().hex}.bin"
+    path = os.path.join(mountpoint, _volume_relpath(), name)
+    original = bytes(range(256)) * 8  # 2048 distinctive bytes
+    try:
+        with open(path, "wb") as fobj:
+            fobj.write(original)
+        # Whole file must be present (waits out the negative-cache TTL and the
+        # read-after-write window). This also warms the cache so the O_WRONLY
+        # reopen below pre-loads from cache rather than racing the API.
+        _read_back(path, original)
+
+        # Reopen O_WRONLY (no O_TRUNC) and overwrite only the first 3 bytes.
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, b"AAA", 0) == 3
+        finally:
+            os.close(fd)
+
+        # The leading bytes change; the untouched tail must survive the upload.
+        expected = b"AAA" + original[3:]
+        _read_back(path, expected)
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
