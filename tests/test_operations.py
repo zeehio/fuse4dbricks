@@ -609,7 +609,7 @@ def _make_vol_file(inode_manager, filename="data.txt", size=512):
 
 @pytest.mark.trio
 async def test_open_wronly_creates_write_buffer(fs, inode_manager, ctx):
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -622,7 +622,7 @@ async def test_open_wronly_creates_write_buffer(fs, inode_manager, ctx):
 
 @pytest.mark.trio
 async def test_write_updates_st_size(fs, inode_manager, ctx):
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -635,7 +635,7 @@ async def test_write_updates_st_size(fs, inode_manager, ctx):
 
 @pytest.mark.trio
 async def test_write_at_nonzero_offset_extends_buffer_size(fs, inode_manager, ctx):
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -647,7 +647,7 @@ async def test_write_at_nonzero_offset_extends_buffer_size(fs, inode_manager, ct
 
 @pytest.mark.trio
 async def test_write_sets_dirty_flag(fs, inode_manager, ctx):
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -660,7 +660,7 @@ async def test_write_sets_dirty_flag(fs, inode_manager, ctx):
 @pytest.mark.trio
 async def test_release_no_upload_when_not_dirty(fs, inode_manager, uc_client, ctx):
     """Open O_WRONLY without writing: release must skip the upload."""
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -671,7 +671,7 @@ async def test_release_no_upload_when_not_dirty(fs, inode_manager, uc_client, ct
 @pytest.mark.trio
 async def test_release_upload_on_dirty(fs, inode_manager, uc_client, ctx):
     """Write then release: upload_file is called with the correct uc_path."""
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
     fh = int(file_info.fh)
@@ -684,7 +684,7 @@ async def test_release_upload_on_dirty(fs, inode_manager, uc_client, ctx):
 
 @pytest.mark.trio
 async def test_release_invalidates_cache_on_success(fs, inode_manager, metadata_manager, ctx):
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     metadata_manager.invalidate = MagicMock()
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
@@ -697,7 +697,7 @@ async def test_release_invalidates_cache_on_success(fs, inode_manager, metadata_
 @pytest.mark.trio
 async def test_release_upload_failure_returns_eio(fs, inode_manager, uc_client, metadata_manager, ctx):
     """Upload failure: release raises EIO and does NOT invalidate the cache."""
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     uc_client.upload_file = AsyncMock(side_effect=UcUnavailable("503"))
     metadata_manager.invalidate = MagicMock()
     O_WRONLY = 1
@@ -714,7 +714,7 @@ async def test_release_upload_failure_returns_eio(fs, inode_manager, uc_client, 
 async def test_release_cleans_tempfile_on_failure(fs, inode_manager, uc_client, ctx):
     """Tempfile must be deleted even when the upload raises."""
     import os
-    _vol, f = _make_vol_file(inode_manager)
+    _vol, f = _make_vol_file(inode_manager, size=0)
     uc_client.upload_file = AsyncMock(side_effect=RuntimeError("network error"))
     O_WRONLY = 1
     file_info = await fs.open(f.inode, O_WRONLY, ctx)
@@ -725,6 +725,55 @@ async def test_release_cleans_tempfile_on_failure(fs, inode_manager, uc_client, 
     with pytest.raises(pyfuse3.FUSEError):
         await fs.release(pyfuse3.FileHandleT(fh))
     assert not os.path.exists(tmppath)
+
+
+@pytest.mark.trio
+async def test_wronly_preloads_existing_file_on_open(fs, inode_manager, data_manager, ctx):
+    """open(O_WRONLY) without O_TRUNC must pre-load the existing remote content,
+    exactly like O_RDWR — otherwise a partial write would truncate the file."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    data_manager.read = AsyncMock(return_value=b"hello")
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    data_manager.read.assert_awaited_once()
+    assert fs._open_state[fh]["write_buffer"].size() == 5
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_wronly_trunc_skips_preload(fs, inode_manager, data_manager, ctx):
+    """open(O_WRONLY | O_TRUNC) must NOT pre-load — buffer starts empty."""
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    O_WRONLY = 1
+    O_TRUNC = 0o1000
+    file_info = await fs.open(f.inode, O_WRONLY | O_TRUNC, ctx)
+    fh = int(file_info.fh)
+    data_manager.read.assert_not_awaited()
+    assert fs._open_state[fh]["write_buffer"].size() == 0
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+
+@pytest.mark.trio
+async def test_wronly_partial_write_preserves_tail(fs, inode_manager, data_manager, uc_client, ctx):
+    """Regression: a partial O_WRONLY write must keep the bytes it did not touch.
+
+    Opening O_WRONLY (no O_TRUNC) and rewriting only the leading bytes used to
+    upload a truncated file, silently destroying the tail. Pre-loading makes the
+    buffer start as a copy of the remote file, so the untouched tail survives.
+    """
+    _vol, f = _make_vol_file(inode_manager, size=10)
+    data_manager.read = AsyncMock(return_value=b"0123456789")
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    # Overwrite only the first 3 bytes; the remaining 7 must be preserved.
+    await fs.write(fh, offset=0, buffer=b"AAA")
+    wb = fs._open_state[fh]["write_buffer"]
+    assert wb.size() == 10
+    assert wb.read(0, 10) == b"AAA3456789"
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1022,10 +1071,12 @@ async def test_posix_concurrent_writers_last_wins(fs, inode_manager, uc_client, 
     the first silently. No error is returned to either writer. This matches object-store
     (S3/ADLS/GCS) semantics and is documented as an accepted deviation from POSIX.
     """
+    # O_TRUNC: both writers fully overwrite, so no pre-load of existing content.
     _vol, f = _make_vol_file(inode_manager)
     O_WRONLY = 1
-    info_a = await fs.open(f.inode, O_WRONLY, ctx)
-    info_b = await fs.open(f.inode, O_WRONLY, ctx)
+    O_TRUNC = 0o1000
+    info_a = await fs.open(f.inode, O_WRONLY | O_TRUNC, ctx)
+    info_b = await fs.open(f.inode, O_WRONLY | O_TRUNC, ctx)
     fha, fhb = int(info_a.fh), int(info_b.fh)
 
     await fs.write(fha, offset=0, buffer=b"writer-A")
