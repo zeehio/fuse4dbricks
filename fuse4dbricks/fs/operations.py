@@ -418,7 +418,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             # exists after release(), even if nothing is written into it.
             "dirty": True,
         }
-        return (self._entry_to_fuse_attr(entry), pyfuse3.FileInfo(fh=fh))
+        return (pyfuse3.FileInfo(fh=fh), self._entry_to_fuse_attr(entry))
 
     async def release(self, fh: pyfuse3.FileHandleT) -> None:
         if fh not in self._open_state:
