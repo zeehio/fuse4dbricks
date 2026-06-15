@@ -89,3 +89,36 @@ def test_partial_overwrite_preserves_tail_on_disk(writes_dir):
     with open(wb.path, "rb") as f:
         assert f.read() == b"AAA3456789"
     wb.close()
+
+
+def test_truncate_shrinks(writes_dir):
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, b"0123456789")
+    wb.truncate(4)
+    assert wb.size() == 4
+    wb.finalize()
+    with open(wb.path, "rb") as f:
+        assert f.read() == b"0123"
+    wb.close()
+
+
+def test_truncate_grows_with_zeros(writes_dir):
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, b"abc")
+    wb.truncate(6)
+    assert wb.size() == 6
+    wb.finalize()
+    with open(wb.path, "rb") as f:
+        assert f.read() == b"abc\x00\x00\x00"
+    wb.close()
+
+
+def test_truncate_to_zero(writes_dir):
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, b"data")
+    wb.truncate(0)
+    assert wb.size() == 0
+    wb.finalize()
+    with open(wb.path, "rb") as f:
+        assert f.read() == b""
+    wb.close()

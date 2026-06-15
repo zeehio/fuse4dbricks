@@ -37,6 +37,17 @@ class WriteBuffer:
         self._tmp.seek(offset)
         return self._tmp.read(length)
 
+    def truncate(self, size: int) -> None:
+        """Resize the buffer to exactly ``size`` bytes.
+
+        Shrinks (dropping the tail) or grows (zero-filling, POSIX hole
+        semantics) as needed. ``file.truncate`` flushes the buffered writer
+        before resizing, so a subsequent ``read``/``finalize`` sees the new
+        length.
+        """
+        self._tmp.truncate(size)
+        self._size = size
+
     def finalize(self) -> None:
         """Flush and close the write handle, keeping the file on disk.
 

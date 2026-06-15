@@ -283,3 +283,57 @@ def test_partial_wronly_write_preserves_tail(mountpoint):
             os.remove(path)
         except FileNotFoundError:
             pass
+
+
+@requires_live_mount
+def test_rename_moves_file_content(mountpoint):
+    # Exercises rename through the real copy(download+upload)+delete path: the
+    # content must appear at the new name and the old name must be gone.
+    base = _volume_relpath()
+    suffix = uuid.uuid4().hex
+    src_name = f"fuse4dbricks_e2e_rename_src_{suffix}.bin"
+    dst_name = f"fuse4dbricks_e2e_rename_dst_{suffix}.bin"
+    src = os.path.join(mountpoint, base, src_name)
+    dst = os.path.join(mountpoint, base, dst_name)
+    payload = bytes(range(256)) * 4  # 1024 distinctive bytes
+    try:
+        with open(src, "wb") as fobj:
+            fobj.write(payload)
+        # Wait out the read-after-write window; this also warms the chunk cache
+        # so rename's internal read is served locally rather than racing the API.
+        _read_back(src, payload)
+
+        os.rename(src, dst)
+
+        # New name carries the content; old name no longer exists.
+        _read_back(dst, payload)
+        with pytest.raises(FileNotFoundError):
+            os.stat(src)
+    finally:
+        for p in (src, dst):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+
+
+@requires_live_mount
+def test_ftruncate_shrinks_file(mountpoint):
+    # Exercises setattr(update_size) on an open writable handle: write content,
+    # truncate it shorter, close -> the upload must carry the truncated bytes.
+    name = f"fuse4dbricks_e2e_trunc_{uuid.uuid4().hex}.bin"
+    path = os.path.join(mountpoint, _volume_relpath(), name)
+    original = bytes(range(256))  # 256 bytes
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            assert os.write(fd, original) == len(original)
+            os.ftruncate(fd, 10)
+        finally:
+            os.close(fd)
+        _read_back(path, original[:10])
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass

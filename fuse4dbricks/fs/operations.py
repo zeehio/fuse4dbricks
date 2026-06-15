@@ -658,6 +658,195 @@ class UnityCatalogFS(pyfuse3.Operations):
             self.inodes._prune_subtree(child_inode)
         self.metadata_manager.invalidate(child_fs_path, is_dir=True)
 
+    async def rename(self, parent_inode_old, name_old, parent_inode_new, name_new, flags, ctx):
+        if self._read_only:
+            raise pyfuse3.FUSEError(errno.EROFS)
+        # We don't implement the atomic-exchange extension.
+        if flags & pyfuse3.RENAME_EXCHANGE:
+            raise pyfuse3.FUSEError(errno.EINVAL)
+
+        await self._check_permissions(parent_inode_old, _W_OK, ctx)
+        await self._check_permissions(parent_inode_new, _W_OK, ctx)
+
+        old_parent = self.inodes.get_entry(parent_inode_old)
+        new_parent = self.inodes.get_entry(parent_inode_new)
+        if old_parent is None or new_parent is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        # The auth overlay is virtual and read-only; renames stay in UC space.
+        if (self._dispatch(old_parent.fs_path) != "unity_catalog"
+                or self._dispatch(new_parent.fs_path) != "unity_catalog"):
+            raise pyfuse3.FUSEError(errno.EACCES)
+
+        old_name = name_old.decode("utf-8")
+        new_name = name_new.decode("utf-8")
+        old_fs_path = f"{old_parent.fs_path}/{old_name}".replace("//", "/")
+        new_fs_path = f"{new_parent.fs_path}/{new_name}".replace("//", "/")
+        if old_fs_path == new_fs_path:
+            return  # no-op
+
+        # Resolve the source so we know its type and size. Prefer the inode map;
+        # fall back to a metadata lookup if it isn't cached yet.
+        src_inode = self.inodes.get_inode_by_path(old_fs_path)
+        src_entry = self.inodes.get_entry(src_inode) if src_inode is not None else None
+        if src_entry is None:
+            try:
+                attr = await self.metadata_manager.lookup_child(old_parent, old_name, ctx)
+            except pyfuse3.FUSEError:
+                raise
+            except Exception as exc:
+                self._raise_fuse_error(exc, fs_path=old_fs_path, op="rename")
+            if attr is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            src_entry = self.inodes.add_entry(parent_inode_old, old_name, attr)
+            src_inode = src_entry.inode
+
+        # The Files API has no directory move; a recursive copy would be heavy
+        # and non-atomic. Report cross-device so `mv` falls back to copy+remove.
+        if src_entry.is_dir:
+            raise pyfuse3.FUSEError(errno.EXDEV)
+
+        # Inspect the destination for NOREPLACE / file-over-dir rules.
+        try:
+            dst_attr = await self.metadata_manager.lookup_child(new_parent, new_name, ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as exc:
+            self._raise_fuse_error(exc, fs_path=new_fs_path, op="rename")
+        if dst_attr is not None:
+            if flags & pyfuse3.RENAME_NOREPLACE:
+                raise pyfuse3.FUSEError(errno.EEXIST)
+            if dst_attr.is_dir:
+                raise pyfuse3.FUSEError(errno.EISDIR)
+
+        # No server-side move: download source -> upload to dest -> delete source.
+        src_uc = fs_to_uc_path(old_fs_path)
+        dst_uc = fs_to_uc_path(new_fs_path)
+        write_buffer = WriteBuffer(self._writes_dir)
+        try:
+            file_size = src_entry.attr.st_size
+            pos = 0
+            chunk_size = self.data_manager.chunk_size
+            while pos < file_size:
+                length = min(chunk_size, file_size - pos)
+                chunk = await self.data_manager.read(
+                    old_fs_path, pos, length,
+                    src_entry.attr.st_mtime, file_size, ctx=ctx,
+                )
+                if len(chunk) == 0:
+                    break
+                write_buffer.write(pos, chunk)
+                pos += len(chunk)
+            write_buffer.finalize()
+            await self.uc_client.upload_file(dst_uc, write_buffer.path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            write_buffer.close()
+            raise
+        except Exception as exc:
+            write_buffer.close()
+            self._raise_fuse_error(exc, fs_path=new_fs_path, op="rename/upload")
+        else:
+            write_buffer.close()
+
+        # Drop the source only after the copy is durably uploaded.
+        try:
+            await self.uc_client.delete_file(src_uc, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as exc:
+            self._raise_fuse_error(exc, fs_path=old_fs_path, op="rename/delete")
+
+        # Re-point the inode and bust caches for both ends (and their parents).
+        self.inodes.move_inode(src_inode, parent_inode_new, new_name)
+        self.metadata_manager.invalidate(old_fs_path, is_dir=False)
+        self.metadata_manager.invalidate(new_fs_path, is_dir=False)
+
+    async def setattr(self, inode, attr, fields, fh, ctx):
+        entry = self.inodes.get_entry(inode)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        is_uc = self._dispatch(entry.fs_path) == "unity_catalog"
+
+        # Size change (truncate / ftruncate) is the only field backed by remote
+        # storage. The rest (mode/uid/gid/times) has no Unity Catalog
+        # representation, so we accept them in-memory only to keep tools that do
+        # chmod/chown/utime (tar, cp -p, editors) from failing.
+        if fields.update_size:
+            if entry.is_dir:
+                raise pyfuse3.FUSEError(errno.EISDIR)
+            if not is_uc:
+                raise pyfuse3.FUSEError(errno.EACCES)
+            if self._read_only:
+                raise pyfuse3.FUSEError(errno.EROFS)
+            await self._truncate_uc_file(entry, attr.st_size, fh, ctx)
+
+        if fields.update_mode:
+            # Preserve the file-type bits; only the permission bits change.
+            entry.attr.st_mode = stat.S_IFMT(entry.attr.st_mode) | stat.S_IMODE(
+                attr.st_mode
+            )
+        if fields.update_uid:
+            entry.attr.st_uid = attr.st_uid
+        if fields.update_gid:
+            entry.attr.st_gid = attr.st_gid
+        if fields.update_atime:
+            entry.attr.st_atime = attr.st_atime_ns / 1e9
+        if fields.update_mtime:
+            entry.attr.st_mtime = attr.st_mtime_ns / 1e9
+        # Metadata changed: bump ctime like a real filesystem.
+        entry.attr.st_ctime = time.time()
+
+        return self._entry_to_fuse_attr(entry)
+
+    async def _truncate_uc_file(self, entry, new_size, fh, ctx):
+        """Resize a Unity Catalog file to ``new_size`` bytes.
+
+        If an open writable handle is supplied (ftruncate), operate on its
+        buffer and defer the upload to release(). Otherwise (path-based
+        truncate) materialize the kept bytes into a temp buffer, resize it and
+        upload immediately.
+        """
+        # ftruncate on an open writable handle: resize its buffer; release()
+        # will upload the result.
+        if fh is not None and fh in self._open_state:
+            state = self._open_state[fh]
+            write_buffer: WriteBuffer | None = state.get("write_buffer")
+            if write_buffer is not None and state.get("writable"):
+                write_buffer.truncate(new_size)
+                state["dirty"] = True
+                entry.attr.st_size = write_buffer.size()
+                return
+
+        # Path-based truncate: copy the bytes we keep, resize, upload now.
+        write_buffer = WriteBuffer(self._writes_dir)
+        try:
+            old_size = entry.attr.st_size
+            to_copy = min(new_size, old_size)
+            pos = 0
+            chunk_size = self.data_manager.chunk_size
+            while pos < to_copy:
+                length = min(chunk_size, to_copy - pos)
+                chunk = await self.data_manager.read(
+                    entry.fs_path, pos, length,
+                    entry.attr.st_mtime, old_size, ctx=ctx,
+                )
+                if len(chunk) == 0:
+                    break
+                write_buffer.write(pos, chunk)
+                pos += len(chunk)
+            write_buffer.truncate(new_size)  # zero-extends when growing
+            write_buffer.finalize()
+            uc_path = fs_to_uc_path(entry.fs_path)
+            await self.uc_client.upload_file(uc_path, write_buffer.path, ctx=ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as exc:
+            self._raise_fuse_error(exc, fs_path=entry.fs_path, op="setattr/truncate")
+        finally:
+            write_buffer.close()
+        entry.attr.st_size = new_size
+        self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
+
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:
             self.inodes.forget(inode, nlookup)

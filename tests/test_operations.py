@@ -1191,3 +1191,253 @@ async def test_read_only_auth_write_still_allowed(fs_ro, inode_manager, auth_man
     # open O_WRONLY on an auth file — must NOT raise EROFS
     file_info = await fs_ro.open(token_file.inode, 1, ctx)  # O_WRONLY = 1
     await fs_ro.release(pyfuse3.FileHandleT(int(file_info.fh)))
+
+
+# ---------------------------------------------------------------------------
+# rename
+# ---------------------------------------------------------------------------
+
+
+def _fields(**kw):
+    """A SetattrFields stand-in (the real type is immutable). setattr only
+    reads these update_* booleans."""
+    base = dict(
+        update_size=False, update_mode=False, update_uid=False,
+        update_gid=False, update_atime=False, update_mtime=False,
+        update_ctime=False,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+@pytest.mark.trio
+async def test_rename_file_copies_then_deletes_and_moves_inode(
+    fs, inode_manager, uc_client, metadata_manager, data_manager, ctx
+):
+    vol, f = _make_vol_file(inode_manager, size=5)  # data_manager.read -> b"hello"
+    metadata_manager.lookup_child = AsyncMock(return_value=None)  # dest is free
+    metadata_manager.invalidate = MagicMock()
+
+    await fs.rename(vol.inode, b"data.txt", vol.inode, b"renamed.txt", 0, ctx)
+
+    # Uploaded to the new path, deleted from the old.
+    uc_client.upload_file.assert_awaited_once()
+    assert uc_client.upload_file.call_args.args[0] == "/Volumes/cat/sch/vol/renamed.txt"
+    uc_client.delete_file.assert_awaited_once()
+    assert uc_client.delete_file.call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+
+    # Inode moved: new path resolves to the same inode, old path is gone.
+    assert inode_manager.get_inode_by_path("/cat/sch/vol/data.txt") is None
+    moved = inode_manager.get_inode_by_path("/cat/sch/vol/renamed.txt")
+    assert moved == f.inode
+    assert inode_manager.get_entry(moved).name == "renamed.txt"
+
+    # Both ends invalidated.
+    metadata_manager.invalidate.assert_any_call("/cat/sch/vol/data.txt", is_dir=False)
+    metadata_manager.invalidate.assert_any_call("/cat/sch/vol/renamed.txt", is_dir=False)
+
+
+@pytest.mark.trio
+async def test_rename_into_other_directory_reparents_inode(
+    fs, inode_manager, uc_client, metadata_manager, ctx
+):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    sub = inode_manager.add_entry(vol.inode, "sub", attr=_make_attr(True))
+    f = inode_manager.add_entry(vol.inode, "data.txt", attr=_make_attr(False, size=5))
+    metadata_manager.lookup_child = AsyncMock(return_value=None)
+
+    await fs.rename(vol.inode, b"data.txt", sub.inode, b"data.txt", 0, ctx)
+
+    assert uc_client.upload_file.call_args.args[0] == "/Volumes/cat/sch/vol/sub/data.txt"
+    moved = inode_manager.get_inode_by_path("/cat/sch/vol/sub/data.txt")
+    assert moved == f.inode
+    assert inode_manager.get_entry(moved).parent_inode == sub.inode
+
+
+@pytest.mark.trio
+async def test_rename_directory_raises_exdev(fs, inode_manager, metadata_manager, ctx):
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    inode_manager.add_entry(vol.inode, "adir", attr=_make_attr(True))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"adir", vol.inode, b"bdir", 0, ctx)
+    assert exc.value.errno == errno.EXDEV
+
+
+@pytest.mark.trio
+async def test_rename_noreplace_existing_raises_eexist(
+    fs, inode_manager, metadata_manager, uc_client, ctx
+):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    # Destination exists (default lookup_child returns a file attr).
+    metadata_manager.lookup_child = AsyncMock(return_value=_make_attr(False))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"taken.txt",
+                        pyfuse3.RENAME_NOREPLACE, ctx)
+    assert exc.value.errno == errno.EEXIST
+    uc_client.upload_file.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_rename_over_existing_directory_raises_eisdir(
+    fs, inode_manager, metadata_manager, uc_client, ctx
+):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    metadata_manager.lookup_child = AsyncMock(return_value=_make_attr(True))  # dest is a dir
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"adir", 0, ctx)
+    assert exc.value.errno == errno.EISDIR
+    uc_client.upload_file.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_rename_exchange_flag_raises_einval(fs, inode_manager, ctx):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"other.txt",
+                        pyfuse3.RENAME_EXCHANGE, ctx)
+    assert exc.value.errno == errno.EINVAL
+
+
+@pytest.mark.trio
+async def test_rename_read_only_raises_erofs(fs_ro, inode_manager, ctx):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.rename(vol.inode, b"data.txt", vol.inode, b"renamed.txt", 0, ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_rename_upload_failure_does_not_delete_source(
+    fs, inode_manager, uc_client, metadata_manager, ctx
+):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    metadata_manager.lookup_child = AsyncMock(return_value=None)
+    uc_client.upload_file = AsyncMock(side_effect=UcUnavailable("503"))
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"renamed.txt", 0, ctx)
+    assert exc.value.errno == errno.EAGAIN
+    # Source must survive a failed copy.
+    uc_client.delete_file.assert_not_awaited()
+    assert inode_manager.get_inode_by_path("/cat/sch/vol/data.txt") == f.inode
+
+
+@pytest.mark.trio
+async def test_rename_same_path_is_noop(fs, inode_manager, uc_client, ctx):
+    vol, f = _make_vol_file(inode_manager, size=5)
+    await fs.rename(vol.inode, b"data.txt", vol.inode, b"data.txt", 0, ctx)
+    uc_client.upload_file.assert_not_awaited()
+    uc_client.delete_file.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# setattr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_setattr_ftruncate_shrinks_open_buffer(fs, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    file_info = await fs.open(f.inode, 1, ctx)  # O_WRONLY
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"0123456789")
+
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 4
+    result = await fs.setattr(f.inode, attr, _fields(update_size=True),
+                              pyfuse3.FileHandleT(fh), ctx)
+
+    assert result.st_size == 4
+    assert f.attr.st_size == 4
+    # The open writable handle now serves the truncated content.
+    assert await fs.read(fh, 0, 100) == b"0123"
+
+
+@pytest.mark.trio
+async def test_setattr_ftruncate_marks_dirty_and_uploads_on_release(
+    fs, inode_manager, uc_client, metadata_manager, ctx
+):
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    metadata_manager.invalidate = MagicMock()
+    file_info = await fs.open(f.inode, 1, ctx)  # O_WRONLY
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"0123456789")
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 4
+    await fs.setattr(f.inode, attr, _fields(update_size=True),
+                     pyfuse3.FileHandleT(fh), ctx)
+    await fs.release(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_awaited_once()
+    assert uc_client.upload_file.call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+
+
+@pytest.mark.trio
+async def test_setattr_path_truncate_downloads_resizes_uploads(
+    fs, inode_manager, uc_client, metadata_manager, data_manager, ctx
+):
+    _vol, f = _make_vol_file(inode_manager, size=5)  # read -> b"hello"
+    metadata_manager.invalidate = MagicMock()
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 3
+    # No fh -> path-based truncate: download, resize, upload immediately.
+    result = await fs.setattr(f.inode, attr, _fields(update_size=True), None, ctx)
+    uc_client.upload_file.assert_awaited_once()
+    assert uc_client.upload_file.call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+    assert result.st_size == 3
+    assert f.attr.st_size == 3
+    metadata_manager.invalidate.assert_called_once_with("/cat/sch/vol/data.txt", is_dir=False)
+
+
+@pytest.mark.trio
+async def test_setattr_truncate_read_only_raises_erofs(fs_ro, inode_manager, ctx):
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 0
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs_ro.setattr(f.inode, attr, _fields(update_size=True), None, ctx)
+    assert exc.value.errno == errno.EROFS
+
+
+@pytest.mark.trio
+async def test_setattr_chmod_chown_noop_updates_inode_only(
+    fs, inode_manager, uc_client, ctx
+):
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    original_type = stat.S_IFMT(f.attr.st_mode)
+    attr = pyfuse3.EntryAttributes()
+    attr.st_mode = stat.S_IFREG | 0o600
+    attr.st_uid = 4242
+    attr.st_gid = 4343
+    result = await fs.setattr(
+        f.inode, attr, _fields(update_mode=True, update_uid=True, update_gid=True),
+        None, ctx,
+    )
+    # No remote calls for metadata-only changes.
+    uc_client.upload_file.assert_not_awaited()
+    # Permission bits applied; file-type bits preserved.
+    assert result.st_mode & 0o777 == 0o600
+    assert stat.S_IFMT(result.st_mode) == original_type
+    assert result.st_uid == 4242
+    assert result.st_gid == 4343
+
+
+@pytest.mark.trio
+async def test_setattr_utimes_noop_updates_mtime(fs, inode_manager, uc_client, ctx):
+    _vol, f = _make_vol_file(inode_manager, size=5)
+    attr = pyfuse3.EntryAttributes()
+    attr.st_mtime_ns = 1_500_000_000 * 10**9
+    result = await fs.setattr(f.inode, attr, _fields(update_mtime=True), None, ctx)
+    uc_client.upload_file.assert_not_awaited()
+    assert result.st_mtime_ns == 1_500_000_000 * 10**9
+
+
+@pytest.mark.trio
+async def test_setattr_missing_inode_raises_enoent(fs, ctx):
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 0
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.setattr(999999, attr, _fields(update_size=True), None, ctx)
+    assert exc.value.errno == errno.ENOENT
