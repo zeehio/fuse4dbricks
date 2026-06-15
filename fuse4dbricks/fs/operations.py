@@ -16,6 +16,7 @@ from fuse4dbricks.api.errors import (
     UcError,
     UcNotFound,
     UcPermissionDenied,
+    UcPreconditionFailed,
     UcRateLimited,
     UcUnavailable,
 )
@@ -102,6 +103,9 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EINVAL) from exc
         if isinstance(exc, UcConflict):
             raise pyfuse3.FUSEError(errno.EEXIST) from exc
+        if isinstance(exc, UcPreconditionFailed):
+            # The file changed under us mid-read: the cached size/mtime is stale.
+            raise pyfuse3.FUSEError(errno.ESTALE) from exc
         if isinstance(exc, (UcRateLimited, UcUnavailable)):
             # transient
             raise pyfuse3.FUSEError(errno.EAGAIN) from exc

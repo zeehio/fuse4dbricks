@@ -412,3 +412,17 @@ def test_move_inode_replaces_existing_destination(manager, dir_entry_attr, file_
 def test_move_inode_missing_inode_raises(manager):
     with pytest.raises(ValueError):
         manager.move_inode(999999, pyfuse3.ROOT_INODE, "x")
+
+
+def test_add_entry_copies_attr_no_aliasing(manager, file_entry_attr):
+    """add_entry must store a COPY of the passed attr: the attr object is often
+    the very instance held in the metadata cache, so an inode-side mutation
+    (e.g. write() bumping st_size) must not leak back into that shared cache."""
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=file_entry_attr)
+
+    # Mutate the inode's attr the way write()/truncate() do.
+    cat.attr.st_size = 999_999
+
+    # The caller's original attr (and thus the shared cache object) is untouched.
+    assert file_entry_attr.st_size != 999_999
+    assert cat.attr is not file_entry_attr

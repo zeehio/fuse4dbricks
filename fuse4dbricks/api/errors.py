@@ -43,3 +43,9 @@ class UcUnavailable(UcError):
 
 class UcBadRequest(UcError):
     pass
+
+
+class UcPreconditionFailed(UcError):
+    """412 Precondition Failed — e.g. the file changed underneath an
+    If-Unmodified-Since read, so the cached view is now stale."""
+    pass

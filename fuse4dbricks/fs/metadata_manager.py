@@ -376,11 +376,14 @@ class MetadataManager:
                     )
                     if cached:
                         return cached
-            # Cache miss after waiting: fall through and do our own lookup
-            # (the leader may have failed). The real lookup below surfaces a
-            # transient error as an exception, mapped to EAGAIN upstream.
+            # Leader recorded neither a positive nor our negative: it failed.
+            # Surface a retryable error rather than running our own lookup —
+            # the leader already owns this coalescer key, so a follower calling
+            # notify_done() could pop a *subsequent* leader's entry and wake its
+            # followers into a thundering herd. Mirrors get_attributes().
+            raise pyfuse3.FUSEError(errno.EAGAIN)
 
-        # 3. Real API Lookup
+        # 3. Real API Lookup (leader only)
         try:
             uc_path = fs_to_uc_path(child_fs_path)
             uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx=ctx)

@@ -5,7 +5,7 @@ Manages the mapping between Linux Inodes and Unity Catalog Paths.
 import logging
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pyfuse3
 
@@ -170,7 +170,11 @@ class InodeManager:
             parent_inode=parent_inode,
             name=name,
             fs_path=fs_path,
-            attr=attr,
+            # Copy: the caller's attr is often the very object held in the
+            # metadata cache. Aliasing it would let an inode-side mutation
+            # (e.g. write() updating st_size) silently corrupt the shared
+            # cache. All fields are scalars, so a shallow replace is a full copy.
+            attr=replace(attr),
         )
         self._inode_map[inode] = entry
         self._path_map[fs_path] = inode
