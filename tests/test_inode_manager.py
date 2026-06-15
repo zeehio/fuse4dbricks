@@ -344,3 +344,71 @@ def test_strict_garbage_collection(manager, file_entry_attr):
     # Should be deleted to save RAM
     assert manager.get_entry(entry.inode) is None
     assert manager.get_inode_by_path("/temp_file") is None
+
+
+# ---------------------------------------------------------------------------
+# move_inode (rename support)
+# ---------------------------------------------------------------------------
+
+
+def test_move_inode_renames_within_same_parent(manager, dir_entry_attr, file_entry_attr):
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=dir_entry_attr)
+    f = manager.add_entry(cat.inode, "old.txt", attr=file_entry_attr)
+
+    moved = manager.move_inode(f.inode, cat.inode, "new.txt")
+
+    assert moved.inode == f.inode
+    assert moved.fs_path == "/cat/new.txt"
+    assert moved.name == "new.txt"
+    assert manager.get_inode_by_path("/cat/old.txt") is None
+    assert manager.get_inode_by_path("/cat/new.txt") == f.inode
+    assert f.inode in manager._children_map[cat.inode]
+
+
+def test_move_inode_reparents_to_other_directory(manager, dir_entry_attr, file_entry_attr):
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=dir_entry_attr)
+    src = manager.add_entry(cat.inode, "src", attr=dir_entry_attr)
+    dst = manager.add_entry(cat.inode, "dst", attr=dir_entry_attr)
+    f = manager.add_entry(src.inode, "data.txt", attr=file_entry_attr)
+
+    manager.move_inode(f.inode, dst.inode, "data.txt")
+
+    assert manager.get_inode_by_path("/cat/src/data.txt") is None
+    assert manager.get_inode_by_path("/cat/dst/data.txt") == f.inode
+    assert manager.get_entry(f.inode).parent_inode == dst.inode
+    assert f.inode not in manager._children_map[src.inode]
+    assert f.inode in manager._children_map[dst.inode]
+
+
+def test_move_inode_rebuilds_descendant_paths(manager, dir_entry_attr, file_entry_attr):
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=dir_entry_attr)
+    d = manager.add_entry(cat.inode, "dir", attr=dir_entry_attr)
+    sub = manager.add_entry(d.inode, "sub", attr=dir_entry_attr)
+    leaf = manager.add_entry(sub.inode, "leaf.txt", attr=file_entry_attr)
+
+    manager.move_inode(d.inode, cat.inode, "renamed")
+
+    # The whole subtree's fs_paths follow the moved directory.
+    assert manager.get_entry(d.inode).fs_path == "/cat/renamed"
+    assert manager.get_entry(sub.inode).fs_path == "/cat/renamed/sub"
+    assert manager.get_entry(leaf.inode).fs_path == "/cat/renamed/sub/leaf.txt"
+    assert manager.get_inode_by_path("/cat/renamed/sub/leaf.txt") == leaf.inode
+    assert manager.get_inode_by_path("/cat/dir/sub/leaf.txt") is None
+
+
+def test_move_inode_replaces_existing_destination(manager, dir_entry_attr, file_entry_attr):
+    cat = manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=dir_entry_attr)
+    src = manager.add_entry(cat.inode, "src.txt", attr=file_entry_attr)
+    dst = manager.add_entry(cat.inode, "dst.txt", attr=file_entry_attr)
+
+    manager.move_inode(src.inode, cat.inode, "dst.txt")
+
+    # The destination path now points at the source inode; the old dst inode
+    # was pruned (ref_count 0).
+    assert manager.get_inode_by_path("/cat/dst.txt") == src.inode
+    assert manager.get_entry(dst.inode) is None
+
+
+def test_move_inode_missing_inode_raises(manager):
+    with pytest.raises(ValueError):
+        manager.move_inode(999999, pyfuse3.ROOT_INODE, "x")
