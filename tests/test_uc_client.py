@@ -6,8 +6,15 @@ import pytest
 
 import pyfuse3
 
-from fuse4dbricks.api.uc_client import UnityCatalogClient
-from fuse4dbricks.api.errors import UcBadRequest, UcError, UcNotFound, UcRateLimited, UcUnavailable
+from fuse4dbricks.api.uc_client import UnityCatalogClient, _parse_retry_after
+from fuse4dbricks.api.errors import (
+    UcBadRequest,
+    UcError,
+    UcNotFound,
+    UcPreconditionFailed,
+    UcRateLimited,
+    UcUnavailable,
+)
 
 # --- FIXTURES ---
 
@@ -146,7 +153,8 @@ async def test_download_chunk_stream_headers(client):
 
 @pytest.mark.trio
 async def test_download_chunk_stream_412_precondition_failed(client):
-    """Verify that if the file changed (412), it raises a UcError."""
+    """If the file changed under the If-Unmodified-Since read (412), raise the
+    specific UcPreconditionFailed so it can be mapped to ESTALE upstream."""
     mock_response = AsyncMock(spec=httpx.Response)
     mock_response.status_code = 412
 
@@ -161,7 +169,7 @@ async def test_download_chunk_stream_412_precondition_failed(client):
     client.client.send.return_value = mock_response
 
     ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
-    with pytest.raises(UcError) as excinfo:
+    with pytest.raises(UcPreconditionFailed) as excinfo:
         async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx=ctx):
             pass
 
@@ -447,3 +455,82 @@ async def test_create_directory_parent_is_file_raises_ucbadrequest(client):
     ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
     with pytest.raises(UcBadRequest):
         await client.create_directory("/Volumes/cat/sch/vol/file.txt/subdir", ctx=ctx)
+
+# --- TESTS: Retry-After parsing (both RFC 7231 forms) ---
+
+
+def test_parse_retry_after_seconds():
+    assert _parse_retry_after("120") == 120.0
+    assert _parse_retry_after("  5 ") == 5.0
+
+
+def test_parse_retry_after_http_date():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=100)
+    val = _parse_retry_after(format_datetime(future, usegmt=True))
+    assert val is not None
+    # ~100s from now, allowing for the small elapsed time during the test.
+    assert 90.0 <= val <= 100.0
+
+
+def test_parse_retry_after_past_date_clamps_to_zero():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    past = datetime.now(timezone.utc) - timedelta(seconds=100)
+    assert _parse_retry_after(format_datetime(past, usegmt=True)) == 0.0
+
+
+def test_parse_retry_after_unparseable_returns_none():
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
+    assert _parse_retry_after("not-a-date") is None
+
+
+# --- TESTS: upload_file token refresh on 401 ---
+
+
+@pytest.mark.trio
+async def test_upload_file_refreshes_token_on_401(client, mock_auth_provider, tmp_path, monkeypatch):
+    """An expired token during the SDK upload (which bypasses _request's 401
+    flow) must be invalidated, re-resolved and retried once with a fresh token."""
+    from databricks.sdk.errors.platform import Unauthenticated
+
+    mock_auth_provider.get_access_token = AsyncMock(side_effect=["stale", "fresh"])
+    mock_auth_provider.invalidate_access_token = MagicMock()
+
+    seen_tokens = []
+
+    class _FakeConfig:
+        def __init__(self, host=None, token=None):
+            self.host = host
+            self.token = token
+
+    class _FakeFiles:
+        def __init__(self, token):
+            self._token = token
+
+        def upload(self, file_path, contents, overwrite):
+            # The stale token is rejected; the refreshed one succeeds.
+            if self._token == "stale":
+                raise Unauthenticated("token expired")
+
+    class _FakeWorkspaceClient:
+        def __init__(self, config=None):
+            seen_tokens.append(config.token)
+            self.files = _FakeFiles(config.token)
+
+    monkeypatch.setattr("databricks.sdk.config.Config", _FakeConfig)
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", _FakeWorkspaceClient)
+
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"data")
+    ctx = pyfuse3.RequestContext(uid=0, pid=1, gid=0)
+
+    await client.upload_file("/Volumes/c/s/v/payload.bin", str(local), ctx=ctx)
+
+    assert seen_tokens == ["stale", "fresh"]
+    mock_auth_provider.invalidate_access_token.assert_called_once()
+    assert mock_auth_provider.get_access_token.await_count == 2

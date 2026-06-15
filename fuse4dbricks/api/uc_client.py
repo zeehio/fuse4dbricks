@@ -8,6 +8,7 @@ import os
 import random
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from enum import Enum
 from typing import AsyncGenerator
@@ -22,6 +23,7 @@ from fuse4dbricks.api.errors import (
     UcError,
     UcNotFound,
     UcPermissionDenied,
+    UcPreconditionFailed,
     UcRateLimited,
     UcUnavailable,
 )
@@ -45,6 +47,12 @@ try:
 except ImportError:
     _SDK_TRANSIENT_ERRORS = ()
 
+try:
+    from databricks.sdk.errors.platform import Unauthenticated as _SdkUnauthenticated
+    _SDK_AUTH_ERRORS: tuple = (_SdkUnauthenticated,)
+except ImportError:
+    _SDK_AUTH_ERRORS = ()
+
 # Transient failures are retried with exponential backoff and jitter:
 # 429 (rate limited), 5xx (server unavailable) and connection-level errors.
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -54,14 +62,31 @@ _BACKOFF_CAP_S = 20.0
 
 
 def _parse_retry_after(value: str | None) -> float | None:
-    """Parse a Retry-After header expressed as a number of seconds."""
+    """Parse a Retry-After header into seconds-from-now.
+
+    Per RFC 7231 the header is either a non-negative integer number of seconds
+    or an HTTP date. Both forms are honored; the date form is converted to a
+    delay relative to now (clamped at 0). Returns None if unparseable.
+    """
     if not value:
         return None
+    value = value.strip()
     try:
         return float(value)
     except ValueError:
-        # Retry-After may also be an HTTP date; we don't honor that form.
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
         return None
+    if when is None:
+        return None
+    # parsedate_to_datetime may return a naive datetime for a malformed zone;
+    # assume UTC in that case so the subtraction is well-defined.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delay = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, delay)
 
 
 def _backoff_delay(attempt: int, retry_after_s: float | None) -> float:
@@ -184,14 +209,13 @@ class UnityCatalogClient:
         if resp.status_code == 400:
             raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
 
+        if resp.status_code == 412:
+            # Precondition failed: the file changed under an If-Unmodified-Since
+            # read, so the caller's cached size/mtime view is stale.
+            raise UcPreconditionFailed(msg, status_code=412, uc_path=uc_path, url=url, request_id=request_id)
+
         if resp.status_code == 429:
-            ra = resp.headers.get("retry-after")
-            retry_after_s = None
-            if ra:
-                try:
-                    retry_after_s = float(ra)
-                except ValueError:
-                    pass
+            retry_after_s = _parse_retry_after(resp.headers.get("retry-after"))
             raise UcRateLimited(msg, status_code=429, uc_path=uc_path, url=url, request_id=request_id, retry_after_s=retry_after_s)
 
         if resp.status_code in (500, 502, 503, 504):
@@ -637,10 +661,9 @@ class UnityCatalogClient:
         files above the SDK's internal threshold (>5 GB). WorkspaceClient is
         cheap to construct: it makes no API calls at instantiation time.
         """
-        token = await self.auth_provider.get_access_token(ctx=ctx)
         base_url = self.base_url
 
-        async def _attempt():
+        async def _upload_with_token(token: str):
             def _do_upload():
                 from databricks.sdk import WorkspaceClient
                 from databricks.sdk.config import Config
@@ -648,6 +671,19 @@ class UnityCatalogClient:
                 with open(local_path, "rb") as f:
                     w.files.upload(file_path=uc_path, contents=f, overwrite=overwrite)
             await trio.to_thread.run_sync(_do_upload)
+
+        async def _attempt():
+            # Resolve the token inside the attempt so a refresh takes effect on
+            # retry. The SDK path doesn't go through _request's 401 handling, so
+            # mirror it here: on an expired token, invalidate, re-resolve, retry
+            # once. (Genuine 403s surface as PermissionDenied and propagate.)
+            token = await self.auth_provider.get_access_token(ctx=ctx)
+            try:
+                await _upload_with_token(token)
+            except _SDK_AUTH_ERRORS:
+                self.auth_provider.invalidate_access_token(ctx=ctx)
+                fresh = await self.auth_provider.get_access_token(ctx=ctx)
+                await _upload_with_token(fresh)
 
         await self._with_retry(_attempt, uc_path=uc_path)
 

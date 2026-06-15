@@ -28,6 +28,7 @@ from fuse4dbricks.api.errors import (
     UcError,
     UcNotFound,
     UcPermissionDenied,
+    UcPreconditionFailed,
     UcRateLimited,
     UcUnavailable,
 )
@@ -208,6 +209,12 @@ def test_raise_fuse_error_conflict(fs):
     with pytest.raises(pyfuse3.FUSEError) as exc_info:
         fs._raise_fuse_error(UcConflict("conflict"))
     assert exc_info.value.errno == errno.EEXIST
+
+
+def test_raise_fuse_error_precondition_failed(fs):
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        fs._raise_fuse_error(UcPreconditionFailed("changed under us", status_code=412))
+    assert exc_info.value.errno == errno.ESTALE
 
 
 def test_raise_fuse_error_rate_limited(fs):
