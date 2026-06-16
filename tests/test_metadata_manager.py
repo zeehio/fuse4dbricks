@@ -623,6 +623,25 @@ async def test_get_attributes_follower_miss_raises_eagain(manager, ctx):
 
 
 @pytest.mark.trio
+async def test_lookup_child_follower_miss_raises_eagain(manager, mock_uc_client, ctx):
+    """A lookup_child follower that wakes to neither a positive nor a negative
+    means the leader failed: surface EAGAIN instead of running its own lookup
+    (which would wrongly notify_done on a coalescer key it doesn't own and could
+    stampede a subsequent leader's followers)."""
+    parent = _make_entry("/cat/sch/vol", is_dir=True)
+    child_fs_path = "/cat/sch/vol/x.txt"
+    done = trio.Event()
+    done.set()
+    manager._attr_coalescer._inflight[child_fs_path] = done
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await manager.lookup_child(parent, "x.txt", ctx)
+    assert exc_info.value.errno == errno.EAGAIN
+    # The follower must not have performed its own API lookup.
+    mock_uc_client.get_path_metadata.assert_not_awaited()
+
+
+@pytest.mark.trio
 async def test_list_directory_clears_listing_principals_negative(manager, mock_uc_client, ctx):
     """Listing a directory must clear the requesting principal's stale negative
     for a listed child, so `ls` and a subsequent `stat` agree."""

@@ -1,5 +1,59 @@
-# Unreleased
+# 0.7.0 (2026-06-16)
 
+- Fix files written from a Windows application through WSL being uploaded at
+  the correct size but filled with zeros. A path-based `setattr(size)` (which
+  WSL's 9P layer emits instead of an `ftruncate` carrying the handle) now
+  resizes the open writer's buffer instead of reading the not-yet-uploaded
+  remote object. A short read while preserving bytes in a true path-based
+  truncate now fails with `EIO` instead of silently zero-filling.
+- Add `--single-principal`: use one Databricks identity for every request
+  regardless of the requesting uid, resolving the token from the fuse4dbricks
+  process's own credentials (its environment and the launching user's
+  `~/.databrickscfg`) or from a token written to `.auth`. Intended for
+  single-user machines; combine with `--allow-other` so a request carrying an
+  undocumented uid (e.g. the Windows file explorer over WSL) is served by the
+  one token without fuse4dbricks needing root to read the requesting process.
+- Add `--securable-allowlist` and `--securable-denylist` to restrict which
+  Unity Catalog securables are listable and accessible. Each takes a
+  comma-separated list of dotted securables (`catalog`, `catalog.schema` or
+  `catalog.schema.volume`). A denylist hides the listed securables and
+  everything beneath them; an allowlist exposes only the listed securables
+  (their parent catalog/schema stay navigable). Deny wins when both are given.
+  This is a mount-wide visibility filter, not a per-user boundary, and does not
+  replace Unity Catalog's own permission checks.
+- Implement `rename` and `setattr`. Files can be moved/renamed (via
+  copy-then-delete, since the Files API has no server-side move) and truncated;
+  directory rename returns `EXDEV` so `mv` falls back to a recursive copy.
+  `chmod`/`chown`/`utimes` are accepted as no-ops (Unity Catalog has no POSIX
+  metadata) so tools such as `tar` and `cp -p` don't fail.
+- Implement `statfs` so `df` works and tools that pre-check free space before
+  writing succeed. A large synthetic capacity is reported (Unity Catalog
+  exposes no quota), with zero availability on a `--read-only` mount.
+- Fix silent data loss on writes: opening a file `O_WRONLY` without `O_TRUNC`
+  now pre-loads the existing content so untouched bytes are preserved, and
+  small buffered writes are flushed before upload (they could previously be
+  uploaded as zero bytes).
+- Security: validate that the default `~/.databrickscfg` is a regular file
+  owned by the requesting uid, the same way the env-supplied config path is
+  already checked. Prevents a symlink planted by one user (under `--allow-other`
+  + root) from making root read and cache another user's token.
+- Fix `create` not incrementing the kernel lookup count: it returns an entry
+  the kernel will later `forget`, so the new inode could be freed while still
+  referenced.
+- Map a 412 (the file changed under an `If-Unmodified-Since` read) to `ESTALE`
+  instead of `EIO`, so a mid-read modification is reported accurately.
+- Honor the HTTP-date form of the `Retry-After` header (previously only the
+  integer-seconds form was used).
+- Refresh the access token on a 401 during an SDK file upload; the upload path
+  bypassed the request-layer 401 retry and so failed permanently on an expired
+  token.
+- Don't let an inode-side `st_size` mutation (from a write or truncate) corrupt
+  the shared metadata cache: `add_entry` now stores a copy of the attributes.
+- A coalescing `lookup_child` follower that wakes to a cache miss now surfaces a
+  retryable `EAGAIN` instead of running its own lookup and notifying a coalescer
+  key it does not own.
+- Performance: stop running a blocking `os.makedirs` on every chunk read; cache
+  shard directories are created only on the write path, off the event loop.
 - Security: A user could use DATABRICKS_CONFIG_PROFILE to make fuse4dbricks read any user profile if it ran as root.
 - Retry transient API failures (429 rate limits, 5xx server errors and
   connection errors) with exponential backoff and jitter, honoring the

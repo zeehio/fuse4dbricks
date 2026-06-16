@@ -225,18 +225,22 @@ class MetadataManager:
     async def check_access(self, entry: InodeEntry, mode: int, ctx) -> bool:
         #R_OK = 4
         W_OK = 2
-        if (mode & W_OK):
-            logger.error("Write access not supported")
-            raise pyfuse3.FUSEError(errno.EACCES)
         (securable, securable_type) = fs_to_securable(entry.fs_path)
         if securable == "":
             return True
         if securable_type == "catalog":
+            if (mode & W_OK):
+                raise pyfuse3.FUSEError(errno.EACCES)
             req_privileges = ["USE_CATALOG"]
         elif securable_type == "schema":
+            if (mode & W_OK):
+                raise pyfuse3.FUSEError(errno.EACCES)
             req_privileges = ["USE_SCHEMA"]
         elif securable_type == "volume":
-            req_privileges = ["READ_VOLUME"]
+            if (mode & W_OK):
+                req_privileges = ["READ_VOLUME", "WRITE_VOLUME"]
+            else:
+                req_privileges = ["READ_VOLUME"]
         else:
             logger.error(f"Unexpected securable type for path {entry.fs_path}")
             raise pyfuse3.FUSEError(errno.EACCES)
@@ -372,11 +376,14 @@ class MetadataManager:
                     )
                     if cached:
                         return cached
-            # Cache miss after waiting: fall through and do our own lookup
-            # (the leader may have failed). The real lookup below surfaces a
-            # transient error as an exception, mapped to EAGAIN upstream.
+            # Leader recorded neither a positive nor our negative: it failed.
+            # Surface a retryable error rather than running our own lookup —
+            # the leader already owns this coalescer key, so a follower calling
+            # notify_done() could pop a *subsequent* leader's entry and wake its
+            # followers into a thundering herd. Mirrors get_attributes().
+            raise pyfuse3.FUSEError(errno.EAGAIN)
 
-        # 3. Real API Lookup
+        # 3. Real API Lookup (leader only)
         try:
             uc_path = fs_to_uc_path(child_fs_path)
             uc_entry = await self.uc_client.get_path_metadata(uc_path, ctx=ctx)

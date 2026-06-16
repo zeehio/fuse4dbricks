@@ -44,17 +44,31 @@ class DiskPersistence:
         nursery.start_soon(self._background_maintenance)
 
     def _get_chunk_path(self, fs_path: str, chunk_index: int, mtime: float) -> str:
-        """Determines path with 256-shard distribution based on chunk key."""
+        """Compute the cache path for a chunk (256-shard distribution).
+
+        Pure: does NOT touch the filesystem. ``retrieve_chunk`` runs on every
+        read (cache hits included), so creating the shard dir here meant a
+        blocking ``os.makedirs`` syscall in the async hot path plus empty dirs
+        for chunks that are never written. Directory creation now lives on the
+        write path only (see ``store_chunk_from_stream`` /
+        ``_ensure_parent_dir``); a read of a missing chunk simply hits
+        FileNotFoundError and returns None.
+        """
         sha256_hash = hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
         shard1 = sha256_hash[:2]
         shard2 = f"{(chunk_index // 1000):07d}"  # Secondary shard to prevent too many files in one dir
         shard_dir = os.path.join(self.cache_dir, shard1, shard2)
-        os.makedirs(shard_dir, exist_ok=True)
         mtime_ms = int(mtime * 1000)
         # the cache_path
         return os.path.join(
             shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin"
         )
+
+    @staticmethod
+    def _ensure_parent_dir(path: str) -> None:
+        """Create the parent directory of ``path`` (idempotent). Runs off the
+        event loop via ``trio.to_thread`` from the write path."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
     async def _graceful_init(self):
         """Non-blocking cache discovery."""
@@ -134,6 +148,10 @@ class DiskPersistence:
         result = bytearray()
         bytes_written = 0
         try:
+            # The shard dir is created lazily here (off-thread), only when we
+            # actually write a chunk — not on every read in _get_chunk_path.
+            await trio.to_thread.run_sync(self._ensure_parent_dir, cache_path)
+
             # Write to .tmp (No lock needed)
             async with await trio.open_file(temp_path, "wb") as f:
                 async for chunk in stream:

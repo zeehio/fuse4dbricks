@@ -14,6 +14,7 @@ from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
+from fuse4dbricks.fs.securable_filter import SecurableFilter
 from fuse4dbricks.auth.provider import AuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
@@ -53,6 +54,18 @@ def parse_args():
     )
     parser.add_argument("--no-unified-auth", action="store_false", dest="unified_auth",
         help="Disable Databricks Unified Authentication; users must provide a token manually"
+    )
+    parser.add_argument("--single-principal", action="store_true",
+        help=(
+            "Use one Databricks identity for every request regardless of the "
+            "requesting user. The token is resolved from this process's own "
+            "credentials (its environment plus the launching user's "
+            "~/.databrickscfg) or from a token written to .auth. Intended for "
+            "single-user machines; combine with --allow-other so a request "
+            "carrying a different/undocumented uid (e.g. Windows Explorer over "
+            "WSL) is served by the one token without needing root to read its "
+            "environment."
+        ),
     )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
@@ -100,6 +113,25 @@ def parse_args():
         help="Maximum number of metadata cache entries",
     )
     parser.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--read-only", action="store_true",
+        help="Disallow all writes to Unity Catalog volumes (token writes to .auth still work)",
+    )
+    parser.add_argument(
+        "--securable-allowlist", default="",
+        help=(
+            "Comma-separated securables (e.g. cat.schema.vol1,cat.schema2) that "
+            "are the ONLY ones listable/accessible; ancestors stay navigable. "
+            "Empty means all are allowed."
+        ),
+    )
+    parser.add_argument(
+        "--securable-denylist", default="",
+        help=(
+            "Comma-separated securables that are hidden and inaccessible. "
+            "Deny wins over the allowlist."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -160,6 +192,14 @@ async def async_main():
     os.chmod(auth_cache_dir, mode=0o700)
     os.makedirs(data_cache_dir, exist_ok=True, mode=0o700)
     os.chmod(data_cache_dir, mode=0o700)
+    writes_dir = os.path.join(root_cache_dir, "writes")
+    os.makedirs(writes_dir, exist_ok=True, mode=0o700)
+    os.chmod(writes_dir, mode=0o700)
+    for _fname in os.listdir(writes_dir):
+        try:
+            os.unlink(os.path.join(writes_dir, _fname))
+        except OSError:
+            pass
 
     if args.workspace != "":
         workspace = args.workspace
@@ -171,7 +211,11 @@ async def async_main():
 
     # Auth
     logging.info(f"Initializing Authentication... with {args.unified_auth=}")
-    auth_provider: AuthProvider = AuthProvider(unified_auth=args.unified_auth)
+    auth_provider: AuthProvider = AuthProvider(
+        unified_auth=args.unified_auth, single_principal=args.single_principal
+    )
+    if args.single_principal:
+        logging.info("Single-principal mode: one Databricks identity serves all requests")
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
@@ -183,7 +227,25 @@ async def async_main():
     # different principal); drop the cached principal so authz re-derives it.
     auth_provider.set_token_invalidation_callback(metadata_manager.forget_principal)
     auth_manager = AuthManager(uc_client, auth_provider, metadata_manager, workspace=workspace)
-    operations = UnityCatalogFS(inode_manager, metadata_manager, data_manager, auth_manager)
+
+    def _split_csv(value: str) -> list[str]:
+        return [s.strip() for s in value.split(",") if s.strip()]
+
+    securable_filter = SecurableFilter(
+        allowlist=_split_csv(args.securable_allowlist),
+        denylist=_split_csv(args.securable_denylist),
+    )
+    if securable_filter.is_active:
+        logging.info(
+            "Securable filtering active (allowlist=%r, denylist=%r)",
+            _split_csv(args.securable_allowlist),
+            _split_csv(args.securable_denylist),
+        )
+    operations = UnityCatalogFS(
+        inode_manager, metadata_manager, data_manager, auth_manager,
+        uc_client=uc_client, writes_dir=writes_dir, read_only=args.read_only,
+        securable_filter=securable_filter,
+    )
     stopped_evt = trio.Event()
     try:
         async with trio.open_nursery() as nursery:
