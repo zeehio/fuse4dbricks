@@ -1448,3 +1448,34 @@ async def test_setattr_missing_inode_raises_enoent(fs, ctx):
     with pytest.raises(pyfuse3.FUSEError) as exc:
         await fs.setattr(999999, attr, _fields(update_size=True), None, ctx)
     assert exc.value.errno == errno.ENOENT
+
+
+# ---------------------------------------------------------------------------
+# statfs (df)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_statfs_reports_synthetic_capacity(fs, ctx):
+    st = await fs.statfs(ctx)
+    assert st.f_bsize == 4096
+    assert st.f_frsize == 4096
+    assert st.f_namemax == 255
+    # Large synthetic total, fully available on a writable mount.
+    assert st.f_blocks > 0
+    assert st.f_bavail == st.f_blocks
+    assert st.f_bfree == st.f_blocks
+    assert st.f_files > 0
+    assert st.f_favail == st.f_files
+    assert st.f_ffree == st.f_files
+
+
+@pytest.mark.trio
+async def test_statfs_read_only_reports_zero_availability(fs_ro, ctx):
+    st = await fs_ro.statfs(ctx)
+    # Total size still shows, but nothing is available to write.
+    assert st.f_blocks > 0
+    assert st.f_bavail == 0
+    assert st.f_bfree == 0
+    assert st.f_favail == 0
+    assert st.f_ffree == 0
