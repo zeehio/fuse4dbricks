@@ -38,6 +38,16 @@ _O_TRUNC = 0o1000  # 512
 _R_OK = 4
 _W_OK = 2
 
+# Synthetic filesystem capacity reported by statfs(). Unity Catalog volumes
+# expose no quota or free-space figure via the Files API, so — like other
+# object-store FUSE drivers (s3fs, gcsfuse, rclone) — we advertise a large
+# fixed capacity. This makes `df` work and lets tools that pre-check free
+# space before writing proceed.
+_STATFS_BLOCK_SIZE = 4096
+_STATFS_TOTAL_BLOCKS = (1 << 50) // _STATFS_BLOCK_SIZE  # ~1 PiB total
+_STATFS_TOTAL_INODES = 1 << 32
+_STATFS_NAME_MAX = 255
+
 
 class UnityCatalogFS(pyfuse3.Operations):
     def __init__(
@@ -854,6 +864,25 @@ class UnityCatalogFS(pyfuse3.Operations):
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:
             self.inodes.forget(inode, nlookup)
+
+    async def statfs(self, ctx: pyfuse3.RequestContext) -> pyfuse3.StatvfsData:
+        # Unity Catalog has no capacity API, so report a large synthetic volume
+        # (see _STATFS_* constants) so `df` works and free-space pre-checks
+        # pass. On a read-only mount, advertise zero availability so writes are
+        # clearly unavailable while the total size still shows.
+        stat = pyfuse3.StatvfsData()
+        stat.f_bsize = _STATFS_BLOCK_SIZE
+        stat.f_frsize = _STATFS_BLOCK_SIZE
+        stat.f_blocks = _STATFS_TOTAL_BLOCKS
+        stat.f_files = _STATFS_TOTAL_INODES
+        free_blocks = 0 if self._read_only else _STATFS_TOTAL_BLOCKS
+        free_inodes = 0 if self._read_only else _STATFS_TOTAL_INODES
+        stat.f_bfree = free_blocks
+        stat.f_bavail = free_blocks
+        stat.f_ffree = free_inodes
+        stat.f_favail = free_inodes
+        stat.f_namemax = _STATFS_NAME_MAX
+        return stat
 
     def _entry_to_fuse_attr(self, entry: InodeEntry) -> pyfuse3.EntryAttributes:
         attr = pyfuse3.EntryAttributes()

@@ -228,6 +228,25 @@ def test_stat_nonexistent_raises_enoent(mountpoint):
 
 
 @requires_live_mount
+def test_statfs_and_df(mountpoint):
+    # Exercises statfs: without it, statvfs/df fail with ENOSYS. We report a
+    # synthetic capacity, so a writable mount shows space available.
+    st = os.statvfs(mountpoint)
+    assert st.f_bsize > 0
+    assert st.f_blocks > 0
+    assert st.f_bavail > 0  # writable mount -> space available
+    # The `df` tool itself must succeed against the mount.
+    result = subprocess.run(
+        ["df", str(mountpoint)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@requires_live_mount
 @pytest.mark.skipif(not TEST_FILE_REL, reason="FUSE4DBRICKS_TEST_FILE not set")
 def test_read_known_file_matches_size(mountpoint):
     # Exercises read -> data_manager -> uc_client.download_chunk_stream end to end.
