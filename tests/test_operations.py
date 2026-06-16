@@ -34,6 +34,7 @@ from fuse4dbricks.api.errors import (
 )
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr, InodeManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
+from fuse4dbricks.fs.securable_filter import SecurableFilter
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +152,24 @@ def fs_ro(inode_manager, metadata_manager, data_manager, auth_manager, uc_client
         writes_dir=writes_dir,
         read_only=True,
     )
+
+
+@pytest.fixture
+def fs_builder(inode_manager, metadata_manager, data_manager, auth_manager, uc_client, writes_dir):
+    """Build a UnityCatalogFS with a custom securable_filter, sharing the
+    standard manager fixtures (so inode tree / mocks line up with other tests)."""
+    def _build(securable_filter=None, read_only=False):
+        return UnityCatalogFS(
+            inode_manager=inode_manager,
+            metadata_manager=metadata_manager,
+            data_manager=data_manager,
+            auth_manager=auth_manager,
+            uc_client=uc_client,
+            writes_dir=writes_dir,
+            read_only=read_only,
+            securable_filter=securable_filter,
+        )
+    return _build
 
 
 # ---------------------------------------------------------------------------
@@ -1479,3 +1498,139 @@ async def test_statfs_read_only_reports_zero_availability(fs_ro, ctx):
     assert st.f_bfree == 0
     assert st.f_favail == 0
     assert st.f_ffree == 0
+
+
+# ---------------------------------------------------------------------------
+# securable allow/deny filtering
+# ---------------------------------------------------------------------------
+
+
+def _make_cat_sch(inode_manager):
+    """Build /cat/sch and return (cat, sch) entries."""
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    return cat, sch
+
+
+@pytest.mark.trio
+async def test_lookup_denied_securable_raises_enoent(fs_builder, inode_manager, ctx):
+    fs = fs_builder(SecurableFilter(denylist=["cat.sch.vol"]))
+    _cat, sch = _make_cat_sch(inode_manager)
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.lookup(sch.inode, b"vol", ctx)
+    assert exc.value.errno == errno.ENOENT
+
+
+@pytest.mark.trio
+async def test_lookup_allowlist_blocks_off_chain_but_permits_target(
+    fs_builder, inode_manager, metadata_manager, ctx
+):
+    fs = fs_builder(SecurableFilter(allowlist=["cat.sch.vol"]))
+    _cat, sch = _make_cat_sch(inode_manager)
+
+    # Sibling off the allowed chain is hidden.
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.lookup(sch.inode, b"other_vol", ctx)
+    assert exc.value.errno == errno.ENOENT
+
+    # The allowlisted target resolves normally (lookup_child mock returns a file).
+    attr = await fs.lookup(sch.inode, b"vol", ctx)
+    assert attr is not None
+
+
+@pytest.mark.trio
+async def test_readdir_filters_denied_children(
+    fs_builder, inode_manager, metadata_manager, ctx, monkeypatch
+):
+    fs = fs_builder(SecurableFilter(denylist=["cat.sch.deny_vol"]))
+    _cat, sch = _make_cat_sch(inode_manager)
+    metadata_manager.list_directory = AsyncMock(return_value={
+        "ok_vol": _make_attr(True),
+        "deny_vol": _make_attr(True),
+    })
+    calls = _capture_readdir_replies(monkeypatch)
+
+    fh = await fs.opendir(sch.inode, ctx)
+    await fs.readdir(fh, 0, token=object())
+
+    names = [name for name, _next in calls]
+    assert b"ok_vol" in names
+    assert b"deny_vol" not in names
+
+
+@pytest.mark.trio
+async def test_readdir_allowlist_shows_only_on_chain(
+    fs_builder, inode_manager, metadata_manager, ctx, monkeypatch
+):
+    fs = fs_builder(SecurableFilter(allowlist=["cat.sch.vol"]))
+    _cat, sch = _make_cat_sch(inode_manager)
+    metadata_manager.list_directory = AsyncMock(return_value={
+        "vol": _make_attr(True),
+        "other_vol": _make_attr(True),
+    })
+    calls = _capture_readdir_replies(monkeypatch)
+
+    fh = await fs.opendir(sch.inode, ctx)
+    await fs.readdir(fh, 0, token=object())
+
+    names = [name for name, _next in calls]
+    assert b"vol" in names
+    assert b"other_vol" not in names
+
+
+@pytest.mark.trio
+async def test_create_denied_path_raises_eacces(
+    fs_builder, inode_manager, uc_client, ctx
+):
+    fs = fs_builder(SecurableFilter(denylist=["cat.sch.vol.secret"]))
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.create(vol.inode, b"secret", 0o644, 0, ctx)
+    assert exc.value.errno == errno.EACCES
+
+    # A non-denied sibling still creates fine.
+    file_info, _attrs = await fs.create(vol.inode, b"ok.txt", 0o644, 0, ctx)
+    assert int(file_info.fh) in fs._open_state
+
+
+@pytest.mark.trio
+async def test_mkdir_denied_path_raises_eacces(
+    fs_builder, inode_manager, uc_client, ctx
+):
+    fs = fs_builder(SecurableFilter(denylist=["cat.sch.vol.private"]))
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.mkdir(vol.inode, b"private", 0o755, ctx)
+    assert exc.value.errno == errno.EACCES
+    uc_client.create_directory.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_rename_into_denied_path_raises_eacces(
+    fs_builder, inode_manager, uc_client, metadata_manager, ctx
+):
+    fs = fs_builder(SecurableFilter(denylist=["cat.sch.vol.locked"]))
+    cat = inode_manager.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inode_manager.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inode_manager.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    inode_manager.add_entry(vol.inode, "data.txt", attr=_make_attr(False, size=5))
+
+    with pytest.raises(pyfuse3.FUSEError) as exc:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"locked", 0, ctx)
+    assert exc.value.errno == errno.EACCES
+    uc_client.upload_file.assert_not_awaited()
+
+
+@pytest.mark.trio
+async def test_no_filter_is_permissive(fs_builder, inode_manager, ctx):
+    # No securable_filter -> default permissive -> lookup behaves normally.
+    fs = fs_builder(None)
+    _cat, sch = _make_cat_sch(inode_manager)
+    attr = await fs.lookup(sch.inode, b"vol", ctx)
+    assert attr is not None

@@ -14,6 +14,7 @@ from fuse4dbricks.fs.inode_manager import InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
 from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.operations import UnityCatalogFS
+from fuse4dbricks.fs.securable_filter import SecurableFilter
 from fuse4dbricks.auth.provider import AuthProvider
 from fuse4dbricks.storage.persistence import DiskPersistence, clear_cache
 
@@ -103,6 +104,21 @@ def parse_args():
     parser.add_argument(
         "--read-only", action="store_true",
         help="Disallow all writes to Unity Catalog volumes (token writes to .auth still work)",
+    )
+    parser.add_argument(
+        "--securable-allowlist", default="",
+        help=(
+            "Comma-separated securables (e.g. cat.schema.vol1,cat.schema2) that "
+            "are the ONLY ones listable/accessible; ancestors stay navigable. "
+            "Empty means all are allowed."
+        ),
+    )
+    parser.add_argument(
+        "--securable-denylist", default="",
+        help=(
+            "Comma-separated securables that are hidden and inaccessible. "
+            "Deny wins over the allowlist."
+        ),
     )
     return parser.parse_args()
 
@@ -195,9 +211,24 @@ async def async_main():
     # different principal); drop the cached principal so authz re-derives it.
     auth_provider.set_token_invalidation_callback(metadata_manager.forget_principal)
     auth_manager = AuthManager(uc_client, auth_provider, metadata_manager, workspace=workspace)
+
+    def _split_csv(value: str) -> list[str]:
+        return [s.strip() for s in value.split(",") if s.strip()]
+
+    securable_filter = SecurableFilter(
+        allowlist=_split_csv(args.securable_allowlist),
+        denylist=_split_csv(args.securable_denylist),
+    )
+    if securable_filter.is_active:
+        logging.info(
+            "Securable filtering active (allowlist=%r, denylist=%r)",
+            _split_csv(args.securable_allowlist),
+            _split_csv(args.securable_denylist),
+        )
     operations = UnityCatalogFS(
         inode_manager, metadata_manager, data_manager, auth_manager,
         uc_client=uc_client, writes_dir=writes_dir, read_only=args.read_only,
+        securable_filter=securable_filter,
     )
     stopped_evt = trio.Event()
     try:
