@@ -29,6 +29,8 @@ personal access token to a virtual file:
 If fuse (`/etc/fuse.conf`) has `user_allow_other` activated, this driver supports the `--allow-other`,
 option so **multiple users** can access it. In this case, the fuse4dbricks process should run from a root account, who should have exclusive access to `--disk-cache-dir`. fuse4dbricks will inspect the environment variables of the requesting process, as well as the requesting user, in order to find the access credentials. This may require reading the `.databrickscfg` file from the requesting user. The cache is shared among all users in this scenario.
 
+On a **single-user machine** you can instead pass `--single-principal`, so one Databricks identity serves every request regardless of the requesting uid. The token is resolved from the fuse4dbricks process's own credentials (its environment and the launching user's `~/.databrickscfg`) or from a token written to `.auth` — never from the requesting process. This is especially useful under WSL: combine `--single-principal` with `--allow-other` so the Windows file explorer (whose requests arrive with an undocumented uid) can browse the mount using that single token, without fuse4dbricks needing root to inspect each requesting process.
+
 When an access token is missing, revoked or expired, the unity catalog is not accessible anymore and only
 a virtual `/Volumes/README.txt` file appears, with instructions on how to add the access token manually.
 

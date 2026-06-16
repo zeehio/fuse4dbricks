@@ -298,3 +298,65 @@ def test_authprovider_invalidate_notifies_callback():
     # 401 path always drops principal-derived caches.
     prov.invalidate_access_token(_ctx(uid=4242))
     assert seen == [1000, 4242]
+
+
+# ---------------------------------------------------------------------------
+# AuthProvider single-principal mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_single_principal_shares_token_across_uids():
+    prov = AuthProvider(unified_auth=True, single_principal=True)
+    prov._unified_auth = SimpleNamespace(
+        get_access_token=AsyncMock(return_value="dapi-shared")
+    )
+    # First request resolves the token...
+    assert await prov.get_access_token(_ctx(uid=1000)) == "dapi-shared"
+    # ...a different uid (e.g. Windows Explorer's synthetic uid) reuses it from
+    # the shared slot without re-resolving.
+    assert await prov.get_access_token(_ctx(uid=4294967295)) == "dapi-shared"
+    assert prov._unified_auth.get_access_token.await_count == 1
+
+
+@pytest.mark.trio
+async def test_single_principal_resolves_from_server_identity():
+    prov = AuthProvider(unified_auth=True, single_principal=True)
+    captured = {}
+
+    async def fake(ctx):
+        captured["uid"] = ctx.uid
+        captured["pid"] = ctx.pid
+        return "dapi-x"
+
+    prov._unified_auth = SimpleNamespace(get_access_token=AsyncMock(side_effect=fake))
+    # Request comes from some other uid/pid, but resolution uses THIS process.
+    await prov.get_access_token(_ctx(uid=1000, pid=5678))
+    assert captured["uid"] == os.getuid()
+    assert captured["pid"] == os.getpid()
+
+
+@pytest.mark.trio
+async def test_single_principal_written_token_serves_all_uids():
+    # No unified auth: token comes from a .auth write under one uid and must be
+    # usable by every other uid.
+    prov = AuthProvider(unified_auth=False, single_principal=True)
+    prov.set_access_token(1000, "dapi-written")
+    assert prov._uid_to_access_token == {AuthProvider._SHARED_TOKEN_KEY: "dapi-written"}
+    assert await prov.get_access_token(_ctx(uid=2000)) == "dapi-written"
+
+
+def test_single_principal_invalidate_clears_shared_slot_for_any_uid():
+    prov = AuthProvider(unified_auth=False, single_principal=True)
+    prov.set_access_token(1000, "dapi-written")
+    # Invalidating from a different uid still clears the one shared token.
+    prov.invalidate_access_token(_ctx(uid=9999))
+    assert prov._uid_to_access_token == {}
+
+
+def test_default_mode_keys_token_per_uid():
+    # Regression: without single_principal, tokens remain per-uid.
+    prov = AuthProvider(unified_auth=False)
+    prov.set_access_token(1000, "a")
+    prov.set_access_token(2000, "b")
+    assert prov._uid_to_access_token == {1000: "a", 2000: "b"}

@@ -1,5 +1,12 @@
 # Unreleased
 
+- Add `--single-principal`: use one Databricks identity for every request
+  regardless of the requesting uid, resolving the token from the fuse4dbricks
+  process's own credentials (its environment and the launching user's
+  `~/.databrickscfg`) or from a token written to `.auth`. Intended for
+  single-user machines; combine with `--allow-other` so a request carrying an
+  undocumented uid (e.g. the Windows file explorer over WSL) is served by the
+  one token without fuse4dbricks needing root to read the requesting process.
 - Add `--securable-allowlist` and `--securable-denylist` to restrict which
   Unity Catalog securables are listable and accessible. Each takes a
   comma-separated list of dotted securables (`catalog`, `catalog.schema` or

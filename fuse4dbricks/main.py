@@ -55,6 +55,18 @@ def parse_args():
     parser.add_argument("--no-unified-auth", action="store_false", dest="unified_auth",
         help="Disable Databricks Unified Authentication; users must provide a token manually"
     )
+    parser.add_argument("--single-principal", action="store_true",
+        help=(
+            "Use one Databricks identity for every request regardless of the "
+            "requesting user. The token is resolved from this process's own "
+            "credentials (its environment plus the launching user's "
+            "~/.databrickscfg) or from a token written to .auth. Intended for "
+            "single-user machines; combine with --allow-other so a request "
+            "carrying a different/undocumented uid (e.g. Windows Explorer over "
+            "WSL) is served by the one token without needing root to read its "
+            "environment."
+        ),
+    )
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear disk cache on startup"
     )
@@ -199,7 +211,11 @@ async def async_main():
 
     # Auth
     logging.info(f"Initializing Authentication... with {args.unified_auth=}")
-    auth_provider: AuthProvider = AuthProvider(unified_auth=args.unified_auth)
+    auth_provider: AuthProvider = AuthProvider(
+        unified_auth=args.unified_auth, single_principal=args.single_principal
+    )
+    if args.single_principal:
+        logging.info("Single-principal mode: one Databricks identity serves all requests")
     # Init Components
     uc_client = UnityCatalogClient(workspace, auth_provider)
     persistence = DiskPersistence(data_cache_dir, max_size_gb=args.disk_cache_gb, max_age_days=args.disk_cache_max_days)
