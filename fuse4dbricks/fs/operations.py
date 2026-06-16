@@ -25,6 +25,7 @@ from fuse4dbricks.fs.auth_manager import AuthManager
 from fuse4dbricks.fs.data_manager import DataManager
 from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr, InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager
+from fuse4dbricks.fs.securable_filter import SecurableFilter
 from fuse4dbricks.fs.utils import fs_to_uc_path
 from fuse4dbricks.fs.write_buffer import WriteBuffer
 
@@ -59,6 +60,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         uc_client: UnityCatalogClient,
         writes_dir: str,
         read_only: bool = False,
+        securable_filter: SecurableFilter | None = None,
     ):
         super(UnityCatalogFS, self).__init__()
         self.inodes = inode_manager
@@ -68,6 +70,9 @@ class UnityCatalogFS(pyfuse3.Operations):
         self.uc_client = uc_client
         self._writes_dir = writes_dir
         self._read_only = read_only
+        # Permissive by default (no allow/deny rules) so callers that don't pass
+        # one are unaffected.
+        self._securables = securable_filter or SecurableFilter()
         self._readdir_state: dict[int, dict] = {}
         self._readdir_fh_count = 0
         self._open_fh_count = 0
@@ -78,6 +83,11 @@ class UnityCatalogFS(pyfuse3.Operations):
             return "auth"
         else:
             return "unity_catalog"
+
+    def _child_fs_path(self, parent_fs_path: str, name: str) -> str:
+        if parent_fs_path == "/":
+            return f"/{name}"
+        return f"{parent_fs_path}/{name}"
 
     async def _check_permissions(self, inode: int, mode: int, ctx: pyfuse3.RequestContext):
         entry = self.inodes.get_entry(inode)
@@ -171,6 +181,12 @@ class UnityCatalogFS(pyfuse3.Operations):
             full_path = f"/{name}"
         else:
             full_path = f"{parent_entry.fs_path}/{name}"
+
+        # Securable allow/deny: a filtered-out path is reported as nonexistent so
+        # it is neither listable nor reachable (the auth overlay is exempt).
+        if (self._dispatch(full_path) == "unity_catalog"
+                and not self._securables.is_path_allowed(full_path)):
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         existing = self.inodes.get_inode_by_path(full_path)
         if existing:
@@ -312,6 +328,16 @@ class UnityCatalogFS(pyfuse3.Operations):
                     raise
             if items is None:
                 raise pyfuse3.FUSEError(errno.EIO)
+            # Hide securables excluded by the allow/deny rules (auth overlay is
+            # served separately above and is never filtered).
+            if self._securables.is_active and self._dispatch(entry.fs_path) == "unity_catalog":
+                items = {
+                    name: attr
+                    for name, attr in items.items()
+                    if self._securables.is_path_allowed(
+                        self._child_fs_path(entry.fs_path, name)
+                    )
+                }
             self._readdir_state[fh]["children"] = items
         else:
             items = self._readdir_state[fh]["children"]
@@ -412,6 +438,10 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EACCES)
 
         name_str = name.decode("utf-8")
+        if not self._securables.is_path_allowed(
+            self._child_fs_path(parent_entry.fs_path, name_str)
+        ):
+            raise pyfuse3.FUSEError(errno.EACCES)
         now = time.time()
         attr = InodeEntryAttr(
             st_mode=(stat.S_IFREG | 0o644),
@@ -593,6 +623,8 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         name_str = name.decode("utf-8")
         child_fs_path = f"{parent_entry.fs_path}/{name_str}".replace("//", "/")
+        if not self._securables.is_path_allowed(child_fs_path):
+            raise pyfuse3.FUSEError(errno.EACCES)
         uc_path = fs_to_uc_path(child_fs_path)
 
         try:
@@ -695,6 +727,12 @@ class UnityCatalogFS(pyfuse3.Operations):
         new_name = name_new.decode("utf-8")
         old_fs_path = f"{old_parent.fs_path}/{old_name}".replace("//", "/")
         new_fs_path = f"{new_parent.fs_path}/{new_name}".replace("//", "/")
+        # Securable rules: a filtered-out source is invisible (ENOENT); renaming
+        # into a forbidden destination is refused (EACCES).
+        if not self._securables.is_path_allowed(old_fs_path):
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if not self._securables.is_path_allowed(new_fs_path):
+            raise pyfuse3.FUSEError(errno.EACCES)
         if old_fs_path == new_fs_path:
             return  # no-op
 

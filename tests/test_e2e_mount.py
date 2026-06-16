@@ -247,6 +247,45 @@ def test_statfs_and_df(mountpoint):
 
 
 @requires_live_mount
+def test_securable_denylist_hides_catalog():
+    # Mounting with the test catalog on the denylist must hide it from the root
+    # listing and make the volume under it unreachable; the auth overlay is
+    # unaffected.
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--securable-denylist", catalog), suffix="_deny") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries  # overlay is never filtered
+        assert catalog not in entries  # whole catalog hidden
+        with pytest.raises(FileNotFoundError):
+            os.stat(os.path.join(mnt, _volume_relpath()))
+
+
+@requires_live_mount
+def test_securable_allowlist_restricts_root_listing():
+    # Allowlisting only a bogus securable hides the real catalog (it is off the
+    # allowed chain), proving the allowlist restricts visibility. The auth
+    # overlay still shows.
+    catalog = _volume_relpath().split("/")[0]
+    bogus = "fuse4dbricks_nonexistent_catalog_zzz.sch.vol"
+    with _mounted(extra_args=("--securable-allowlist", bogus), suffix="_allow") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries
+        assert catalog not in entries
+
+
+@requires_live_mount
+def test_securable_allowlist_keeps_listed_volume_reachable():
+    # Allowlisting the test volume keeps its ancestor catalog navigable and the
+    # volume itself reachable.
+    securable = _volume_relpath().replace("/", ".")  # cat/sch/vol -> cat.sch.vol
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--securable-allowlist", securable), suffix="_allow2") as mnt:
+        entries = set(os.listdir(mnt))
+        assert catalog in entries  # ancestor stays navigable
+        assert os.path.isdir(os.path.join(mnt, _volume_relpath()))
+
+
+@requires_live_mount
 @pytest.mark.skipif(not TEST_FILE_REL, reason="FUSE4DBRICKS_TEST_FILE not set")
 def test_read_known_file_matches_size(mountpoint):
     # Exercises read -> data_manager -> uc_client.download_chunk_stream end to end.
