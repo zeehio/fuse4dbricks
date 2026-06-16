@@ -1,5 +1,11 @@
-# Unreleased
+# 0.7.0 (2026-06-16)
 
+- Fix files written from a Windows application through WSL being uploaded at
+  the correct size but filled with zeros. A path-based `setattr(size)` (which
+  WSL's 9P layer emits instead of an `ftruncate` carrying the handle) now
+  resizes the open writer's buffer instead of reading the not-yet-uploaded
+  remote object. A short read while preserving bytes in a true path-based
+  truncate now fails with `EIO` instead of silently zero-filling.
 - Add `--single-principal`: use one Databricks identity for every request
   regardless of the requesting uid, resolving the token from the fuse4dbricks
   process's own credentials (its environment and the launching user's

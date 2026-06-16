@@ -850,26 +850,47 @@ class UnityCatalogFS(pyfuse3.Operations):
 
         return self._entry_to_fuse_attr(entry)
 
+    def _find_open_writer(self, inode: int, fh) -> dict | None:
+        """Resolve the open write state a truncate should act on.
+
+        Prefer the handle named by an ftruncate call. Otherwise fall back to any
+        open writable handle on the same inode: WSL's 9P layer issues a file's
+        final size as a *path-based* setattr (fh is None or not the writer), and
+        the open writer's buffer -- not the remote object -- holds the
+        authoritative bytes. Reading the remote there would upload a zero-filled
+        file of the right size.
+        """
+        if fh is not None:
+            state = self._open_state.get(int(fh))
+            if state and state.get("writable") and state.get("write_buffer") is not None:
+                return state
+        for state in self._open_state.values():
+            if (state.get("inode") == inode
+                    and state.get("writable")
+                    and state.get("write_buffer") is not None):
+                return state
+        return None
+
     async def _truncate_uc_file(self, entry, new_size, fh, ctx):
         """Resize a Unity Catalog file to ``new_size`` bytes.
 
-        If an open writable handle is supplied (ftruncate), operate on its
+        If a writable handle is open for this inode (ftruncate, or the
+        path-based setattr WSL emits while a writer is open), operate on its
         buffer and defer the upload to release(). Otherwise (path-based
-        truncate) materialize the kept bytes into a temp buffer, resize it and
-        upload immediately.
+        truncate of a closed file) materialize the kept bytes into a temp
+        buffer, resize it and upload immediately.
         """
-        # ftruncate on an open writable handle: resize its buffer; release()
-        # will upload the result.
-        if fh is not None and fh in self._open_state:
-            state = self._open_state[fh]
-            write_buffer: WriteBuffer | None = state.get("write_buffer")
-            if write_buffer is not None and state.get("writable"):
-                write_buffer.truncate(new_size)
-                state["dirty"] = True
-                entry.attr.st_size = write_buffer.size()
-                return
+        # Resize the open writer's buffer; release() will upload the result.
+        writer = self._find_open_writer(entry.inode, fh)
+        if writer is not None:
+            write_buffer: WriteBuffer = writer["write_buffer"]
+            write_buffer.truncate(new_size)
+            writer["dirty"] = True
+            entry.attr.st_size = write_buffer.size()
+            return
 
-        # Path-based truncate: copy the bytes we keep, resize, upload now.
+        # Path-based truncate of a closed file: copy the bytes we keep, resize,
+        # upload now.
         write_buffer = WriteBuffer(self._writes_dir)
         try:
             old_size = entry.attr.st_size
@@ -883,7 +904,10 @@ class UnityCatalogFS(pyfuse3.Operations):
                     entry.attr.st_mtime, old_size, ctx=ctx,
                 )
                 if len(chunk) == 0:
-                    break
+                    # Short read before reaching the bytes we must preserve: the
+                    # remote file isn't what we expected. Fail rather than
+                    # silently zero-fill the tail.
+                    raise pyfuse3.FUSEError(errno.EIO)
                 write_buffer.write(pos, chunk)
                 pos += len(chunk)
             write_buffer.truncate(new_size)  # zero-extends when growing
