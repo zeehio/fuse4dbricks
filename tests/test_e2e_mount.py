@@ -247,6 +247,18 @@ def test_statfs_and_df(mountpoint):
 
 
 @requires_live_mount
+def test_single_principal_lists_catalog():
+    # In single-principal mode the token is resolved from the fuse4dbricks
+    # process's own environment (which carries DATABRICKS_TOKEN here), not from
+    # the requesting process, so the catalog must still be listable.
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--single-principal",), suffix="_sp") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries
+        assert catalog in entries
+
+
+@requires_live_mount
 def test_securable_denylist_hides_catalog():
     # Mounting with the test catalog on the denylist must hide it from the root
     # listing and make the volume under it unreachable; the auth overlay is

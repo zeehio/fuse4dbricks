@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import stat
 import traceback
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 import pyfuse3
@@ -251,12 +252,33 @@ class DatabricksUnifiedAuthProvider:
         return self._get_token_from_config(profile, config_file)
 
 class AuthProvider:
-    def __init__(self, unified_auth: bool = True):
+    # Key for the shared token in single-principal mode. -1 is never a valid uid,
+    # so it cannot collide with a real per-user entry.
+    _SHARED_TOKEN_KEY = -1
+
+    def __init__(self, unified_auth: bool = True, single_principal: bool = False):
         self._uid_to_access_token: dict[int, str] = {}
         "uid -> access_token"
         self._unified_auth = DatabricksUnifiedAuthProvider() if unified_auth else None
         self._on_token_invalidated: Optional[Callable[[int], None]] = None
         "Optional listener notified (with the uid) when a uid's token is invalidated."
+        self._single_principal = single_principal
+        """When True, one token serves every request regardless of the requesting
+        uid. The token is resolved from THIS process's own Databricks credentials
+        (its environment plus the launching user's ~/.databrickscfg), not from the
+        requesting process. Useful on single-user machines (e.g. WSL accessed from
+        Windows Explorer, whose requests carry an undocumented uid)."""
+        # Identity used to resolve the shared token in single-principal mode: the
+        # fuse4dbricks process itself. _get_env_for_pid/_get_profile... only read
+        # .pid and .uid, so a lightweight object is sufficient.
+        self._server_ctx = SimpleNamespace(
+            uid=os.getuid(), pid=os.getpid(), gid=os.getgid()
+        )
+
+    def _token_key(self, uid: int) -> int:
+        """Map a requesting uid to its token-cache slot. In single-principal mode
+        every uid collapses to one shared slot."""
+        return self._SHARED_TOKEN_KEY if self._single_principal else uid
 
     def set_token_invalidation_callback(self, callback: Callable[[int], None]) -> None:
         """Register a listener invoked with the uid whenever its token is
@@ -264,8 +286,9 @@ class AuthProvider:
         self._on_token_invalidated = callback
 
     def invalidate_access_token(self, ctx: pyfuse3.RequestContext):
-        if ctx.uid in self._uid_to_access_token:
-            del self._uid_to_access_token[ctx.uid]
+        key = self._token_key(ctx.uid)
+        if key in self._uid_to_access_token:
+            del self._uid_to_access_token[key]
         # A 401 invalidation may re-resolve to a token for a different principal;
         # notify listeners so they drop principal-derived caches and re-derive.
         if self._on_token_invalidated is not None:
@@ -281,18 +304,26 @@ class AuthProvider:
         For any request, if there is a valid local token that is used. Otherwise we try to get
         a token from the requesting process, if unified authentication is available.
 
+        In single-principal mode the token is shared across all uids and resolved
+        from this process's own credentials rather than the requesting process.
+
         :param ctx: The Request context representing the user that we want to get the token for
         :raises pyfuse3.FUSEError: raises ENOACCES if no token is available
         :return: A token
         """
         # If the user has given a token, we use that token. Otherwise we check the external provider
         try:
-            local_token = self._uid_to_access_token.get(ctx.uid)
+            key = self._token_key(ctx.uid)
+            local_token = self._uid_to_access_token.get(key)
             if local_token:
                 return local_token
             if self._unified_auth is None:
                 raise pyfuse3.FUSEError(errno.EACCES)
-            token =  await self._unified_auth.get_access_token(ctx=ctx)
+            # Single-principal: resolve from this process's own identity so a
+            # request carrying an unknown/undocumented uid (e.g. Windows Explorer
+            # over WSL) is still served.
+            resolve_ctx = self._server_ctx if self._single_principal else ctx
+            token = await self._unified_auth.get_access_token(ctx=resolve_ctx)
             if token is None:
                 raise pyfuse3.FUSEError(errno.EACCES)
             self.set_access_token(ctx.uid, token)
@@ -301,5 +332,5 @@ class AuthProvider:
             raise pyfuse3.FUSEError(errno.EACCES) from exc
 
     def set_access_token(self, ctx_uid: int, access_token: str):
-        self._uid_to_access_token[ctx_uid] = access_token
+        self._uid_to_access_token[self._token_key(ctx_uid)] = access_token
         return access_token
