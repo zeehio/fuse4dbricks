@@ -6,8 +6,15 @@ import pytest
 
 import pyfuse3
 
-from fuse4dbricks.api.uc_client import UnityCatalogClient
-from fuse4dbricks.api.errors import UcError, UcRateLimited, UcUnavailable
+from fuse4dbricks.api.uc_client import UnityCatalogClient, _parse_retry_after
+from fuse4dbricks.api.errors import (
+    UcBadRequest,
+    UcError,
+    UcNotFound,
+    UcPreconditionFailed,
+    UcRateLimited,
+    UcUnavailable,
+)
 
 # --- FIXTURES ---
 
@@ -146,7 +153,8 @@ async def test_download_chunk_stream_headers(client):
 
 @pytest.mark.trio
 async def test_download_chunk_stream_412_precondition_failed(client):
-    """Verify that if the file changed (412), it raises a UcError."""
+    """If the file changed under the If-Unmodified-Since read (412), raise the
+    specific UcPreconditionFailed so it can be mapped to ESTALE upstream."""
     mock_response = AsyncMock(spec=httpx.Response)
     mock_response.status_code = 412
 
@@ -161,7 +169,7 @@ async def test_download_chunk_stream_412_precondition_failed(client):
     client.client.send.return_value = mock_response
 
     ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
-    with pytest.raises(UcError) as excinfo:
+    with pytest.raises(UcPreconditionFailed) as excinfo:
         async for _ in client.download_chunk_stream("/file.bin", 0, 100, ctx=ctx):
             pass
 
@@ -318,3 +326,211 @@ def test_uc_rate_limited_carries_retry_after():
     err = UcRateLimited("rate limited", status_code=429, retry_after_s=5.0)
     assert err.retry_after_s == 5.0
     assert err.status_code == 429
+
+
+# --- TESTS: WRITE PRIMITIVES ---
+
+
+@pytest.mark.trio
+async def test_delete_file_success(client):
+    """DELETE /files/{path} with 200 and empty body → no exception."""
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.content = b""
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    # Should not raise
+    await client.delete_file("/Volumes/cat/sch/vol/file.txt", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_delete_file_not_found_raises_ucnotfound(client):
+    """DELETE /files/{path} with 404 → _request returns None → UcNotFound."""
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 404
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcNotFound):
+        await client.delete_file("/Volumes/cat/sch/vol/missing.txt", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_delete_directory_success(client):
+    """DELETE /directories/{path} with 200 and empty body → no exception."""
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.content = b""
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    await client.delete_directory("/Volumes/cat/sch/vol/emptydir", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_delete_directory_non_empty_raises_ucbadrequest(client):
+    """DELETE /directories/{path} on a non-empty directory → 400 → UcBadRequest.
+
+    rmdir() catches UcBadRequest and maps it to ENOTEMPTY.
+    """
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 400
+    mock_response.headers = {}
+    mock_response.request = MagicMock(spec=httpx.Request)
+    mock_response.request.url = "https://test-workspace.net/api/2.0/fs/directories/Volumes/cat/sch/vol/nonempty"
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcBadRequest):
+        await client.delete_directory("/Volumes/cat/sch/vol/nonempty", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_delete_directory_file_path_raises_ucnotfound(client):
+    """DELETE /directories/{path} on a file path → expected 404 → UcNotFound.
+
+    The Databricks API returns 404 when the /directories/ endpoint is called on
+    a path that is a file (not a directory). This means rmdir() will see
+    UcNotFound and raise ENOENT instead of the POSIX-correct ENOTDIR. This
+    test documents the current behavior so any future API change is caught.
+    """
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 404
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcNotFound):
+        await client.delete_directory("/Volumes/cat/sch/vol/actually_a_file.txt", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_create_directory_success(client):
+    """PUT /directories/{path} with 200 and empty body → no exception."""
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 200
+    mock_response.content = b""
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    await client.create_directory("/Volumes/cat/sch/vol/newdir", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_create_directory_path_is_file_raises_ucbadrequest(client):
+    """PUT /directories/{path} when path already exists as a file → 400 → UcBadRequest.
+
+    Databricks returns 400 when asked to create a directory at a path that is
+    already a file. mkdir() will see UcBadRequest and raise EINVAL. POSIX would
+    prefer EEXIST, but that requires a pre-flight HEAD; this test documents the
+    current behavior.
+    """
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 400
+    mock_response.headers = {}
+    mock_response.request = MagicMock(spec=httpx.Request)
+    mock_response.request.url = "https://test-workspace.net/api/2.0/fs/directories/Volumes/cat/sch/vol/file.txt"
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcBadRequest):
+        await client.create_directory("/Volumes/cat/sch/vol/file.txt", ctx=ctx)
+
+
+@pytest.mark.trio
+async def test_create_directory_parent_is_file_raises_ucbadrequest(client):
+    """PUT /directories/{path} when a parent component is a file → 400 → UcBadRequest.
+
+    e.g. /vol/file.txt/subdir where file.txt is a regular file. Databricks
+    returns 400 in this case. mkdir() will see UcBadRequest and raise EINVAL;
+    POSIX would prefer ENOTDIR. This test documents the current behavior.
+    """
+    mock_response = MagicMock(spec=httpx.Response)
+    mock_response.status_code = 400
+    mock_response.headers = {}
+    mock_response.request = MagicMock(spec=httpx.Request)
+    mock_response.request.url = "https://test-workspace.net/api/2.0/fs/directories/Volumes/cat/sch/vol/file.txt/subdir"
+    client.client.send.return_value = mock_response
+
+    ctx = pyfuse3.RequestContext(uid=0, pid=1234, gid=0)
+    with pytest.raises(UcBadRequest):
+        await client.create_directory("/Volumes/cat/sch/vol/file.txt/subdir", ctx=ctx)
+
+# --- TESTS: Retry-After parsing (both RFC 7231 forms) ---
+
+
+def test_parse_retry_after_seconds():
+    assert _parse_retry_after("120") == 120.0
+    assert _parse_retry_after("  5 ") == 5.0
+
+
+def test_parse_retry_after_http_date():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    future = datetime.now(timezone.utc) + timedelta(seconds=100)
+    val = _parse_retry_after(format_datetime(future, usegmt=True))
+    assert val is not None
+    # ~100s from now, allowing for the small elapsed time during the test.
+    assert 90.0 <= val <= 100.0
+
+
+def test_parse_retry_after_past_date_clamps_to_zero():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    past = datetime.now(timezone.utc) - timedelta(seconds=100)
+    assert _parse_retry_after(format_datetime(past, usegmt=True)) == 0.0
+
+
+def test_parse_retry_after_unparseable_returns_none():
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
+    assert _parse_retry_after("not-a-date") is None
+
+
+# --- TESTS: upload_file token refresh on 401 ---
+
+
+@pytest.mark.trio
+async def test_upload_file_refreshes_token_on_401(client, mock_auth_provider, tmp_path, monkeypatch):
+    """An expired token during the SDK upload (which bypasses _request's 401
+    flow) must be invalidated, re-resolved and retried once with a fresh token."""
+    from databricks.sdk.errors.platform import Unauthenticated
+
+    mock_auth_provider.get_access_token = AsyncMock(side_effect=["stale", "fresh"])
+    mock_auth_provider.invalidate_access_token = MagicMock()
+
+    seen_tokens = []
+
+    class _FakeConfig:
+        def __init__(self, host=None, token=None):
+            self.host = host
+            self.token = token
+
+    class _FakeFiles:
+        def __init__(self, token):
+            self._token = token
+
+        def upload(self, file_path, contents, overwrite):
+            # The stale token is rejected; the refreshed one succeeds.
+            if self._token == "stale":
+                raise Unauthenticated("token expired")
+
+    class _FakeWorkspaceClient:
+        def __init__(self, config=None):
+            seen_tokens.append(config.token)
+            self.files = _FakeFiles(config.token)
+
+    monkeypatch.setattr("databricks.sdk.config.Config", _FakeConfig)
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", _FakeWorkspaceClient)
+
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"data")
+    ctx = pyfuse3.RequestContext(uid=0, pid=1, gid=0)
+
+    await client.upload_file("/Volumes/c/s/v/payload.bin", str(local), ctx=ctx)
+
+    assert seen_tokens == ["stale", "fresh"]
+    mock_auth_provider.invalidate_access_token.assert_called_once()
+    assert mock_auth_provider.get_access_token.await_count == 2

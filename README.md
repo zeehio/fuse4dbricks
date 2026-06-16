@@ -8,9 +8,11 @@ This is not an official databricks package. I, the author of this package, am no
 
 ## Features
 
-The filesystem is read only.
-
 This filesystem uses the [public databricks API](https://docs.databricks.com/api/azure/workspace/introduction) to retrieve files, directories and access permissions from the Unity Catalog.
+
+**Read and write** access is supported for Unity Catalog Volumes. Users with `WRITE_VOLUME` privilege can create, overwrite and delete files and directories, and can `mv`/rename and truncate files. Files above 5 GB are uploaded via multipart upload handled transparently by the Databricks SDK. Pass `--read-only` to disable all writes to Unity Catalog (useful when mounting a shared volume that should not be modified). `df` reports a (synthetic) capacity so tools that check free space before writing work.
+
+**Restricting visibility** to a subset of securables is supported with `--securable-allowlist` and `--securable-denylist`. Each takes a comma-separated list of securables, written dotted: a catalog (`mycatalog`), a schema (`mycatalog.myschema`) or a volume (`mycatalog.myschema.myvol`). With a denylist, the listed securables (and everything beneath them) are hidden and inaccessible. With an allowlist, only the listed securables are listable and accessible — their parent catalog/schema stay navigable so you can reach them. If both are given, only allowlisted securables that are not also denied are accessible (deny wins). This is a mount-wide visibility filter layered on top of — not a replacement for — Unity Catalog's own per-user permission checks.
 
 To mitigate latency and improve **performance**, file metadata is cached in-memory. Data is cached
 to a local cache directory (`--disk-cache-dir`) and partially to RAM as well. Options to control
@@ -26,6 +28,8 @@ personal access token to a virtual file:
 
 If fuse (`/etc/fuse.conf`) has `user_allow_other` activated, this driver supports the `--allow-other`,
 option so **multiple users** can access it. In this case, the fuse4dbricks process should run from a root account, who should have exclusive access to `--disk-cache-dir`. fuse4dbricks will inspect the environment variables of the requesting process, as well as the requesting user, in order to find the access credentials. This may require reading the `.databrickscfg` file from the requesting user. The cache is shared among all users in this scenario.
+
+On a **single-user machine** you can instead pass `--single-principal`, so one Databricks identity serves every request regardless of the requesting uid. The token is resolved from the fuse4dbricks process's own credentials (its environment and the launching user's `~/.databrickscfg`) or from a token written to `.auth` — never from the requesting process. This is especially useful under WSL: combine `--single-principal` with `--allow-other` so the Windows file explorer (whose requests arrive with an undocumented uid) can browse the mount using that single token, without fuse4dbricks needing root to inspect each requesting process.
 
 When an access token is missing, revoked or expired, the unity catalog is not accessible anymore and only
 a virtual `/Volumes/README.txt` file appears, with instructions on how to add the access token manually.
@@ -180,3 +184,26 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   result, a file created (or that becomes visible to you) just after you looked for it may not
   appear until this short TTL expires. Unlike file metadata, these negative results are *not*
   shared between users.
+
+- **Writes are object-store semantics, not POSIX semantics.** The Databricks Files API is a
+  full-replace store: a file is not visible to other processes until the writing process closes
+  it (`release`). Concurrent writers follow last-write-wins — there is no locking. Deleting a
+  file while another process has it open will cause that process to receive an I/O error on its
+  next network fetch. These are intentional trade-offs for performance on object storage.
+
+- **Opening a large file O_RDWR without O_TRUNC downloads the entire file first.** Because
+  writes are buffered locally and uploaded on close, the full existing content must be
+  downloaded into a temporary file before the open returns. For very large files (multi-GB)
+  this can be slow. Use `O_WRONLY` or `O_RDWR | O_TRUNC` when you intend to overwrite the
+  file completely.
+
+- **Renaming a file copies it.** The Databricks Files API has no server-side move, so renaming
+  a file downloads it and re-uploads it under the new name, then deletes the original. This is
+  cheap for the write-temp-then-rename pattern editors use, but expensive for large files.
+  Renaming a *directory* is not supported and returns `EXDEV`, which makes `mv` fall back to a
+  recursive copy.
+
+- **Securable allow/deny is a mount-wide visibility filter, not a per-user boundary.**
+  `--securable-allowlist`/`--securable-denylist` hide securables for everyone using the mount;
+  they are not per-user and do not replace Unity Catalog permissions. A user still needs the
+  relevant Unity Catalog privileges to read data that the filter allows.

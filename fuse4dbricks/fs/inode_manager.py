@@ -5,7 +5,7 @@ Manages the mapping between Linux Inodes and Unity Catalog Paths.
 import logging
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pyfuse3
 
@@ -170,7 +170,11 @@ class InodeManager:
             parent_inode=parent_inode,
             name=name,
             fs_path=fs_path,
-            attr=attr,
+            # Copy: the caller's attr is often the very object held in the
+            # metadata cache. Aliasing it would let an inode-side mutation
+            # (e.g. write() updating st_size) silently corrupt the shared
+            # cache. All fields are scalars, so a shallow replace is a full copy.
+            attr=replace(attr),
         )
         self._inode_map[inode] = entry
         self._path_map[fs_path] = inode
@@ -179,6 +183,64 @@ class InodeManager:
             self._children_map[parent_inode] = set()
         self._children_map[parent_inode].add(inode)
         return entry
+
+    def move_inode(self, inode: int, new_parent_inode: int, new_name: str) -> "InodeEntry":
+        """Move ``inode`` to ``new_parent_inode`` under ``new_name``.
+
+        Updates ``_path_map``, ``_children_map`` and the entry's
+        ``parent_inode``/``name``/``fs_path``, then rebuilds the fs_path of the
+        whole subtree (so descendants of a moved directory get correct paths).
+        Any inode already living at the destination path is pruned first, since
+        POSIX rename replaces the target. Returns the moved entry.
+        """
+        entry = self._inode_map.get(inode)
+        if entry is None:
+            raise ValueError(f"Inode {inode} not found")
+        new_parent = self._inode_map.get(new_parent_inode)
+        if new_parent is None:
+            raise ValueError(f"Parent inode {new_parent_inode} not found")
+
+        if new_parent_inode == pyfuse3.ROOT_INODE:
+            new_fs_path = f"/{new_name}"
+        else:
+            new_fs_path = f"{new_parent.fs_path}/{new_name}"
+
+        # Replace whatever currently sits at the destination (unless it's us).
+        existing = self._path_map.get(new_fs_path)
+        if existing is not None and existing != inode:
+            self._prune_subtree(existing)
+
+        # Detach from the old parent and re-key under the new one.
+        old_parent_inode = entry.parent_inode
+        if old_parent_inode in self._children_map:
+            self._children_map[old_parent_inode].discard(inode)
+        entry.parent_inode = new_parent_inode
+        entry.name = new_name
+        self._children_map.setdefault(new_parent_inode, set()).add(inode)
+
+        # Rebuild this entry's path and every descendant's.
+        self._rebuild_subtree_paths(inode)
+        return entry
+
+    def _rebuild_subtree_paths(self, inode: int):
+        entry = self._inode_map.get(inode)
+        if entry is None:
+            return
+        parent = self._inode_map.get(entry.parent_inode)
+        if parent is None or entry.parent_inode == pyfuse3.ROOT_INODE:
+            new_path = f"/{entry.name}"
+        else:
+            new_path = f"{parent.fs_path}/{entry.name}"
+
+        if entry.fs_path != new_path:
+            # Drop the stale key only if it still points at us.
+            if self._path_map.get(entry.fs_path) == inode:
+                del self._path_map[entry.fs_path]
+            entry.fs_path = new_path
+        self._path_map[new_path] = inode
+
+        for child in list(self._children_map.get(inode, [])):
+            self._rebuild_subtree_paths(child)
 
     def forget(self, inode: int, count):
         if inode not in self._inode_map:

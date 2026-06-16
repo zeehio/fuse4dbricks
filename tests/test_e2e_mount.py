@@ -18,12 +18,15 @@ process), so it must be present in the shell that runs pytest:
     pytest tests/test_e2e_mount.py -v
 """
 
+import errno
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -86,19 +89,34 @@ def _wait_until_mounted(mnt: Path, proc: subprocess.Popen, log: tempfile.Tempora
     raise TimeoutError(f"Mount did not become ready within {MOUNT_TIMEOUT_S}s at {mnt}")
 
 
-@pytest.fixture(scope="module")
-def mountpoint():
+def _resolve_mountpoint(suffix: str = "") -> Path:
     raw = os.environ.get("FUSE4DBRICKS_TEST_MOUNTPOINT")
     mnt = Path(raw) if raw else DEFAULT_MOUNTPOINT
     if not mnt.is_absolute():
         mnt = (REPO_ROOT / mnt).resolve()
+    if suffix:
+        mnt = mnt.parent / (mnt.name + suffix)
+    return mnt
 
+
+@contextmanager
+def _mounted(extra_args=(), suffix: str = ""):
+    """Mount fuse4dbricks at a (possibly suffixed) mountpoint, yield it, unmount."""
+    mnt = _resolve_mountpoint(suffix)
     mnt.mkdir(parents=True, exist_ok=True)
     _unmount(mnt)  # in case a previous run left it mounted
 
     log = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "fuse4dbricks.main", "--workspace", HOST, str(mnt)],
+        [
+            sys.executable,
+            "-m",
+            "fuse4dbricks.main",
+            "--workspace",
+            HOST,
+            *extra_args,
+            str(mnt),
+        ],
         stdout=log,
         stderr=subprocess.STDOUT,
         text=True,
@@ -117,10 +135,47 @@ def mountpoint():
             proc.wait(timeout=10)
         log.close()
         try:
-            if mnt == DEFAULT_MOUNTPOINT:
+            # Only remove dirs we created under the default scheme, never a
+            # user-supplied FUSE4DBRICKS_TEST_MOUNTPOINT.
+            if mnt.name.startswith(DEFAULT_MOUNTPOINT.name):
                 mnt.rmdir()  # only if empty
         except OSError:
             pass
+
+
+@pytest.fixture(scope="module")
+def mountpoint():
+    with _mounted() as mnt:
+        yield mnt
+
+
+@pytest.fixture(scope="module")
+def readonly_mountpoint():
+    with _mounted(extra_args=("--read-only",), suffix="_ro") as mnt:
+        yield mnt
+
+
+def _read_back(path: str, expected: bytes, timeout_s: float = 20.0) -> bytes:
+    """Read a file through the mount until its content equals ``expected``.
+
+    Retries on both OSError (a freshly-created path is hidden by the negative
+    cache for its short TTL, and a just-uploaded object has a brief
+    read-after-write window) and on a not-yet-consistent body (e.g. a transient
+    zero-length read), so the test does not race the live API.
+    """
+    deadline = time.monotonic() + timeout_s
+    last: object = "no attempt"
+    while time.monotonic() < deadline:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if data == expected:
+                return data
+            last = f"content not settled (len={len(data)}, want {len(expected)})"
+        except OSError as exc:
+            last = exc
+        time.sleep(0.5)
+    raise AssertionError(f"read-back of {path} did not settle within {timeout_s}s: {last}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +228,76 @@ def test_stat_nonexistent_raises_enoent(mountpoint):
 
 
 @requires_live_mount
+def test_statfs_and_df(mountpoint):
+    # Exercises statfs: without it, statvfs/df fail with ENOSYS. We report a
+    # synthetic capacity, so a writable mount shows space available.
+    st = os.statvfs(mountpoint)
+    assert st.f_bsize > 0
+    assert st.f_blocks > 0
+    assert st.f_bavail > 0  # writable mount -> space available
+    # The `df` tool itself must succeed against the mount.
+    result = subprocess.run(
+        ["df", str(mountpoint)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@requires_live_mount
+def test_single_principal_lists_catalog():
+    # In single-principal mode the token is resolved from the fuse4dbricks
+    # process's own environment (which carries DATABRICKS_TOKEN here), not from
+    # the requesting process, so the catalog must still be listable.
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--single-principal",), suffix="_sp") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries
+        assert catalog in entries
+
+
+@requires_live_mount
+def test_securable_denylist_hides_catalog():
+    # Mounting with the test catalog on the denylist must hide it from the root
+    # listing and make the volume under it unreachable; the auth overlay is
+    # unaffected.
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--securable-denylist", catalog), suffix="_deny") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries  # overlay is never filtered
+        assert catalog not in entries  # whole catalog hidden
+        with pytest.raises(FileNotFoundError):
+            os.stat(os.path.join(mnt, _volume_relpath()))
+
+
+@requires_live_mount
+def test_securable_allowlist_restricts_root_listing():
+    # Allowlisting only a bogus securable hides the real catalog (it is off the
+    # allowed chain), proving the allowlist restricts visibility. The auth
+    # overlay still shows.
+    catalog = _volume_relpath().split("/")[0]
+    bogus = "fuse4dbricks_nonexistent_catalog_zzz.sch.vol"
+    with _mounted(extra_args=("--securable-allowlist", bogus), suffix="_allow") as mnt:
+        entries = set(os.listdir(mnt))
+        assert ".auth" in entries
+        assert catalog not in entries
+
+
+@requires_live_mount
+def test_securable_allowlist_keeps_listed_volume_reachable():
+    # Allowlisting the test volume keeps its ancestor catalog navigable and the
+    # volume itself reachable.
+    securable = _volume_relpath().replace("/", ".")  # cat/sch/vol -> cat.sch.vol
+    catalog = _volume_relpath().split("/")[0]
+    with _mounted(extra_args=("--securable-allowlist", securable), suffix="_allow2") as mnt:
+        entries = set(os.listdir(mnt))
+        assert catalog in entries  # ancestor stays navigable
+        assert os.path.isdir(os.path.join(mnt, _volume_relpath()))
+
+
+@requires_live_mount
 @pytest.mark.skipif(not TEST_FILE_REL, reason="FUSE4DBRICKS_TEST_FILE not set")
 def test_read_known_file_matches_size(mountpoint):
     # Exercises read -> data_manager -> uc_client.download_chunk_stream end to end.
@@ -185,9 +310,100 @@ def test_read_known_file_matches_size(mountpoint):
 
 @requires_live_mount
 @pytest.mark.skipif(not TEST_FILE_REL, reason="FUSE4DBRICKS_TEST_FILE not set")
-def test_write_is_rejected_read_only(mountpoint):
-    # The catalog is read-only: opening for write must fail with EACCES.
-    path = os.path.join(mountpoint, _volume_relpath(), TEST_FILE_REL)
-    with pytest.raises(PermissionError):
+def test_write_is_rejected_read_only(readonly_mountpoint):
+    # Mounted with --read-only: opening a Unity Catalog file for write must
+    # fail with EROFS (a read-only filesystem), surfaced as OSError.
+    path = os.path.join(readonly_mountpoint, _volume_relpath(), TEST_FILE_REL)
+    with pytest.raises(OSError) as excinfo:
         with open(path, "wb"):
+            pass
+    assert excinfo.value.errno == errno.EROFS
+
+
+@requires_live_mount
+def test_partial_wronly_write_preserves_tail(mountpoint):
+    # Regression for silent truncation through the real upload path: opening an
+    # existing file O_WRONLY *without* O_TRUNC and rewriting only the leading
+    # bytes must preserve the rest of the file on the volume. Two bugs used to
+    # break this: (1) the write buffer started empty for O_WRONLY, and (2) small
+    # buffered writes were never flushed, so the upload read back zero bytes.
+    name = f"fuse4dbricks_e2e_partial_{uuid.uuid4().hex}.bin"
+    path = os.path.join(mountpoint, _volume_relpath(), name)
+    original = bytes(range(256)) * 8  # 2048 distinctive bytes
+    try:
+        with open(path, "wb") as fobj:
+            fobj.write(original)
+        # Whole file must be present (waits out the negative-cache TTL and the
+        # read-after-write window). This also warms the cache so the O_WRONLY
+        # reopen below pre-loads from cache rather than racing the API.
+        _read_back(path, original)
+
+        # Reopen O_WRONLY (no O_TRUNC) and overwrite only the first 3 bytes.
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, b"AAA", 0) == 3
+        finally:
+            os.close(fd)
+
+        # The leading bytes change; the untouched tail must survive the upload.
+        expected = b"AAA" + original[3:]
+        _read_back(path, expected)
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+@requires_live_mount
+def test_rename_moves_file_content(mountpoint):
+    # Exercises rename through the real copy(download+upload)+delete path: the
+    # content must appear at the new name and the old name must be gone.
+    base = _volume_relpath()
+    suffix = uuid.uuid4().hex
+    src_name = f"fuse4dbricks_e2e_rename_src_{suffix}.bin"
+    dst_name = f"fuse4dbricks_e2e_rename_dst_{suffix}.bin"
+    src = os.path.join(mountpoint, base, src_name)
+    dst = os.path.join(mountpoint, base, dst_name)
+    payload = bytes(range(256)) * 4  # 1024 distinctive bytes
+    try:
+        with open(src, "wb") as fobj:
+            fobj.write(payload)
+        # Wait out the read-after-write window; this also warms the chunk cache
+        # so rename's internal read is served locally rather than racing the API.
+        _read_back(src, payload)
+
+        os.rename(src, dst)
+
+        # New name carries the content; old name no longer exists.
+        _read_back(dst, payload)
+        with pytest.raises(FileNotFoundError):
+            os.stat(src)
+    finally:
+        for p in (src, dst):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+
+
+@requires_live_mount
+def test_ftruncate_shrinks_file(mountpoint):
+    # Exercises setattr(update_size) on an open writable handle: write content,
+    # truncate it shorter, close -> the upload must carry the truncated bytes.
+    name = f"fuse4dbricks_e2e_trunc_{uuid.uuid4().hex}.bin"
+    path = os.path.join(mountpoint, _volume_relpath(), name)
+    original = bytes(range(256))  # 256 bytes
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            assert os.write(fd, original) == len(original)
+            os.ftruncate(fd, 10)
+        finally:
+            os.close(fd)
+        _read_back(path, original[:10])
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
             pass
