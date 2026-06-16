@@ -1418,6 +1418,42 @@ async def test_setattr_path_truncate_downloads_resizes_uploads(
 
 
 @pytest.mark.trio
+async def test_setattr_path_truncate_with_open_writer_uploads_real_data(
+    fs, inode_manager, uc_client, metadata_manager, ctx
+):
+    """WSL/9P regression: a path-based setattr(size) arriving while a writable
+    handle is open must resize that handle's buffer, not read the (empty)
+    remote object and upload a zero-filled file of the right size."""
+    metadata_manager.invalidate = MagicMock()
+    _vol, f = _make_vol_file(inode_manager, size=0)  # brand-new file, empty remote
+
+    uploaded = {}
+
+    async def _capture(uc_path, local_path, *, ctx):
+        with open(local_path, "rb") as fh_:
+            uploaded["bytes"] = fh_.read()
+
+    uc_client.upload_file.side_effect = _capture
+
+    file_info = await fs.open(f.inode, 1, ctx)  # O_WRONLY
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"0123456789")
+
+    # Path-based setattr (fh=None) -- the WSL SetEndOfFile pattern.
+    attr = pyfuse3.EntryAttributes()
+    attr.st_size = 10
+    await fs.setattr(f.inode, attr, _fields(update_size=True), None, ctx)
+
+    # The path-based branch must NOT have uploaded a zero-filled file here.
+    uc_client.upload_file.assert_not_awaited()
+
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+    uc_client.upload_file.assert_awaited_once()
+    assert uploaded["bytes"] == b"0123456789"  # real data, not b"\x00" * 10
+
+
+@pytest.mark.trio
 async def test_setattr_truncate_read_only_raises_erofs(fs_ro, inode_manager, ctx):
     _vol, f = _make_vol_file(inode_manager, size=5)
     attr = pyfuse3.EntryAttributes()
