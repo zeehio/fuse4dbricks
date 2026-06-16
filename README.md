@@ -10,7 +10,9 @@ This is not an official databricks package. I, the author of this package, am no
 
 This filesystem uses the [public databricks API](https://docs.databricks.com/api/azure/workspace/introduction) to retrieve files, directories and access permissions from the Unity Catalog.
 
-**Read and write** access is supported for Unity Catalog Volumes. Users with `WRITE_VOLUME` privilege can create, overwrite and delete files and directories. Files above 5 GB are uploaded via multipart upload handled transparently by the Databricks SDK. Pass `--read-only` to disable all writes to Unity Catalog (useful when mounting a shared volume that should not be modified).
+**Read and write** access is supported for Unity Catalog Volumes. Users with `WRITE_VOLUME` privilege can create, overwrite and delete files and directories, and can `mv`/rename and truncate files. Files above 5 GB are uploaded via multipart upload handled transparently by the Databricks SDK. Pass `--read-only` to disable all writes to Unity Catalog (useful when mounting a shared volume that should not be modified). `df` reports a (synthetic) capacity so tools that check free space before writing work.
+
+**Restricting visibility** to a subset of securables is supported with `--securable-allowlist` and `--securable-denylist`. Each takes a comma-separated list of securables, written dotted: a catalog (`mycatalog`), a schema (`mycatalog.myschema`) or a volume (`mycatalog.myschema.myvol`). With a denylist, the listed securables (and everything beneath them) are hidden and inaccessible. With an allowlist, only the listed securables are listable and accessible — their parent catalog/schema stay navigable so you can reach them. If both are given, only allowlisted securables that are not also denied are accessible (deny wins). This is a mount-wide visibility filter layered on top of — not a replacement for — Unity Catalog's own per-user permission checks.
 
 To mitigate latency and improve **performance**, file metadata is cached in-memory. Data is cached
 to a local cache directory (`--disk-cache-dir`) and partially to RAM as well. Options to control
@@ -192,3 +194,14 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   downloaded into a temporary file before the open returns. For very large files (multi-GB)
   this can be slow. Use `O_WRONLY` or `O_RDWR | O_TRUNC` when you intend to overwrite the
   file completely.
+
+- **Renaming a file copies it.** The Databricks Files API has no server-side move, so renaming
+  a file downloads it and re-uploads it under the new name, then deletes the original. This is
+  cheap for the write-temp-then-rename pattern editors use, but expensive for large files.
+  Renaming a *directory* is not supported and returns `EXDEV`, which makes `mv` fall back to a
+  recursive copy.
+
+- **Securable allow/deny is a mount-wide visibility filter, not a per-user boundary.**
+  `--securable-allowlist`/`--securable-denylist` hide securables for everyone using the mount;
+  they are not per-user and do not replace Unity Catalog permissions. A user still needs the
+  relevant Unity Catalog privileges to read data that the filter allows.
