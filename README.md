@@ -238,12 +238,23 @@ user has to provide its own access token.
       User=root
       WorkingDirectory=/opt/fuse4dbricks
       ExecStart=/opt/fuse4dbricks/fuse4dbricks_start.sh
+      # On stop, fuse4dbricks catches SIGTERM and unmounts itself. Give it time
+      # to finish before systemd escalates to SIGKILL (which cannot be caught
+      # and would leave a stale mount).
+      TimeoutStopSec=30
+      # Belt-and-suspenders: if the process was hard-killed and left a stale
+      # mount, force-unmount it. '-' ignores failure when nothing is mounted.
+      ExecStopPost=-/bin/fusermount3 -uz /Volumes
       Restart=on-failure
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
       EOF
+
+  If your mountpoint is not `/Volumes`, update it in `ExecStopPost` to match.
+  On systems that ship FUSE 2 rather than FUSE 3, use the absolute path to
+  `fusermount` (e.g. `/usr/bin/fusermount`) instead of `fusermount3`.
 
 
 - Reload the daemon lists

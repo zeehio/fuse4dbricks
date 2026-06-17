@@ -1,3 +1,11 @@
+# 0.7.1 (2026-06-17)
+
+- Unmount cleanly on `SIGTERM`/`SIGHUP` (e.g. `systemctl stop`). trio only turns
+  `SIGINT` (Ctrl-C) into a clean shutdown; other termination signals killed the
+  process before `pyfuse3.close()` ran, leaving the kernel with a stale mount
+  that showed up as `d?????????` in `ls`/`df`. All termination signals now run
+  the same orderly unwind that unmounts the filesystem.
+
 # 0.7.0 (2026-06-17)
 
 - Fix files written from a Windows application through WSL being uploaded at
