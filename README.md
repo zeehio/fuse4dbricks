@@ -68,6 +68,109 @@ If you are the only user (e.g. on your laptop) and you have admin permissions, f
     ls /Volumes
     # Your catalogs will appear on /Volumes
 
+## Quick start on WSL
+
+This section covers mounting Databricks Unity Catalog volumes under
+[Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/) and
+browsing them directly from Windows Explorer.
+
+### 1. Install system dependencies
+
+On a WSL shell:
+
+```bash
+sudo apt update
+sudo apt install -y fuse3 libfuse3-dev
+```
+
+### 2. Install fuse4dbricks
+
+```bash
+pip install "fuse4dbricks"
+```
+
+### 3. Enable `user_allow_other` in FUSE
+
+Edit `/etc/fuse.conf` and uncomment the `user_allow_other` line:
+
+```bash
+sudo nano /etc/fuse.conf
+```
+
+Find the line `#user_allow_other` and remove the leading `#` so it reads:
+
+```
+user_allow_other
+```
+
+Save and close the file.
+
+### 4. Set your Databricks credentials
+
+Export your workspace URL and personal access token as environment variables:
+
+```bash
+export DATABRICKS_HOST="https://adb-xxxx.azuredatabricks.net"
+export DATABRICKS_TOKEN="dapi0000000-2"
+```
+
+Replace the values with your actual workspace URL and
+[personal access token](https://docs.databricks.com/en/dev-tools/auth/pat.html).
+
+### 5. Create the `/Volumes` mount point
+
+Create the directory and give your user write access:
+
+```bash
+sudo mkdir -p /Volumes
+sudo chown "$USER" /Volumes
+```
+
+### 6. Mount the filesystem
+
+Run `fuse4dbricks` with `--single-principal` (your token is the only one in use) and
+`--allow-other` (required for Windows Explorer to access the mount through WSL):
+
+```bash
+fuse4dbricks \
+  --workspace "$DATABRICKS_HOST" \
+  --single-principal \
+  --allow-other \
+  /Volumes
+```
+
+**Leave this terminal open.** The mount stays active as long as this process is running.
+
+### 7. Verify the mount
+
+Open a **new terminal** and check that your catalogs are visible:
+
+```bash
+ls /Volumes
+```
+
+You should see your Unity Catalog catalogs listed as directories. You can navigate into
+them as you would any local filesystem:
+
+```bash
+ls /Volumes/<catalog>/<schema>/
+```
+
+### 8. Browse from Windows Explorer
+
+WSL mounts are accessible from Windows as a network drive. In Windows Explorer:
+
+1. Open **Windows Explorer** and look for **Linux** in the left-hand navigation panel
+   (under "Network" or directly in the sidebar).
+2. Navigate to your WSL distribution (e.g. `\\wsl.localhost\Ubuntu`).
+3. Browse to the `Volumes` directory — your Databricks catalogs, schemas, and files
+   will appear just like any other folder.
+
+> **Tip:** You can also pin `\\wsl.localhost\Ubuntu\Volumes` to Quick Access or map it
+> as a network drive for faster access in the future.
+
+
+
 ## Multi user setup
 
 If you are on a shared computer (e.g. an HPC), fuse4dbricks can run as a root service and use the access tokens from any user who
