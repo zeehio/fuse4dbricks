@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import signal
 import traceback
 import sys
 
@@ -145,6 +146,26 @@ def setup_logging(debug_mode):
         logging.getLogger("pyfuse3").setLevel(logging.INFO)
 
 
+async def _shutdown_on_signal(cancel_scope: trio.CancelScope):
+    """Translate termination signals into a clean trio shutdown.
+
+    Without this, trio only converts SIGINT (Ctrl-C) into a KeyboardInterrupt;
+    SIGTERM (e.g. ``systemctl stop``) and SIGHUP kill the process outright, so
+    ``start_fuse``'s ``finally`` never runs and ``pyfuse3.close()`` never gets
+    a chance to unmount. The kernel is then left with a stale mount that shows
+    up as ``d?????????`` in ``ls``/``df``. Cancelling the nursery here makes
+    every signal follow the same orderly unwind that unmounts the filesystem.
+    """
+    with trio.open_signal_receiver(signal.SIGTERM, signal.SIGINT, signal.SIGHUP) as signals:
+        async for signum in signals:
+            logging.info(
+                "Received %s, unmounting and shutting down...",
+                signal.Signals(signum).name,
+            )
+            cancel_scope.cancel()
+            return
+
+
 async def start_fuse(ops, mountpoint, allow_other, debug_mode, stopped_evt: trio.Event | None = None):
     mount_options = ["fsname=fuse4dbricks", "noatime"]
     if allow_other:
@@ -165,7 +186,7 @@ async def start_fuse(ops, mountpoint, allow_other, debug_mode, stopped_evt: trio
         pass
     finally:
         try:
-            pyfuse3.close()
+            pyfuse3.close(unmount=True)
         finally:
             if stopped_evt is not None:
                 stopped_evt.set()
@@ -251,6 +272,7 @@ async def async_main():
         async with trio.open_nursery() as nursery:
             persistence.run_services(nursery)
             data_manager.run_services(nursery)
+            nursery.start_soon(_shutdown_on_signal, nursery.cancel_scope)
             nursery.start_soon(start_fuse, operations, mountpoint, args.allow_other, args.debug, stopped_evt)
 
             await stopped_evt.wait()
