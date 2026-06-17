@@ -1,4 +1,4 @@
-# 0.7.0 (2026-06-16)
+# 0.7.0 (2026-06-17)
 
 - Fix files written from a Windows application through WSL being uploaded at
   the correct size but filled with zeros. A path-based `setattr(size)` (which
