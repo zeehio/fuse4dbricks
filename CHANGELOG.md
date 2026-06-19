@@ -1,3 +1,14 @@
+# 0.7.2 (2026-06-19)
+
+- Fix a just-created file or directory being reported as nonexistent for up to
+  the negative-cache TTL (~5s) when its path had been stat'd before it existed.
+  Probing a not-yet-existing path records a negative (not-found) cache entry,
+  and `invalidate()` — called on every mutating op (create/write, `mkdir`,
+  `unlink`/`rmdir`, `rename`, truncate) — cleared the attribute and directory
+  caches but left that negative entry in place, so a subsequent `stat` kept
+  returning `ENOENT` until the entry expired. `invalidate()` now also evicts the
+  path's negative-cache entries (for every principal).
+
 # 0.7.1 (2026-06-17)
 
 - Unmount cleanly on `SIGTERM`/`SIGHUP` (e.g. `systemctl stop`). trio only turns
