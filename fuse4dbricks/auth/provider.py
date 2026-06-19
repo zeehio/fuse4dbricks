@@ -171,8 +171,17 @@ class DatabricksUnifiedAuthProvider:
         """
         try:
             st = os.stat(config_file)
+        except FileNotFoundError:
+            # A missing config file is the normal state for any uid without a
+            # Databricks setup (e.g. root or a system daemon probing the mount).
+            # Logging it at error level floods the journal with one line per
+            # request, so keep it at debug.
+            logger.debug("Config file %s does not exist, ignoring", config_file)
+            return False
         except OSError as exc:
-            logger.error("Cannot stat config file %s: %s", config_file, exc)
+            # Other stat failures (permission denied, etc.) are unexpected and
+            # worth surfacing, but are not fatal to the mount.
+            logger.warning("Cannot stat config file %s: %s", config_file, exc)
             return False
         if not stat.S_ISREG(st.st_mode):
             logger.error("Config file %s is not a regular file, ignoring", config_file)
@@ -216,7 +225,9 @@ class DatabricksUnifiedAuthProvider:
                 config_file = default_config
 
         if config_file is None:
-            logger.error("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
+            # Expected for any uid without a Databricks config; debug-level so a
+            # repeatedly-probing uid (e.g. root) does not flood the journal.
+            logger.debug("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
             return None, None
         return profile, config_file
 
@@ -247,7 +258,10 @@ class DatabricksUnifiedAuthProvider:
         # The process does not define a token, but defines a profile or config file:
         profile, config_file = self._get_profile_and_config_file_name(env, ctx.uid)
         if profile is None or config_file is None:
-            logger.error("No databricks token found in environment variables for pid %s, and no profile or config file found for uid %s", ctx.pid, ctx.uid)
+            # Routine when a uid has neither a token in its environment nor a
+            # config file; the caller turns this into EACCES. Debug-level to
+            # avoid one error line per request from a probing uid.
+            logger.debug("No databricks token found in environment variables for pid %s, and no profile or config file found for uid %s", ctx.pid, ctx.uid)
             return None
         return self._get_token_from_config(profile, config_file)
 

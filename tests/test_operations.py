@@ -1264,6 +1264,52 @@ async def test_rename_file_copies_then_deletes_and_moves_inode(
 
 
 @pytest.mark.trio
+async def test_rename_refreshes_source_mtime_before_copy(
+    fs, inode_manager, uc_client, metadata_manager, data_manager, ctx
+):
+    """Regression: a file just written through the mount carries a locally
+    stamped st_mtime (create()-time wall clock) that is earlier than the
+    server's Last-Modified. rename() must refresh the source from the server
+    before copying, so the If-Unmodified-Since the copy sends matches the
+    server and does not 412. The copy read must use the refreshed mtime/size,
+    not the stale inode values."""
+    vol, f = _make_vol_file(inode_manager, size=512)
+    # Stale, locally-stamped attributes left on the inode after create()/write.
+    f.attr.st_mtime = 9999.0
+    f.attr.st_size = 512
+    # The server's authoritative view, returned by the refresh.
+    server_attr = _make_attr(False, size=5)  # _make_attr -> st_mtime=2000.0
+    metadata_manager.get_attributes = AsyncMock(return_value=server_attr)
+    metadata_manager.lookup_child = AsyncMock(return_value=None)  # dest is free
+    metadata_manager.invalidate = MagicMock()
+
+    await fs.rename(vol.inode, b"data.txt", vol.inode, b"renamed.txt", 0, ctx)
+
+    # Source was refreshed from the server before the copy.
+    metadata_manager.get_attributes.assert_awaited_once()
+    # The copy read used the server mtime (2000.0) and size (5), not the stale
+    # local values (9999.0 / 512).
+    read_args = data_manager.read.call_args.args
+    assert read_args[3] == 2000.0           # mtime -> If-Unmodified-Since
+    assert read_args[4] == 5                # file_size
+
+
+@pytest.mark.trio
+async def test_rename_source_deleted_during_refresh_raises_enoent(
+    fs, inode_manager, metadata_manager, ctx
+):
+    """If the source vanished by the time we refresh its metadata, rename
+    surfaces ENOENT rather than copying with stale attributes."""
+    vol, f = _make_vol_file(inode_manager, size=5)
+    metadata_manager.get_attributes = AsyncMock(return_value=None)  # gone
+    metadata_manager.lookup_child = AsyncMock(return_value=None)
+
+    with pytest.raises(pyfuse3.FUSEError) as ei:
+        await fs.rename(vol.inode, b"data.txt", vol.inode, b"renamed.txt", 0, ctx)
+    assert ei.value.errno == errno.ENOENT
+
+
+@pytest.mark.trio
 async def test_rename_into_other_directory_reparents_inode(
     fs, inode_manager, uc_client, metadata_manager, ctx
 ):
