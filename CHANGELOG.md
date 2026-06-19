@@ -1,3 +1,22 @@
+# 0.7.3 (2026-06-19)
+
+- Fix `mv` of a freshly written file failing with an I/O error. `rename()`
+  copies the source by downloading it with an `If-Unmodified-Since` guard built
+  from the inode's `st_mtime`. A file just created/written through the mount
+  carries a locally-stamped mtime (the `create()`-time wall clock), which is
+  earlier than the server's `Last-Modified` (assigned when the upload
+  completed), so the server reported `412 Precondition Failed` and the copy read
+  failed with `EIO`. `rename()` now refreshes the source's metadata from the
+  server before copying, so the guard matches the server's view. (Ordinary reads
+  were unaffected: they refresh via `getattr` before reading; only `rename`
+  bypassed that.)
+- Stop logging a missing Databricks config file at `ERROR`. A uid without a
+  Databricks setup (e.g. `root` or a system daemon probing the mount) produced
+  three error lines per request, flooding the journal. A missing default
+  `~/.databrickscfg` and the resulting "no token" outcome are now logged at
+  `debug`; genuinely unexpected stat failures (e.g. permission denied) are
+  logged at `warning`.
+
 # 0.7.2 (2026-06-19)
 
 - Fix a just-created file or directory being reported as nonexistent for up to

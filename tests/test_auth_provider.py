@@ -184,6 +184,31 @@ def test_profile_config_nothing_found(unified, tmp_path, monkeypatch):
     assert (profile, config_file) == (None, None)
 
 
+def test_missing_default_config_is_not_logged_as_error(unified, tmp_path, monkeypatch, caplog):
+    """A missing ~/.databrickscfg is the normal state for a uid without a
+    Databricks setup (e.g. root probing the mount). It must not be logged at
+    error level, or a repeatedly-probing uid floods the journal with one line
+    per request."""
+    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "empty"))
+    with caplog.at_level("DEBUG", logger="fuse4dbricks.auth.provider"):
+        profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
+    assert (profile, config_file) == (None, None)
+    # The benign "does not exist" path logs at debug, never at error/warning.
+    assert not [r for r in caplog.records if r.levelname in ("ERROR", "WARNING")]
+    assert any(r.levelname == "DEBUG" for r in caplog.records)
+
+
+def test_unreadable_config_is_logged_as_warning(unified, tmp_path, monkeypatch, caplog):
+    """A stat failure that is NOT 'file missing' (e.g. permission denied) is
+    unexpected and stays visible at warning level."""
+    def _boom(path):
+        raise PermissionError("denied")
+    monkeypatch.setattr(provider_mod.os, "stat", _boom)
+    with caplog.at_level("DEBUG", logger="fuse4dbricks.auth.provider"):
+        assert unified._is_safe_config_file(str(tmp_path / "cfg"), os.getuid()) is False
+    assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # _get_token_from_config
 # ---------------------------------------------------------------------------

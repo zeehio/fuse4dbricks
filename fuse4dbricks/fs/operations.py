@@ -757,6 +757,24 @@ class UnityCatalogFS(pyfuse3.Operations):
         if src_entry.is_dir:
             raise pyfuse3.FUSEError(errno.EXDEV)
 
+        # Refresh the source's metadata from the server before copying. A file
+        # just created/written through this mount carries a locally-stamped
+        # st_mtime (the create()-time wall clock), which is earlier than the
+        # server's Last-Modified (assigned when the upload completed). The copy
+        # below sends that mtime as If-Unmodified-Since; a too-early value makes
+        # the server report 412 (file changed since) and the read fails with
+        # EIO, so `mv` of a freshly-written file breaks. getattr() refreshes the
+        # inode on the ordinary read path but rename() never does, so do it here.
+        try:
+            refreshed = await self.metadata_manager.get_attributes(src_entry, ctx)
+        except pyfuse3.FUSEError:
+            raise
+        except Exception as exc:
+            self._raise_fuse_error(exc, fs_path=old_fs_path, op="rename")
+        if refreshed is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        src_entry.attr.update(refreshed)
+
         # Inspect the destination for NOREPLACE / file-over-dir rules.
         try:
             dst_attr = await self.metadata_manager.lookup_child(new_parent, new_name, ctx)

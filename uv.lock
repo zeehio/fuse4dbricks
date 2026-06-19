@@ -353,7 +353,7 @@ wheels = [
 
 [[package]]
 name = "fuse4dbricks"
-version = "0.7.2"
+version = "0.7.3"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-sdk" },
