@@ -480,6 +480,18 @@ class MetadataManager:
             if attr_cache_key in self._attr_cache:
                 del self._attr_cache[attr_cache_key]
 
+            # A mutating op (create/write/mkdir/rename/truncate/delete) just
+            # changed this path's presence, so any cached negative is now stale.
+            # Drop it for every principal: invalidate() is synchronous and has
+            # no principal in hand, and a just-created path must be immediately
+            # visible on this mount rather than hidden until the negative TTL
+            # expires. Build the key list first, then delete -- there is no
+            # await between, so this stays atomic under trio (mirrors the
+            # lock-free contract of the rest of this method).
+            stale_negatives = [k for k in self._negative_cache if k[1] == fs_path]
+            for key in stale_negatives:
+                del self._negative_cache[key]
+
             parent_path = "/".join(fs_path.rstrip("/").split("/")[:-1]) or "/"
             if parent_path in self._dir_cache:
                 del self._dir_cache[parent_path]

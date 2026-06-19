@@ -453,6 +453,26 @@ def test_invalidate_nonexistent_path_does_not_raise(manager):
     manager.invalidate("/nonexistent/path/file.txt", is_dir=False)  # Must not raise
 
 
+def test_invalidate_clears_negative_cache_for_all_principals(manager, ctx):
+    """A mutating op (create/write/mkdir/...) routes through invalidate(); it
+    must drop the path's negative entry for EVERY principal so a just-created
+    file is immediately visible instead of hidden until the negative TTL
+    expires. This is the negative-cache poisoning bug: stat a path before it
+    exists, create it, then stat again -> stale ENOENT for ~ttl_negative."""
+    future = time.time() + 100
+    fs_path = "/cat/sch/vol/file.txt"
+    manager._negative_cache[("alice@example.com", fs_path)] = future
+    manager._negative_cache[("bob@example.com", fs_path)] = future
+    # A negative for a *different* path must survive.
+    manager._negative_cache[("alice@example.com", "/cat/sch/vol/other.txt")] = future
+
+    manager.invalidate(fs_path, is_dir=False)
+
+    assert ("alice@example.com", fs_path) not in manager._negative_cache
+    assert ("bob@example.com", fs_path) not in manager._negative_cache
+    assert ("alice@example.com", "/cat/sch/vol/other.txt") in manager._negative_cache
+
+
 # ---------------------------------------------------------------------------
 # reauthorize  (token change -> refresh the uid -> principal mapping)
 # ---------------------------------------------------------------------------
