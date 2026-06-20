@@ -1,3 +1,34 @@
+# 0.7.4 (2026-06-20)
+
+- Make writes durable and immediately visible on `close()`. The upload ran only
+  in `release()`, which the kernel does not wait for and whose errors it
+  discards, so `close()` returned before the data was uploaded — a file written
+  through the mount was invisible (and write errors were silent) for the
+  duration of the asynchronous upload. The upload now runs in `flush()`, which
+  handles the `close()` syscall: the kernel blocks on it, the upload completes
+  before `close()` returns, and a failed upload surfaces as a `close()` error.
+  `release()` keeps the upload as a fallback for the rare close-without-flush.
+- Fix a stale read after overwriting a file within the same second. Cached
+  chunks are keyed by the server `mtime`, but the Files API `Last-Modified`
+  header has only 1-second resolution (verified against the live API: no
+  sub-second timestamp and no `ETag`), so two writes in the same second shared a
+  key and a read could return the previous content. The chunk cache key now
+  carries a per-path generation counter (RAM key and on-disk chunk filename)
+  that `DataManager.invalidate_path()` bumps O(1) on every local write (wired
+  into write/flush, rename, truncate and unlink); old chunks become unreachable
+  and age out via the existing LRUs. Exposed by the durable-`close()` fix above,
+  which made same-second overwrites reachable.
+- Fix cache invalidation not reaching the kernel. Mutating ops route through
+  `invalidate()`, which evicted the in-process attribute/dir/negative caches but
+  never told the FUSE kernel module, so the kernel kept serving stale `stat`
+  results from its own attribute and dentry caches for up to its
+  `attr_timeout` / `entry_timeout` (the pyfuse3 default, 300s) — a deleted file
+  kept stat-ing OK and a recreated one stayed hidden. `invalidate()` now also
+  resolves the path through the inode manager and calls
+  `pyfuse3.invalidate_entry_async()` (drop the parent dentry; the async variant
+  avoids deadlocking against the unlink/rename/create request in flight) and
+  `pyfuse3.invalidate_inode()` (drop the inode's cached attributes and data).
+
 # 0.7.3 (2026-06-19)
 
 - Fix `mv` of a freshly written file failing with an I/O error. `rename()`

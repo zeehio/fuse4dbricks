@@ -15,7 +15,7 @@ import pyfuse3
 
 from fuse4dbricks.api.uc_client import (UcNodeType, UnityCatalogClient,
                                         UnityCatalogEntry)
-from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
+from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr, InodeManager
 from fuse4dbricks.fs.utils import (fs_to_uc_path,  fs_to_securable,
                                    InflightCoalescer,
                                    uc_to_fs_path)
@@ -54,6 +54,7 @@ class MetadataManager:
         max_entries=20000,
         ttl_catalog=600.0,
         ttl_negative: float=5.0,
+        inode_manager: InodeManager | None = None,
     ):
         """
         :param uc_client: The Unity Catalog API client.
@@ -61,8 +62,15 @@ class MetadataManager:
         :param max_entries: Maximum number of metadata entries to keep in RAM.
         :param ttl_negative: Time-to-live in seconds for negative (not-found)
             cache entries. Kept short because it hides newly-created paths.
+        :param inode_manager: Used by ``invalidate`` to resolve an fs_path to an
+            inode so the kernel's own attribute/dentry cache can be dropped too.
+            Optional: when ``None`` only the in-process caches are evicted (the
+            kernel still expires its entries on its own ``attr_timeout`` /
+            ``entry_timeout``). Always wired in production; left unset in unit
+            tests that exercise the in-process caches in isolation.
         """
         self.uc_client = uc_client
+        self._inode_manager = inode_manager
         self._ttl: float = ttl
         self._ttl_catalog = ttl_catalog
         self._ttl_negative = ttl_negative
@@ -497,6 +505,59 @@ class MetadataManager:
                 del self._dir_cache[parent_path]
         except Exception:
             pass
+
+        # Evicting our own caches is not enough: the kernel keeps its own
+        # attribute and dentry caches (for up to attr_timeout / entry_timeout),
+        # so without this a deleted file would keep stat-ing OK and a fresh one
+        # would stay hidden until the kernel's timeout expired. Tell the kernel
+        # to forget this path too.
+        self._invalidate_kernel_cache(fs_path)
+
+    def _invalidate_kernel_cache(self, fs_path: str):
+        """Drop the kernel's cached attributes, data and dentry for ``fs_path``.
+
+        Resolves the path through the inode manager and notifies the FUSE
+        kernel module. A no-op when no inode manager is wired (unit tests) or
+        when neither the path nor its parent is currently known to the kernel.
+        """
+        if self._inode_manager is None:
+            return
+        norm = fs_path.rstrip("/") or "/"
+        if norm == "/":
+            return
+        parent_path, _, name = norm.rpartition("/")
+        parent_path = parent_path or "/"
+
+        # Forget the directory entry in the parent so a deleted name stops
+        # resolving and a recreated one is re-looked-up. Must use the *_async
+        # variant: invalidate() runs inside the very unlink/rename/create
+        # request that touched this entry, and the synchronous invalidate_entry
+        # would deadlock against it.
+        parent_inode = self._inode_manager.get_inode_by_path(parent_path)
+        if parent_inode is not None:
+            try:
+                pyfuse3.invalidate_entry_async(
+                    parent_inode, name.encode("utf-8"), ignore_enoent=True
+                )
+            except Exception:
+                logger.debug(
+                    "invalidate_entry_async failed for %s", fs_path, exc_info=True
+                )
+
+        # Forget cached attributes and page data for the inode itself, so a
+        # changed size/mtime or stale contents are re-fetched on next access.
+        inode = self._inode_manager.get_inode_by_path(norm)
+        if inode is not None:
+            try:
+                pyfuse3.invalidate_inode(inode)
+            except OSError:
+                # ENOSYS (kernel lacks support) or a transient failure: the
+                # kernel's own attr_timeout still bounds how long it stays stale.
+                pass
+            except Exception:
+                logger.debug(
+                    "invalidate_inode failed for %s", fs_path, exc_info=True
+                )
 
     # =========================================================================
     # Internal Logic & Helpers

@@ -43,7 +43,7 @@ class DiskPersistence:
         nursery.start_soon(self._graceful_init)
         nursery.start_soon(self._background_maintenance)
 
-    def _get_chunk_path(self, fs_path: str, chunk_index: int, mtime: float) -> str:
+    def _get_chunk_path(self, fs_path: str, chunk_index: int, mtime: float, gen: int = 0) -> str:
         """Compute the cache path for a chunk (256-shard distribution).
 
         Pure: does NOT touch the filesystem. ``retrieve_chunk`` runs on every
@@ -59,9 +59,10 @@ class DiskPersistence:
         shard2 = f"{(chunk_index // 1000):07d}"  # Secondary shard to prevent too many files in one dir
         shard_dir = os.path.join(self.cache_dir, shard1, shard2)
         mtime_ms = int(mtime * 1000)
-        # the cache_path
+        # gen is a local cache epoch (see DataManager.invalidate_path); it keeps
+        # a same-second overwrite from reusing a stale chunk file on disk.
         return os.path.join(
-            shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin"
+            shard_dir, f"{sha256_hash}_{mtime_ms}_g{gen}_{chunk_index:07d}.bin"
         )
 
     @staticmethod
@@ -96,13 +97,13 @@ class DiskPersistence:
                     continue
 
     async def retrieve_chunk(
-        self, fs_path: str, chunk_index: int, mtime: float
+        self, fs_path: str, chunk_index: int, mtime: float, gen: int = 0
     ) -> bytes | None:
         """
         Retrieves a chunk from disk.
         Updates LRU access time BEFORE reading to prevent concurrent eviction.
         """
-        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime)
+        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime, gen)
 
         # 1. OPTIMISTIC PROMOTION (Pinning)
         # Mark as accessed so GC doesn't delete it while we read.
@@ -141,9 +142,10 @@ class DiskPersistence:
         chunk_index: int,
         mtime: float,
         stream: AsyncGenerator[bytes, None],
+        gen: int = 0,
     ) -> bytes:
         """Consumes a stream and writes it to disk. Returns the bytes written."""
-        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime)
+        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime, gen)
         temp_path = f"{cache_path}.{os.getpid()}.tmp"
         result = bytearray()
         bytes_written = 0

@@ -243,7 +243,7 @@ async def async_main():
 
     inode_manager = InodeManager()
     data_manager = DataManager(uc_client, persistence, ram_cache_mb=args.ram_cache_mb)
-    metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec, ttl_negative=args.metadata_cache_ttl_negative_sec)
+    metadata_manager = MetadataManager(uc_client, ttl=args.metadata_cache_ttl_sec, max_entries=args.metadata_cache_max_entries, ttl_catalog=args.metadata_cache_ttl_catalog_sec, ttl_negative=args.metadata_cache_ttl_negative_sec, inode_manager=inode_manager)
     # On a 401, the token is invalidated and re-resolved (possibly to a
     # different principal); drop the cached principal so authz re-derives it.
     auth_provider.set_token_invalidation_callback(metadata_manager.forget_principal)
