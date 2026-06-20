@@ -50,6 +50,57 @@ def test_finalize_makes_full_content_readable_from_path(writes_dir, data):
     wb.close()
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"hello world",              # well under the buffer
+        bytes(range(256)) * 8,       # 2048 bytes, under the default ~8 KB buffer
+        b"x" * 100_000,              # larger than the buffer
+    ],
+)
+def test_flush_to_disk_makes_full_content_readable_from_path(writes_dir, data):
+    """After flush_to_disk(), a fresh open(path) (as the upload does) sees every
+    byte -- same guarantee as finalize() but without closing the handle, which
+    is what the flush()-time upload relies on."""
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, data)
+
+    wb.flush_to_disk()
+
+    with open(wb.path, "rb") as f:
+        assert f.read() == data
+    wb.close()
+
+
+def test_flush_to_disk_keeps_handle_writable(writes_dir):
+    """Unlike finalize(), flush_to_disk() leaves the handle open so further
+    writes succeed -- flush() may be delivered more than once for one open file
+    (e.g. a duplicated fd) with writes in between."""
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, b"first")
+    wb.flush_to_disk()
+    with open(wb.path, "rb") as f:
+        assert f.read() == b"first"
+
+    # Handle still usable: append more, flush again, full content visible.
+    wb.write(5, b"-second")
+    wb.flush_to_disk()
+    with open(wb.path, "rb") as f:
+        assert f.read() == b"first-second"
+    wb.close()
+
+
+def test_flush_to_disk_is_idempotent_and_safe_after_close(writes_dir):
+    wb = WriteBuffer(writes_dir)
+    wb.write(0, b"data")
+    wb.flush_to_disk()
+    wb.flush_to_disk()  # must not raise
+    wb.finalize()
+    wb.flush_to_disk()  # no-op once closed; must not raise
+    wb.close()
+
+
 def test_finalize_is_idempotent(writes_dir):
     wb = WriteBuffer(writes_dir)
     wb.write(0, b"data")

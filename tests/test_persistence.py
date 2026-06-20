@@ -78,9 +78,29 @@ async def test_sharding_structure(persistence):
         persistence.cache_dir,
         shard1,
         shard2,
-        f"{file_hash}_{mtime_ms}_{chunk_index:07d}.bin",
+        f"{file_hash}_{mtime_ms}_g0_{chunk_index:07d}.bin",
     )
     assert os.path.exists(expected_path)
+
+
+@pytest.mark.trio
+async def test_chunk_path_differs_by_generation(persistence):
+    """Same path/chunk/mtime but a different generation must map to a different
+    file, so a bumped generation never reuses a stale chunk on disk."""
+    p0 = persistence._get_chunk_path("f", 0, 5.0, 0)
+    p1 = persistence._get_chunk_path("f", 0, 5.0, 1)
+    assert p0 != p1
+
+
+@pytest.mark.trio
+async def test_generations_do_not_collide_on_same_mtime(persistence):
+    """Two writes with an identical mtime (the 1-second-resolution collision)
+    but different generations are stored and retrieved independently -- the
+    regression guard for serving stale content after a same-second overwrite."""
+    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"OLD"), gen=0)
+    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"NEW"), gen=1)
+    assert await persistence.retrieve_chunk("f", 0, 5.0, 0) == b"OLD"
+    assert await persistence.retrieve_chunk("f", 0, 5.0, 1) == b"NEW"
 
 
 @pytest.mark.trio
@@ -225,7 +245,7 @@ async def test_graceful_init_discovery(cache_dir):
     os.makedirs(shard_dir, exist_ok=True)
     mtime_ms = int(mtime * 1000)
     file_path = os.path.join(
-        shard_dir, f"{sha256_hash}_{mtime_ms}_{chunk_index:07d}.bin"
+        shard_dir, f"{sha256_hash}_{mtime_ms}_g0_{chunk_index:07d}.bin"
     )
     with open(file_path, "wb") as f:
         f.write(b"existing_data")  # 13 bytes

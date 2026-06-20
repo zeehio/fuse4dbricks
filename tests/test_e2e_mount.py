@@ -155,27 +155,20 @@ def readonly_mountpoint():
         yield mnt
 
 
-def _read_back(path: str, expected: bytes, timeout_s: float = 20.0) -> bytes:
-    """Read a file through the mount until its content equals ``expected``.
+def _read_back(path: str, expected: bytes) -> bytes:
+    """Read a file through the mount and assert its content equals ``expected``.
 
-    Retries on both OSError (a freshly-created path is hidden by the negative
-    cache for its short TTL, and a just-uploaded object has a brief
-    read-after-write window) and on a not-yet-consistent body (e.g. a transient
-    zero-length read), so the test does not race the live API.
+    Reads exactly once, with no retry: flush() uploads synchronously on close()
+    and the Files API is immediately read-after-write consistent (see
+    test_uc_client_live.py), so a write is durable and readable the instant the
+    writing handle is closed -- there is nothing to wait out.
     """
-    deadline = time.monotonic() + timeout_s
-    last: object = "no attempt"
-    while time.monotonic() < deadline:
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            if data == expected:
-                return data
-            last = f"content not settled (len={len(data)}, want {len(expected)})"
-        except OSError as exc:
-            last = exc
-        time.sleep(0.5)
-    raise AssertionError(f"read-back of {path} did not settle within {timeout_s}s: {last}")
+    with open(path, "rb") as f:
+        data = f.read()
+    assert data == expected, (
+        f"read-back of {path}: got {len(data)} bytes, want {len(expected)}"
+    )
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +326,8 @@ def test_partial_wronly_write_preserves_tail(mountpoint):
     try:
         with open(path, "wb") as fobj:
             fobj.write(original)
-        # Whole file must be present (waits out the negative-cache TTL and the
-        # read-after-write window). This also warms the cache so the O_WRONLY
-        # reopen below pre-loads from cache rather than racing the API.
+        # Whole file must be present immediately after close (flush() uploaded
+        # synchronously). This also primes the O_WRONLY reopen below.
         _read_back(path, original)
 
         # Reopen O_WRONLY (no O_TRUNC) and overwrite only the first 3 bytes.
@@ -348,6 +340,42 @@ def test_partial_wronly_write_preserves_tail(mountpoint):
         # The leading bytes change; the untouched tail must survive the upload.
         expected = b"AAA" + original[3:]
         _read_back(path, expected)
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+@requires_live_mount
+def test_write_is_durable_and_visible_on_close(mountpoint):
+    # close() must make a write durable and immediately visible -- no waiting.
+    #
+    # The upload runs in flush(), which handles the close() syscall: the kernel
+    # blocks on it, so by the time close() returns the bytes are on the backend
+    # and the in-process + kernel caches have been invalidated. Combined with the
+    # Files API being immediately read-after-write consistent (proven in
+    # test_uc_client_live.py), the file resolves, stats with the right size and
+    # reads back its content on the very first attempt after close -- with zero
+    # sleeps or retries.
+    #
+    # Before the fix the upload ran only in release(), which the kernel does not
+    # wait for, so close() returned before the data was uploaded and the file was
+    # invisible for the duration of the (asynchronous) upload.
+    name = f"fuse4dbricks_e2e_visible_{uuid.uuid4().hex}.bin"
+    path = os.path.join(mountpoint, _volume_relpath(), name)
+    payload = b"durable-on-close\n" * 8
+    try:
+        # The path must not exist yet (no positive entry cached anywhere).
+        assert not os.path.exists(path)
+
+        with open(path, "wb") as fobj:
+            fobj.write(payload)
+
+        # Immediately after close -- no sleep, no retry -- the file is fully there.
+        assert os.path.exists(path)
+        assert os.stat(path).st_size == len(payload)
+        _read_back(path, payload)
     finally:
         try:
             os.remove(path)
@@ -369,8 +397,7 @@ def test_rename_moves_file_content(mountpoint):
     try:
         with open(src, "wb") as fobj:
             fobj.write(payload)
-        # Wait out the read-after-write window; this also warms the chunk cache
-        # so rename's internal read is served locally rather than racing the API.
+        # Readable immediately after close (flush() uploaded synchronously).
         _read_back(src, payload)
 
         os.rename(src, dst)

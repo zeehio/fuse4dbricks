@@ -95,6 +95,7 @@ def metadata_manager():
 def data_manager():
     mgr = MagicMock()
     mgr.read = AsyncMock(return_value=b"hello")
+    mgr.invalidate_path = AsyncMock()
     mgr.chunk_size = 8 * 1024 * 1024  # 8 MB, same as the real DataManager
     return mgr
 
@@ -706,6 +707,78 @@ async def test_release_upload_on_dirty(fs, inode_manager, uc_client, ctx):
     uc_client.upload_file.assert_awaited_once()
     call_args = uc_client.upload_file.call_args
     assert call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+
+
+@pytest.mark.trio
+async def test_flush_uploads_on_dirty(fs, inode_manager, uc_client, metadata_manager, ctx):
+    """flush() handles close(): it must upload, invalidate and clear dirty so the
+    write is durable and visible by the time close() returns (release() used to
+    do this asynchronously, after close() had already returned)."""
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    metadata_manager.invalidate = MagicMock()
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"content")
+
+    await fs.flush(pyfuse3.FileHandleT(fh))
+
+    uc_client.upload_file.assert_awaited_once()
+    assert uc_client.upload_file.call_args.args[0] == "/Volumes/cat/sch/vol/data.txt"
+    metadata_manager.invalidate.assert_called_once_with(f.fs_path, is_dir=False)
+    assert fs._open_state[fh]["dirty"] is False
+
+
+@pytest.mark.trio
+async def test_flush_then_release_does_not_reupload(fs, inode_manager, uc_client, ctx):
+    """After flush() uploads, the release() fallback must be a no-op (dirty was
+    cleared) so the file is uploaded exactly once per close()."""
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"content")
+
+    await fs.flush(pyfuse3.FileHandleT(fh))
+    await fs.release(pyfuse3.FileHandleT(fh))
+
+    uc_client.upload_file.assert_awaited_once()
+
+
+@pytest.mark.trio
+async def test_flush_upload_failure_returns_eio(fs, inode_manager, uc_client, metadata_manager, ctx):
+    """A failed upload in flush() surfaces as EIO to close() and must NOT
+    invalidate the cache (the remote file is unchanged)."""
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    uc_client.upload_file = AsyncMock(side_effect=UcUnavailable("503"))
+    metadata_manager.invalidate = MagicMock()
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.write(fh, offset=0, buffer=b"data")
+
+    with pytest.raises(pyfuse3.FUSEError) as exc_info:
+        await fs.flush(pyfuse3.FileHandleT(fh))
+    assert exc_info.value.errno == errno.EIO
+    metadata_manager.invalidate.assert_not_called()
+    # Still dirty, so the release() fallback retries the upload.
+    assert fs._open_state[fh]["dirty"] is True
+
+
+@pytest.mark.trio
+async def test_flush_unknown_fh_is_noop(fs):
+    await fs.flush(pyfuse3.FileHandleT(9999))  # Must not raise
+
+
+@pytest.mark.trio
+async def test_flush_not_dirty_no_upload(fs, inode_manager, uc_client, ctx):
+    """Open O_WRONLY without writing, then flush: nothing to upload."""
+    _vol, f = _make_vol_file(inode_manager, size=0)
+    O_WRONLY = 1
+    file_info = await fs.open(f.inode, O_WRONLY, ctx)
+    fh = int(file_info.fh)
+    await fs.flush(pyfuse3.FileHandleT(fh))
+    uc_client.upload_file.assert_not_awaited()
 
 
 @pytest.mark.trio

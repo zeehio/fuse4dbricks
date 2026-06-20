@@ -48,6 +48,19 @@ class WriteBuffer:
         self._tmp.truncate(size)
         self._size = size
 
+    def flush_to_disk(self) -> None:
+        """Push buffered writes to the OS so a separate reader sees them.
+
+        Like ``finalize()`` this makes the full content visible to the upload's
+        own ``open(self.path)``, but it keeps the write handle open so ``read()``
+        and ``write()`` may continue afterwards. Use this when the upload happens
+        on ``flush`` (the ``close()`` syscall), which the kernel may deliver more
+        than once for a single open file (e.g. a duplicated fd) with further
+        writes in between. Idempotent; a no-op once the handle is closed.
+        """
+        if not self._tmp.closed:
+            self._tmp.flush()
+
     def finalize(self) -> None:
         """Flush and close the write handle, keeping the file on disk.
 

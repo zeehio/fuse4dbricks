@@ -473,6 +473,55 @@ class UnityCatalogFS(pyfuse3.Operations):
         }
         return (pyfuse3.FileInfo(fh=fh), self._entry_to_fuse_attr(entry))
 
+    async def _upload_if_dirty(self, state: dict) -> None:
+        """Upload the write buffer to Unity Catalog if it has unsaved writes.
+
+        Shared by ``flush`` and ``release``. Uploads, then marks the handle
+        clean and busts the caches so the new content is immediately visible.
+        Raises ``FUSEError(EIO)`` on upload failure (the caller decides whether
+        that error reaches userspace). A no-op when the buffer is clean, so a
+        second ``flush`` — or the ``release`` fallback after a successful
+        ``flush`` — does not re-upload.
+        """
+        write_buffer: WriteBuffer | None = state.get("write_buffer")
+        if write_buffer is None or not state.get("dirty", False):
+            return
+
+        entry = self.inodes.get_entry(state["inode"])
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        uc_path = fs_to_uc_path(entry.fs_path)
+        try:
+            # Push buffered writes to the OS so the upload's separate reader sees
+            # the complete file (writes smaller than ~8 KB would otherwise read
+            # back as zero bytes). Keep the handle open: flush may be delivered
+            # again with more writes before release.
+            write_buffer.flush_to_disk()
+            await self.uc_client.upload_file(uc_path, write_buffer.path, ctx=state["ctx"])
+        except Exception as e:
+            logger.error("Upload failed for %s: %s", entry.fs_path, e)
+            # Remote file is unchanged: do NOT invalidate the cache.
+            raise pyfuse3.FUSEError(errno.EIO) from e
+        # Clean before invalidating so a concurrent reader never sees "dirty".
+        state["dirty"] = False
+        # Bust caches so subsequent reads see the new file: metadata (size/mtime)
+        # and the chunk content cache (whose mtime key cannot tell apart two
+        # writes in the same second).
+        self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
+        await self.data_manager.invalidate_path(entry.fs_path)
+
+    async def flush(self, fh: pyfuse3.FileHandleT) -> None:
+        # flush handles the close() syscall: the kernel waits for it and returns
+        # its error to userspace. Uploading here (rather than only in release(),
+        # which runs asynchronously and whose errors the kernel discards) makes a
+        # write durable and immediately visible by the time close() returns, and
+        # lets a failed upload surface as a close() error instead of being lost.
+        state = self._open_state.get(fh)
+        if state is None:
+            return
+        await self._upload_if_dirty(state)
+
     async def release(self, fh: pyfuse3.FileHandleT) -> None:
         if fh not in self._open_state:
             # This should not happen, but we want to be resilient to it. Just ignore.
@@ -482,7 +531,6 @@ class UnityCatalogFS(pyfuse3.Operations):
         inode = state["inode"]
         ctx = state["ctx"]
         write_buffer: WriteBuffer | None = state.get("write_buffer")
-        dirty: bool = state.get("dirty", False)
 
         entry = self.inodes.get_entry(inode)
         if entry is None:
@@ -492,26 +540,11 @@ class UnityCatalogFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         try:
-            if write_buffer is not None and dirty:
-                uc_path = fs_to_uc_path(entry.fs_path)
-                try:
-                    # Flush + close the write handle so the upload reads the
-                    # complete file from disk (buffered writes smaller than
-                    # ~8 KB would otherwise upload as zero bytes).
-                    write_buffer.finalize()
-                    await self.uc_client.upload_file(
-                        uc_path, write_buffer.path, ctx=ctx
-                    )
-                except Exception as e:
-                    logger.error("Upload failed for %s: %s", entry.fs_path, e)
-                    # Remote file is unchanged: do NOT invalidate the cache.
-                    raise pyfuse3.FUSEError(errno.EIO) from e
-                else:
-                    # Bust caches so subsequent reads see the new file.
-                    self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
-            elif write_buffer is not None:
-                # Opened writable but never written — discard buffer silently.
-                pass
+            if write_buffer is not None:
+                # Normally flush() already uploaded and cleared the dirty flag,
+                # making this a no-op; it stays as a fallback for the rare path
+                # where release arrives without a preceding flush.
+                await self._upload_if_dirty(state)
             elif self._dispatch(entry.fs_path) == "auth":
                 try:
                     await self.auth_manager.release(entry.fs_path, ctx=ctx)
@@ -675,6 +708,8 @@ class UnityCatalogFS(pyfuse3.Operations):
         if child_inode is not None:
             self.inodes._prune_subtree(child_inode)
         self.metadata_manager.invalidate(child_fs_path, is_dir=False)
+        # Drop any cached content so a later same-named file is not served stale.
+        await self.data_manager.invalidate_path(child_fs_path)
 
     async def rmdir(self, parent_inode, name, ctx):
         if self._read_only:
@@ -829,6 +864,10 @@ class UnityCatalogFS(pyfuse3.Operations):
         self.inodes.move_inode(src_inode, parent_inode_new, new_name)
         self.metadata_manager.invalidate(old_fs_path, is_dir=False)
         self.metadata_manager.invalidate(new_fs_path, is_dir=False)
+        # The source is gone and the destination has new content; drop both from
+        # the chunk content cache.
+        await self.data_manager.invalidate_path(old_fs_path)
+        await self.data_manager.invalidate_path(new_fs_path)
 
     async def setattr(self, inode, attr, fields, fh, ctx):
         entry = self.inodes.get_entry(inode)
@@ -940,6 +979,7 @@ class UnityCatalogFS(pyfuse3.Operations):
             write_buffer.close()
         entry.attr.st_size = new_size
         self.metadata_manager.invalidate(entry.fs_path, is_dir=False)
+        await self.data_manager.invalidate_path(entry.fs_path)
 
     async def forget(self, inode_list):
         for inode, nlookup in inode_list:

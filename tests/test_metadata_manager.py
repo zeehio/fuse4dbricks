@@ -25,7 +25,7 @@ import pyfuse3
 import trio
 
 from fuse4dbricks.api.uc_client import UcNodeType, UnityCatalogEntry
-from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr
+from fuse4dbricks.fs.inode_manager import InodeEntry, InodeEntryAttr, InodeManager
 from fuse4dbricks.fs.metadata_manager import MetadataManager, uc_node_type_from_entry
 
 
@@ -471,6 +471,88 @@ def test_invalidate_clears_negative_cache_for_all_principals(manager, ctx):
     assert ("alice@example.com", fs_path) not in manager._negative_cache
     assert ("bob@example.com", fs_path) not in manager._negative_cache
     assert ("alice@example.com", "/cat/sch/vol/other.txt") in manager._negative_cache
+
+
+# ---------------------------------------------------------------------------
+# invalidate -> kernel cache
+# ---------------------------------------------------------------------------
+
+
+def _manager_with_inodes(mock_uc_client):
+    """A MetadataManager wired to an InodeManager pre-populated with
+    /cat/sch/vol/file.txt. Returns (manager, inode_manager, file_inode)."""
+    inodes = InodeManager()
+    cat = inodes.add_entry(pyfuse3.ROOT_INODE, "cat", attr=_make_attr(True))
+    sch = inodes.add_entry(cat.inode, "sch", attr=_make_attr(True))
+    vol = inodes.add_entry(sch.inode, "vol", attr=_make_attr(True))
+    f = inodes.add_entry(vol.inode, "file.txt", attr=_make_attr(False))
+    mgr = MetadataManager(uc_client=mock_uc_client, ttl=30.0, inode_manager=inodes)
+    return mgr, inodes, f
+
+
+def test_invalidate_drops_kernel_attr_and_dentry(mock_uc_client, monkeypatch):
+    """invalidate() must also tell the FUSE kernel to forget the inode's
+    attributes/data and the dentry in its parent, otherwise the kernel keeps
+    serving stale stat results until attr_timeout / entry_timeout expire."""
+    mgr, inodes, f = _manager_with_inodes(mock_uc_client)
+    vol_inode = inodes.get_inode_by_path("/cat/sch/vol")
+
+    entry_async = MagicMock()
+    inval_inode = MagicMock()
+    monkeypatch.setattr(pyfuse3, "invalidate_entry_async", entry_async)
+    monkeypatch.setattr(pyfuse3, "invalidate_inode", inval_inode)
+
+    mgr.invalidate("/cat/sch/vol/file.txt", is_dir=False)
+
+    entry_async.assert_called_once_with(
+        vol_inode, b"file.txt", ignore_enoent=True
+    )
+    inval_inode.assert_called_once_with(f.inode)
+
+
+def test_invalidate_without_inode_manager_skips_kernel(manager, monkeypatch):
+    """The default manager has no InodeManager wired; it must only evict its
+    own caches and never touch the kernel (mirrors the unit-test setup)."""
+    entry_async = MagicMock()
+    inval_inode = MagicMock()
+    monkeypatch.setattr(pyfuse3, "invalidate_entry_async", entry_async)
+    monkeypatch.setattr(pyfuse3, "invalidate_inode", inval_inode)
+
+    manager.invalidate("/cat/sch/vol/file.txt", is_dir=False)  # must not raise
+
+    entry_async.assert_not_called()
+    inval_inode.assert_not_called()
+
+
+def test_invalidate_kernel_unknown_inode_only_targets_parent(mock_uc_client, monkeypatch):
+    """When the path itself is unknown to the kernel (never looked up) but the
+    parent is, only the parent dentry is invalidated -- e.g. a freshly created
+    file whose name must become visible."""
+    mgr, inodes, _ = _manager_with_inodes(mock_uc_client)
+    vol_inode = inodes.get_inode_by_path("/cat/sch/vol")
+
+    entry_async = MagicMock()
+    inval_inode = MagicMock()
+    monkeypatch.setattr(pyfuse3, "invalidate_entry_async", entry_async)
+    monkeypatch.setattr(pyfuse3, "invalidate_inode", inval_inode)
+
+    mgr.invalidate("/cat/sch/vol/new.txt", is_dir=False)
+
+    entry_async.assert_called_once_with(vol_inode, b"new.txt", ignore_enoent=True)
+    inval_inode.assert_not_called()
+
+
+def test_invalidate_kernel_swallows_enosys(mock_uc_client, monkeypatch):
+    """invalidate_inode raises OSError(ENOSYS) on kernels without notify
+    support; invalidate() must swallow it rather than fail the mutating op."""
+    mgr, _, _ = _manager_with_inodes(mock_uc_client)
+    monkeypatch.setattr(pyfuse3, "invalidate_entry_async", MagicMock())
+    monkeypatch.setattr(
+        pyfuse3, "invalidate_inode",
+        MagicMock(side_effect=OSError(errno.ENOSYS, "not supported")),
+    )
+
+    mgr.invalidate("/cat/sch/vol/file.txt", is_dir=False)  # must not raise
 
 
 # ---------------------------------------------------------------------------

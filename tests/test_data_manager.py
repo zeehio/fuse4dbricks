@@ -48,7 +48,7 @@ def manager():
 
 def _make_fake_read_chunk(chunk_size: int, fill_byte: bytes = b"x"):
     """Returns a coroutine that writes `chunk_size` bytes of fill_byte to out_dict[chunk_id]."""
-    async def _fake(fs_path, chunk_id, mtime, cs, ctx, out_dict):
+    async def _fake(fs_path, chunk_id, mtime, gen, cs, ctx, out_dict):
         out_dict[chunk_id] = fill_byte * cs
 
     return _fake
@@ -56,7 +56,7 @@ def _make_fake_read_chunk(chunk_size: int, fill_byte: bytes = b"x"):
 
 def _make_fake_read_chunk_none():
     """Returns a coroutine that sets out_dict[chunk_id] = None (simulates download failure)."""
-    async def _fake(fs_path, chunk_id, mtime, chunk_size, ctx, out_dict):
+    async def _fake(fs_path, chunk_id, mtime, gen, chunk_size, ctx, out_dict):
         out_dict[chunk_id] = None
 
     return _fake
@@ -159,7 +159,7 @@ async def test_read_last_chunk_smaller_than_chunk_size(manager, ctx):
 
     call_log: list[int] = []
 
-    async def fake_read_chunk(fs_path, chunk_id, mtime, cs, ctx, out_dict):
+    async def fake_read_chunk(fs_path, chunk_id, mtime, gen, cs, ctx, out_dict):
         call_log.append((chunk_id, cs))
         out_dict[chunk_id] = b"x" * cs
 
@@ -184,7 +184,7 @@ async def test_read_file_size_exact_multiple_of_chunk_size(manager, ctx):
 
     call_log: list[tuple[int, int]] = []
 
-    async def fake_read_chunk(fs_path, chunk_id, mtime, cs, ctx, out_dict):
+    async def fake_read_chunk(fs_path, chunk_id, mtime, gen, cs, ctx, out_dict):
         call_log.append((chunk_id, cs))
         out_dict[chunk_id] = b"x" * cs
 
@@ -230,7 +230,7 @@ async def test_read_prefetch_not_triggered_at_start_of_first_chunk(manager, ctx)
     file_size = 12 * CHUNK
     prefetch_calls: list = []
 
-    async def fake_prefetch(fs_path, chunks, mtime, ctx):
+    async def fake_prefetch(fs_path, chunks, mtime, gen, ctx):
         prefetch_calls.append(chunks)
 
     with patch.object(manager, "_read_chunk", side_effect=_make_fake_read_chunk(CHUNK)):
@@ -250,7 +250,7 @@ async def test_read_prefetch_triggered_after_first_chunk(manager, ctx):
     file_size = 20 * CHUNK
     prefetch_calls: list = []
 
-    async def fake_prefetch(fs_path, chunks, mtime, ctx):
+    async def fake_prefetch(fs_path, chunks, mtime, gen, ctx):
         prefetch_calls.append(chunks)
 
     with patch.object(manager, "_read_chunk", side_effect=_make_fake_read_chunk(CHUNK)):
@@ -269,7 +269,7 @@ async def test_read_prefetch_stops_at_eof(manager, ctx):
     file_size = 3 * CHUNK  # 3 chunks total (0, 1, 2)
     prefetch_calls: list = []
 
-    async def fake_prefetch(fs_path, chunks, mtime, ctx):
+    async def fake_prefetch(fs_path, chunks, mtime, gen, ctx):
         prefetch_calls.append(chunks)
 
     with patch.object(manager, "_read_chunk", side_effect=_make_fake_read_chunk(CHUNK)):
@@ -283,3 +283,38 @@ async def test_read_prefetch_stops_at_eof(manager, ctx):
     prefetched_chunk_ids = [cid for cid, _ in prefetch_calls[0]]
     assert all(cid < 3 for cid in prefetched_chunk_ids)
     assert 3 not in prefetched_chunk_ids  # chunk 3 doesn't exist
+
+
+# ---------------------------------------------------------------------------
+# Tests: cache generation (invalidate_path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_invalidate_path_bumps_generation(manager):
+    fs = "/cat/sch/vol/f.txt"
+    assert manager._generation(fs) == 0
+    await manager.invalidate_path(fs)
+    assert manager._generation(fs) == 1
+    await manager.invalidate_path(fs)
+    assert manager._generation(fs) == 2
+    # Other paths are unaffected.
+    assert manager._generation("/cat/sch/vol/other.txt") == 0
+
+
+@pytest.mark.trio
+async def test_invalidate_path_changes_the_chunk_cache_key(manager):
+    """After a write bumps the generation, the next lookup keys the chunk under
+    the new generation -- so a stale RAM/disk chunk from before the write (same
+    fs_path, chunk and mtime, but old gen) is bypassed. This is what stops a
+    same-second overwrite (mtime has 1s resolution) from serving stale bytes."""
+    fs = "/cat/sch/vol/f.txt"
+    mtime = 1000.0
+
+    await manager._get_chunk_from_cache_or_disk(fs, 0, mtime, manager._generation(fs))
+    manager.persistence.retrieve_chunk.assert_awaited_with(fs, 0, mtime, 0)
+
+    await manager.invalidate_path(fs)
+
+    await manager._get_chunk_from_cache_or_disk(fs, 0, mtime, manager._generation(fs))
+    manager.persistence.retrieve_chunk.assert_awaited_with(fs, 0, mtime, 1)

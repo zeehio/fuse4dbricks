@@ -133,6 +133,122 @@ async def test_live_create_and_delete_directory():
 
 
 # ---------------------------------------------------------------------------
+# Read-after-write consistency — records the observed Databricks Files API
+# behavior. Empirically (25+ trials per surface) the API is immediately
+# read-after-write consistent: a file is visible via HEAD metadata, parent
+# directory listing AND content read the instant upload_file() returns, with no
+# observable window. These tests pin that contract so a future regression to an
+# eventually-consistent backend is caught here, at the API layer, rather than
+# surfacing as flaky behavior up in the FUSE stack.
+#
+# Note: a freshly written file showing up ~0.7s later *through the mount* is a
+# FUSE-layer delay (caches/coalescing), NOT this API — see test_e2e_mount.py.
+# ---------------------------------------------------------------------------
+
+
+async def _read_all(client, uc_path, length, ctx):
+    """Read a whole small file via the streaming download API into bytes."""
+    buf = b""
+    async for chunk in client.download_chunk_stream(uc_path, 0, length, ctx=ctx):
+        buf += chunk
+    return buf
+
+
+@requires_databricks_write
+@pytest.mark.trio
+async def test_live_metadata_is_immediately_consistent_after_upload(tmp_path):
+    """HEAD metadata reflects an upload the moment upload_file() returns.
+
+    get_path_metadata() (a HEAD on /api/2.0/fs/files) returns the entry with the
+    correct size immediately -- no read-after-write window to wait out.
+    """
+    payload = b"unity-catalog-rw-consistency\n" * 8
+    local = tmp_path / "meta.txt"
+    local.write_bytes(payload)
+    uc_path = _test_path("rw_meta.txt")
+
+    client = UnityCatalogClient(HOST, _EnvAuth())
+    ctx = _ctx()
+    try:
+        await client.upload_file(uc_path, str(local), ctx=ctx)
+        # No sleep, no retry: the very next call must already see it.
+        meta = await client.get_path_metadata(uc_path, ctx=ctx)
+        assert meta is not None, "metadata not visible immediately after upload"
+        assert meta.size == len(payload)
+        assert meta.entry_type == UcNodeType.FILE
+    finally:
+        try:
+            await client.delete_file(uc_path, ctx=ctx)
+        except Exception:
+            pass
+        await client.close()
+
+
+@requires_databricks_write
+@pytest.mark.trio
+async def test_live_parent_listing_is_immediately_consistent_after_upload(tmp_path):
+    """A directory listing includes a file the moment upload_file() returns.
+
+    get_path_contents() on the parent (a GET on /api/2.0/fs/directories) lists
+    the freshly uploaded file with no observable delay.
+    """
+    payload = b"listing-consistency"
+    local = tmp_path / "listed.txt"
+    local.write_bytes(payload)
+    uc_path = _test_path("rw_listed.txt")
+    parent = uc_path.rsplit("/", 1)[0]
+    name = uc_path.rsplit("/", 1)[1]
+
+    client = UnityCatalogClient(HOST, _EnvAuth())
+    ctx = _ctx()
+    try:
+        await client.upload_file(uc_path, str(local), ctx=ctx)
+        listing = await client.get_path_contents(parent, ctx=ctx)
+        assert listing is not None
+        names = {e.name for e in listing}
+        assert name in names, (
+            f"{name!r} not in parent listing immediately after upload: {sorted(names)}"
+        )
+    finally:
+        try:
+            await client.delete_file(uc_path, ctx=ctx)
+        except Exception:
+            pass
+        await client.close()
+
+
+@requires_databricks_write
+@pytest.mark.trio
+async def test_live_read_is_immediately_consistent_after_upload(tmp_path):
+    """File contents are readable the moment upload_file() returns.
+
+    download_chunk_stream() (a ranged GET on /api/2.0/fs/files) returns the
+    exact bytes just uploaded -- no read-after-write window, and no stale/empty
+    body.
+    """
+    payload = bytes(range(256)) * 4  # 1024 distinctive bytes
+    local = tmp_path / "body.bin"
+    local.write_bytes(payload)
+    uc_path = _test_path("rw_body.bin")
+
+    client = UnityCatalogClient(HOST, _EnvAuth())
+    ctx = _ctx()
+    try:
+        await client.upload_file(uc_path, str(local), ctx=ctx)
+        data = await _read_all(client, uc_path, len(payload), ctx)
+        assert data == payload, (
+            f"content mismatch immediately after upload (got {len(data)} bytes, "
+            f"want {len(payload)})"
+        )
+    finally:
+        try:
+            await client.delete_file(uc_path, ctx=ctx)
+        except Exception:
+            pass
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
 # API edge-case tests — these verify actual Databricks API behavior so that
 # any future API change that alters these semantics is caught immediately.
 # ---------------------------------------------------------------------------
