@@ -283,6 +283,7 @@ async def async_main():
         logger.error("Top-level group message: %s", eg)
         for i, exc in enumerate(eg.exceptions, 1):
             logger.error("[%d] type=%s -> %s\n%s", i, type(exc).__name__, exc, traceback.format_exc())
+        raise
     finally:
         data_manager.close()
         await uc_client.close()
