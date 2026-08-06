@@ -156,53 +156,89 @@ class DatabricksUnifiedAuthProvider:
             logger.error("Failed to read environ file %s for pid %s. Exception: %s", environ_file, pid, exc)
             return None
 
-    def _is_safe_config_file(self, config_file: str, uid: int) -> bool:
-        """Return True only if ``config_file`` is safe to read on behalf of ``uid``.
+    def _read_token_from_path(
+        self, config_file: str, uid: int, profile: str
+    ) -> tuple[bool, Optional[str]]:
+        """Reads ``profile``'s token from ``config_file`` on behalf of ``uid``.
 
-        When fuse4dbricks runs as root (the allow_other deployment), it reads
-        config files out of arbitrary users' home directories. A user who
-        controls their own ``~/.databrickscfg`` could symlink it at another
-        user's config file; root would follow the link and cache the *victim's*
-        token under the *attacker's* uid. ``os.stat`` follows symlinks, so the
-        ``st_uid == uid`` check is what defeats that: a symlinked-to victim file
-        is owned by the victim, not the requesting uid, and is rejected. This is
-        applied to *every* config file path, env-supplied or default, never just
-        one branch.
+        Returns ``(True, token)`` if ``config_file`` exists and passes the
+        ownership/type checks below (``token`` is ``None`` if the profile or
+        its token key is missing -- a content error, not a trust failure, so
+        it is not retried against another location). Returns ``(False,
+        None)`` if the path does not exist or fails validation, so the
+        caller knows to fall back to the next candidate location.
+
+        fuse4dbricks may run as root and read config files out of arbitrary
+        users' home directories (the allow_other deployment), so a path is
+        trusted only if it is owned by ``uid``. The file is opened once;
+        ownership is checked with ``fstat`` on that descriptor, and the token
+        is read from the same descriptor -- never a second, independent
+        lookup of ``config_file`` by name -- so the ownership check and the
+        read always refer to the same file.
         """
         try:
-            st = os.stat(config_file)
+            fd = os.open(config_file, os.O_RDONLY)
         except FileNotFoundError:
             # A missing config file is the normal state for any uid without a
             # Databricks setup (e.g. root or a system daemon probing the mount).
             # Logging it at error level floods the journal with one line per
             # request, so keep it at debug.
             logger.debug("Config file %s does not exist, ignoring", config_file)
-            return False
+            return False, None
         except OSError as exc:
-            # Other stat failures (permission denied, etc.) are unexpected and
+            # Other open failures (permission denied, etc.) are unexpected and
             # worth surfacing, but are not fatal to the mount.
+            logger.warning("Cannot open config file %s: %s", config_file, exc)
+            return False, None
+
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
             logger.warning("Cannot stat config file %s: %s", config_file, exc)
-            return False
+            os.close(fd)
+            return False, None
         if not stat.S_ISREG(st.st_mode):
             logger.error("Config file %s is not a regular file, ignoring", config_file)
-            return False
+            os.close(fd)
+            return False, None
         if st.st_uid != uid or not (st.st_mode & stat.S_IRUSR):
             logger.error(
                 "Config file %s is not owned and readable by uid %s, ignoring",
                 config_file, uid,
             )
-            return False
-        return True
+            os.close(fd)
+            return False, None
 
-    def _get_profile_and_config_file_name(self, env: dict[str, str]|None, uid: int) -> tuple[str, str] | tuple[None, None]:
-        """ Gets the databricks profile and config file name.
-        1. Check if env defines DATABRICKS_CONFIG_PROFILE and DATABRICKS_CONFIG_FILE
-        2. If not, default to DATABRICKS_CONFIG_PROFILE=DEFAULT and DATABRICKS_CONFIG_FILE=~/.databrickscfg (in the user's home directory)
+        config = configparser.ConfigParser()
+        try:
+            with os.fdopen(fd, "r") as f:
+                config.read_file(f)
+        except Exception as exc:
+            logger.error("Failed to read databricks config file at %s for profile %s. Exception: %s\n%s", config_file, profile, exc, traceback.format_exc())
+            return True, None
 
-        Whichever path is selected must be owned by and readable for ``uid``
-        (see ``_is_safe_config_file``); an env-supplied path that fails the
-        check falls through to the default location.
+        if profile not in config:
+            logger.error("Profile '%s' not found in %s", profile, config_file)
+            return True, None
+        try:
+            return True, config[profile]["token"]
+        except KeyError:
+            logger.error(f"'token' not found in profile '{profile}' of {config_file}")
+            return True, None
+
+    async def get_access_token(self, ctx: pyfuse3.RequestContext) -> str|None:
+        """ Gets the databricks token for the given request context by checking the environment variables of the requesting process and then the config file.
+        1. Check if the process defines DATABRICKS_TOKEN in its environment.
+        2. Otherwise, look up a config file: DATABRICKS_CONFIG_PROFILE / DATABRICKS_CONFIG_FILE
+           from the process environment if set, falling back to profile DEFAULT and
+           ~/.databrickscfg in the uid's home directory. An env-supplied config file that
+           fails validation (see ``_read_token_from_path``) falls through to the default.
         """
+        env = self._get_env_for_pid(ctx.pid)
+        # The process defines an access token:
+        if env is not None and "DATABRICKS_TOKEN" in env:
+            return env["DATABRICKS_TOKEN"]
+
         if env is not None:
             profile = env.get("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
             config_file = env.get("DATABRICKS_CONFIG_FILE")
@@ -210,60 +246,21 @@ class DatabricksUnifiedAuthProvider:
             profile = "DEFAULT"
             config_file = None
 
-        # An env-supplied config file that fails validation is ignored, falling
-        # through to the default location below.
-        if config_file is not None and not self._is_safe_config_file(config_file, uid):
-            config_file = None
+        if config_file is not None:
+            found, token = self._read_token_from_path(config_file, ctx.uid, profile)
+            if found:
+                return token
 
-        if config_file is None:
-            # Default to ~/.databrickscfg in the user's home directory. This path
-            # is validated identically: under root it may live in another user's
-            # home and must still be owned by the requesting uid.
-            home_dir = self._home_for_uid(uid)
-            default_config = os.path.join(home_dir, ".databrickscfg")
-            if self._is_safe_config_file(default_config, uid):
-                config_file = default_config
-
-        if config_file is None:
-            # Expected for any uid without a Databricks config; debug-level so a
-            # repeatedly-probing uid (e.g. root) does not flood the journal.
-            logger.debug("No databricks config file found for uid %s. Checked environment variable DATABRICKS_CONFIG_FILE and default location", uid)
-            return None, None
-        return profile, config_file
-
-    def _get_token_from_config(self, profile: str, config_file: str) -> Optional[str]:
-        """ Reads the databricks token from the config file for the given profile. """
-        config = configparser.ConfigParser()
-        try:
-            config.read(config_file)
-        except Exception as exc:
-            logger.error("Failed to read databricks config file at %s for profile %s. Exception: %s\n%s", config_file, profile, exc, traceback.format_exc())
-            return None
-        if profile not in config:
-            logger.error("Profile '%s' not found in %s", profile, config_file)
-            return None
-        try:
-            token = config[profile]["token"]
+        home_dir = self._home_for_uid(ctx.uid)
+        default_config = os.path.join(home_dir, ".databrickscfg")
+        found, token = self._read_token_from_path(default_config, ctx.uid, profile)
+        if found:
             return token
-        except KeyError:
-            logger.error(f"'token' not found in profile '{profile}' of {config_file}")
-            return None
 
-    async def get_access_token(self, ctx: pyfuse3.RequestContext) -> str|None:
-        """ Gets the databricks token for the given request context by checking the environment variables of the requesting process and then the config file. """
-        env = self._get_env_for_pid(ctx.pid)
-        # The process defines an access token:
-        if env is not None and "DATABRICKS_TOKEN" in env:
-            return env["DATABRICKS_TOKEN"]
-        # The process does not define a token, but defines a profile or config file:
-        profile, config_file = self._get_profile_and_config_file_name(env, ctx.uid)
-        if profile is None or config_file is None:
-            # Routine when a uid has neither a token in its environment nor a
-            # config file; the caller turns this into EACCES. Debug-level to
-            # avoid one error line per request from a probing uid.
-            logger.debug("No databricks token found in environment variables for pid %s, and no profile or config file found for uid %s", ctx.pid, ctx.uid)
-            return None
-        return self._get_token_from_config(profile, config_file)
+        # Expected for any uid without a Databricks config; debug-level so a
+        # repeatedly-probing uid (e.g. root) does not flood the journal.
+        logger.debug("No databricks token found in environment variables for pid %s, and no profile or config file found for uid %s", ctx.pid, ctx.uid)
+        return None
 
 class AuthProvider:
     # Key for the shared token in single-principal mode. -1 is never a valid uid,

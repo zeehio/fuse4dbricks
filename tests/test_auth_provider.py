@@ -4,8 +4,7 @@ Tests for fuse4dbricks.auth.provider.
 Covers the multi-user trust boundary:
   - _subuid_owner / _home_for_uid   (uid -> home, including subuid ranges)
   - _get_env_for_pid                (binary /proc/<pid>/environ parsing)
-  - _get_profile_and_config_file_name  (ownership/readability checks)
-  - _get_token_from_config          (config parsing)
+  - _read_token_from_path           (atomic open+fstat ownership check, then parse)
   - DatabricksUnifiedAuthProvider.get_access_token  (end-to-end resolution)
   - AuthProvider                    (local-token precedence, invalidation, EACCES)
 """
@@ -115,121 +114,77 @@ def test_get_env_for_pid_parses_and_skips_non_utf8(unified, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _get_profile_and_config_file_name  (ownership / readability)
+# _read_token_from_path  (atomic open+fstat ownership check, then parse)
 # ---------------------------------------------------------------------------
 
 
-def test_profile_config_from_env_owned_by_uid(unified, tmp_path):
+def test_read_token_from_path_owned_by_uid(unified, tmp_path):
     cfg = tmp_path / "cfg"
-    cfg.write_text("[DEFAULT]\ntoken=x\n")
-    uid = os.getuid()
-    env = {"DATABRICKS_CONFIG_PROFILE": "PROD", "DATABRICKS_CONFIG_FILE": str(cfg)}
-    profile, config_file = unified._get_profile_and_config_file_name(env, uid)
-    assert profile == "PROD"
-    assert config_file == str(cfg)
+    cfg.write_text("[PROD]\ntoken = dapi-prod\n")
+    found, token = unified._read_token_from_path(str(cfg), os.getuid(), "PROD")
+    assert (found, token) == (True, "dapi-prod")
 
 
-def test_profile_config_env_file_not_owned_is_ignored(unified, tmp_path, monkeypatch):
+def test_read_token_from_path_not_owned_is_rejected(unified, tmp_path):
+    # Trust-boundary regression: under root + allow_other, a config file (or
+    # a symlink swapped in to point at another user's file) not owned by the
+    # requesting uid must be rejected — root must not cache the victim's
+    # token under the attacker's uid. Ownership is checked with fstat() on
+    # the same fd that is then read, so there is no separate check-then-open
+    # step for a swapped path to land in between.
     cfg = tmp_path / "cfg"
-    cfg.write_text("[DEFAULT]\ntoken=x\n")
-    # A uid that does not own the temp file -> the env config file is rejected
-    # and we fall back to the home default (which we point at an empty dir).
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "emptyhome"))
-    env = {"DATABRICKS_CONFIG_FILE": str(cfg)}
-    profile, config_file = unified._get_profile_and_config_file_name(env, os.getuid() + 424242)
-    assert (profile, config_file) == (None, None)
+    cfg.write_text("[DEFAULT]\ntoken = victim-secret\n")
+    found, token = unified._read_token_from_path(str(cfg), os.getuid() + 424242, "DEFAULT")
+    assert (found, token) == (False, None)
 
 
-def test_profile_config_env_file_not_regular_is_ignored(unified, tmp_path, monkeypatch):
+def test_read_token_from_path_not_regular_is_rejected(unified, tmp_path):
     d = tmp_path / "adir"
     d.mkdir()
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "emptyhome"))
-    env = {"DATABRICKS_CONFIG_FILE": str(d)}
-    profile, config_file = unified._get_profile_and_config_file_name(env, os.getuid())
-    assert (profile, config_file) == (None, None)
+    found, token = unified._read_token_from_path(str(d), os.getuid(), "DEFAULT")
+    assert (found, token) == (False, None)
 
 
-def test_profile_config_default_home_file(unified, tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".databrickscfg").write_text("[DEFAULT]\ntoken=x\n")
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(home))
-    # The default file must also pass the ownership check, so the resolved uid
-    # has to match the file owner (the test user that just created it).
-    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
-    assert profile == "DEFAULT"
-    assert config_file == str(home / ".databrickscfg")
-
-
-def test_profile_config_default_home_file_not_owned_is_rejected(unified, tmp_path, monkeypatch):
-    # Trust-boundary regression: under root + allow_other, the default
-    # ~/.databrickscfg is resolved from another user's home and could be a
-    # symlink the user planted to a victim's config. os.stat follows the link,
-    # so the file appears owned by the victim (not the requesting uid) and must
-    # be rejected — root must not cache the victim's token under the attacker.
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".databrickscfg").write_text("[DEFAULT]\ntoken=victim-secret\n")
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(home))
-    # A uid that does not own the file -> rejected, nothing resolved.
-    profile, config_file = unified._get_profile_and_config_file_name(
-        env=None, uid=os.getuid() + 424242
-    )
-    assert (profile, config_file) == (None, None)
-
-
-def test_profile_config_nothing_found(unified, tmp_path, monkeypatch):
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "empty"))
-    profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
-    assert (profile, config_file) == (None, None)
-
-
-def test_missing_default_config_is_not_logged_as_error(unified, tmp_path, monkeypatch, caplog):
-    """A missing ~/.databrickscfg is the normal state for a uid without a
+def test_read_token_from_path_missing_file_is_not_logged_as_error(unified, tmp_path, caplog):
+    """A missing config file is the normal state for a uid without a
     Databricks setup (e.g. root probing the mount). It must not be logged at
     error level, or a repeatedly-probing uid floods the journal with one line
     per request."""
-    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "empty"))
     with caplog.at_level("DEBUG", logger="fuse4dbricks.auth.provider"):
-        profile, config_file = unified._get_profile_and_config_file_name(env=None, uid=os.getuid())
-    assert (profile, config_file) == (None, None)
-    # The benign "does not exist" path logs at debug, never at error/warning.
+        found, token = unified._read_token_from_path(str(tmp_path / "nope"), os.getuid(), "DEFAULT")
+    assert (found, token) == (False, None)
     assert not [r for r in caplog.records if r.levelname in ("ERROR", "WARNING")]
     assert any(r.levelname == "DEBUG" for r in caplog.records)
 
 
-def test_unreadable_config_is_logged_as_warning(unified, tmp_path, monkeypatch, caplog):
-    """A stat failure that is NOT 'file missing' (e.g. permission denied) is
-    unexpected and stays visible at warning level."""
-    def _boom(path):
+def test_read_token_from_path_open_failure_is_logged_as_warning(unified, tmp_path, monkeypatch, caplog):
+    """An open() failure that is NOT 'file missing' (e.g. permission denied)
+    is unexpected and stays visible at warning level."""
+    def _boom(path, flags):
         raise PermissionError("denied")
-    monkeypatch.setattr(provider_mod.os, "stat", _boom)
+    monkeypatch.setattr(provider_mod.os, "open", _boom)
     with caplog.at_level("DEBUG", logger="fuse4dbricks.auth.provider"):
-        assert unified._is_safe_config_file(str(tmp_path / "cfg"), os.getuid()) is False
+        found, token = unified._read_token_from_path(str(tmp_path / "cfg"), os.getuid(), "DEFAULT")
+    assert (found, token) == (False, None)
     assert any(r.levelname == "WARNING" for r in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# _get_token_from_config
-# ---------------------------------------------------------------------------
-
-
-def test_get_token_from_config_reads_token(unified, tmp_path):
+def test_read_token_from_path_reads_token(unified, tmp_path):
     cfg = tmp_path / "cfg"
     cfg.write_text("[DEFAULT]\ntoken = dapi-default\n\n[PROD]\ntoken = dapi-prod\n")
-    assert unified._get_token_from_config("PROD", str(cfg)) == "dapi-prod"
+    assert unified._read_token_from_path(str(cfg), os.getuid(), "PROD") == (True, "dapi-prod")
 
 
-def test_get_token_from_config_missing_profile(unified, tmp_path):
+def test_read_token_from_path_missing_profile(unified, tmp_path):
     cfg = tmp_path / "cfg"
     cfg.write_text("[DEFAULT]\ntoken = x\n")
-    assert unified._get_token_from_config("NOPE", str(cfg)) is None
+    assert unified._read_token_from_path(str(cfg), os.getuid(), "NOPE") == (True, None)
 
 
-def test_get_token_from_config_missing_token_key(unified, tmp_path):
+def test_read_token_from_path_missing_token_key(unified, tmp_path):
     cfg = tmp_path / "cfg"
     cfg.write_text("[DEFAULT]\nhost = https://x\n")
-    assert unified._get_token_from_config("DEFAULT", str(cfg)) is None
+    assert unified._read_token_from_path(str(cfg), os.getuid(), "DEFAULT") == (True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -244,21 +199,42 @@ async def test_unified_get_token_prefers_env_token(unified, monkeypatch):
 
 
 @pytest.mark.trio
-async def test_unified_get_token_falls_back_to_config(unified, tmp_path, monkeypatch):
+async def test_unified_get_token_uses_env_config_file(unified, tmp_path, monkeypatch):
     cfg = tmp_path / "cfg"
     cfg.write_text("[DEFAULT]\ntoken = dapi-cfg\n")
-    monkeypatch.setattr(unified, "_get_env_for_pid", lambda pid: {})
-    monkeypatch.setattr(
-        unified, "_get_profile_and_config_file_name", lambda env, uid: ("DEFAULT", str(cfg))
-    )
-    assert await unified.get_access_token(_ctx()) == "dapi-cfg"
+    monkeypatch.setattr(unified, "_get_env_for_pid", lambda pid: {"DATABRICKS_CONFIG_FILE": str(cfg)})
+    assert await unified.get_access_token(_ctx(uid=os.getuid())) == "dapi-cfg"
 
 
 @pytest.mark.trio
-async def test_unified_get_token_none_when_unresolvable(unified, monkeypatch):
+async def test_unified_get_token_missing_env_file_falls_back_to_default(unified, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".databrickscfg").write_text("[DEFAULT]\ntoken = dapi-home\n")
+    monkeypatch.setattr(
+        unified, "_get_env_for_pid",
+        lambda pid: {"DATABRICKS_CONFIG_FILE": str(tmp_path / "does-not-exist")},
+    )
+    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(home))
+    assert await unified.get_access_token(_ctx(uid=os.getuid())) == "dapi-home"
+
+
+@pytest.mark.trio
+async def test_unified_get_token_env_file_not_owned_is_ignored(unified, tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg"
+    cfg.write_text("[DEFAULT]\ntoken = x\n")
+    monkeypatch.setattr(unified, "_get_env_for_pid", lambda pid: {"DATABRICKS_CONFIG_FILE": str(cfg)})
+    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "emptyhome"))
+    # A uid that does not own cfg -> the env config file is rejected; the
+    # default home has no config file either -> nothing resolved.
+    assert await unified.get_access_token(_ctx(uid=os.getuid() + 424242)) is None
+
+
+@pytest.mark.trio
+async def test_unified_get_token_none_when_unresolvable(unified, tmp_path, monkeypatch):
     monkeypatch.setattr(unified, "_get_env_for_pid", lambda pid: None)
-    monkeypatch.setattr(unified, "_get_profile_and_config_file_name", lambda env, uid: (None, None))
-    assert await unified.get_access_token(_ctx()) is None
+    monkeypatch.setattr(unified, "_home_for_uid", lambda uid: str(tmp_path / "empty"))
+    assert await unified.get_access_token(_ctx(uid=os.getuid())) is None
 
 
 # ---------------------------------------------------------------------------
