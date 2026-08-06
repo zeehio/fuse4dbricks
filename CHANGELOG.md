@@ -1,6 +1,9 @@
 # Unreleased
 
 - Fix fatal startup/runtime errors exiting with status 0 instead of 1.
+- Fix a race in Databricks config file validation where ownership was
+  checked on a path and the file was read from that same path separately.
+  Ownership is now checked on the open file descriptor that is read.
 
 # 0.7.4 (2026-06-20)
 
