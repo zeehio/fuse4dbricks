@@ -1,4 +1,4 @@
-# Unreleased
+# 0.7.5 (2026-08-06)
 
 - Fix fatal startup/runtime errors exiting with status 0 instead of 1.
 - Fix a race in Databricks config file validation where ownership was
