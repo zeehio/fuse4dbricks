@@ -134,6 +134,19 @@ class InodeManager:
         if entry.ref_count <= 0:
             self._delete_inode_internal(inode)
 
+    def detach_path(self, fs_path: str) -> None:
+        """Detach ``fs_path`` -- and, if it is a directory, everything
+        beneath it -- from the tree after it has been deleted remotely.
+
+        A no-op if ``fs_path`` has no known inode. This only touches the
+        in-process tree; it does not tell the kernel to drop its own cached
+        attributes/dentries for the path (see
+        ``MetadataManager._invalidate_kernel_cache`` for that).
+        """
+        inode = self.get_inode_by_path(fs_path)
+        if inode is not None:
+            self._prune_subtree(inode)
+
     def add_entry(
         self, parent_inode: int, name: str, attr: InodeEntryAttr
     ):
