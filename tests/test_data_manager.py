@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pyfuse3
 
-from fuse4dbricks.fs.data_manager import DataManager
+from fuse4dbricks.fs.data_manager import DataManager, _ChunkRequest
+from fuse4dbricks.fs.ram_cache import RamCache
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +284,85 @@ async def test_read_prefetch_stops_at_eof(manager, ctx):
     prefetched_chunk_ids = [cid for cid, _ in prefetch_calls[0]]
     assert all(cid < 3 for cid in prefetched_chunk_ids)
     assert 3 not in prefetched_chunk_ids  # chunk 3 doesn't exist
+
+
+# ---------------------------------------------------------------------------
+# Tests: _process_request (on-demand reads vs. prefetch downloads)
+#
+# On-demand ("high" priority) reads need the actual bytes now, so they read
+# the chunk (from disk, falling back to network) and cache it in RAM.
+# Prefetch ("regular" priority) only needs the chunk to end up on disk --
+# reading it back would cost as much disk I/O as the read it's trying to
+# save, for a chunk that may never be read, so it uses a cheap existence
+# check and never populates the RAM cache.
+# ---------------------------------------------------------------------------
+
+
+def _chunk_request(manager, chunk_id=0, mtime=100.0, gen=0):
+    return _ChunkRequest(
+        fs_path="/c/s/v/f", chunk_id=chunk_id, mtime=mtime, gen=gen,
+        chunk_size=manager.chunk_size, ctx=SimpleNamespace(uid=1000, pid=1, gid=1000),
+    )
+
+
+@pytest.mark.trio
+async def test_process_request_high_priority_disk_hit_caches_in_ram(manager):
+    # The `manager` fixture's ram_cache_mb=1 rounds down to 0-entry capacity
+    # (1 MB < one 8 MB chunk), which would no-op every put/get below.
+    manager._ram_cache = RamCache(max_entries=8)
+    manager.persistence.retrieve_chunk = AsyncMock(return_value=b"cached-bytes")
+    request = _chunk_request(manager)
+
+    await manager._process_request(request, priority="high")
+
+    manager.persistence.store_chunk_from_stream.assert_not_awaited()
+    cached = await manager._ram_cache.get(("/c/s/v/f", 0, 100.0, 0))
+    assert cached == b"cached-bytes"
+
+
+@pytest.mark.trio
+async def test_process_request_high_priority_miss_downloads_and_caches_in_ram(manager):
+    manager._ram_cache = RamCache(max_entries=8)
+    manager.persistence.retrieve_chunk = AsyncMock(return_value=None)
+    manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
+    request = _chunk_request(manager)
+
+    await manager._process_request(request, priority="high")
+
+    manager.persistence.store_chunk_from_stream.assert_awaited_once()
+    cached = await manager._ram_cache.get(("/c/s/v/f", 0, 100.0, 0))
+    assert cached == b"downloaded"
+
+
+@pytest.mark.trio
+async def test_process_request_prefetch_skips_download_when_already_on_disk(manager):
+    manager.persistence.chunk_exists = AsyncMock(return_value=True)
+    request = _chunk_request(manager, chunk_id=5)
+
+    await manager._process_request(request, priority="regular")
+
+    manager.persistence.chunk_exists.assert_awaited_once_with(
+        fs_path="/c/s/v/f", chunk_index=5, mtime=100.0, gen=0
+    )
+    # No download, and -- crucially -- no read of the chunk's content either
+    # (that would cost the same disk I/O the existence check is avoiding).
+    manager.persistence.retrieve_chunk.assert_not_awaited()
+    manager.persistence.store_chunk_from_stream.assert_not_awaited()
+    assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) is None
+
+
+@pytest.mark.trio
+async def test_process_request_prefetch_downloads_when_missing_but_not_cached_in_ram(manager):
+    manager.persistence.chunk_exists = AsyncMock(return_value=False)
+    manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
+    request = _chunk_request(manager, chunk_id=5)
+
+    await manager._process_request(request, priority="regular")
+
+    manager.persistence.retrieve_chunk.assert_not_awaited()
+    manager.persistence.store_chunk_from_stream.assert_awaited_once()
+    # Prefetched content is deliberately not promoted into the RAM cache.
+    assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) is None
 
 
 # ---------------------------------------------------------------------------
