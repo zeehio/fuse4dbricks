@@ -317,6 +317,3 @@ class DataManager:
             )
             result.extend(chunk_data[chunk_start:chunk_end])
         return bytes(result)
-
-    async def write(self, fs_path: str, offset: int, buffer: bytes, ctx: pyfuse3.RequestContext) -> int:
-        raise pyfuse3.FUSEError(errno.EACCES)
