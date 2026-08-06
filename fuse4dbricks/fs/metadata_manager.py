@@ -504,7 +504,7 @@ class MetadataManager:
             if parent_path in self._dir_cache:
                 del self._dir_cache[parent_path]
         except Exception:
-            pass
+            logger.warning("Cache invalidation failed for %s", fs_path, exc_info=True)
 
         # Evicting our own caches is not enough: the kernel keeps its own
         # attribute and dentry caches (for up to attr_timeout / entry_timeout),
