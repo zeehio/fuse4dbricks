@@ -4,6 +4,10 @@
 - Fix a race in Databricks config file validation where ownership was
   checked on a path and the file was read from that same path separately.
   Ownership is now checked on the open file descriptor that is read.
+- Fix prefetch reading already-downloaded chunks back from disk on every
+  read, instead of just checking they exist. Reading a large file
+  sequentially could pull roughly an order of magnitude more bytes off
+  local disk than the file actually contains.
 
 # 0.7.4 (2026-06-20)
 
