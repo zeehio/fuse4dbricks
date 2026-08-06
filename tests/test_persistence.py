@@ -111,6 +111,33 @@ async def test_retrieve_missing_chunk(persistence):
 
 
 @pytest.mark.trio
+async def test_chunk_exists_true_after_store(persistence):
+    """chunk_exists reports a stored chunk as present, without needing to
+    read its content."""
+    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"data"))
+    assert await persistence.chunk_exists("f", 0, 5.0) is True
+
+
+@pytest.mark.trio
+async def test_chunk_exists_false_for_missing_chunk(persistence):
+    assert await persistence.chunk_exists("ghost_file", 99, 0.0) is False
+
+
+@pytest.mark.trio
+async def test_chunk_exists_does_not_read_file_content(persistence, monkeypatch):
+    """chunk_exists must not pay the I/O cost of reading the chunk back --
+    that's the whole point of using it instead of retrieve_chunk for a
+    prefetch's "is a download needed" check."""
+    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"data"))
+
+    def _boom(path):
+        raise AssertionError("chunk_exists must not read the file's content")
+
+    monkeypatch.setattr(persistence, "_read_file", _boom)
+    assert await persistence.chunk_exists("f", 0, 5.0) is True
+
+
+@pytest.mark.trio
 async def test_get_chunk_path_is_pure_no_dir_created(persistence):
     """_get_chunk_path must not touch the filesystem: it runs on every read,
     so it must not create (empty) shard dirs for never-written chunks."""
