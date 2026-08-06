@@ -159,14 +159,21 @@ class DataManager:
     async def _process_request(self, chunk_request: _ChunkRequest, priority: str):
         try:
             cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime, chunk_request.gen)
-            # We have a chunk_request to download
-            # check if we already downloaded it:
-            chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen)
-            if chunk is None:
-                # download it.
-                chunk = await self._fetch_chunk(chunk_request)
             if priority == "high":
+                # A real read needs the bytes now, so fetch them (from disk,
+                # falling back to network) and cache in RAM.
+                chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen)
+                if chunk is None:
+                    chunk = await self._fetch_chunk(chunk_request)
                 await self._ram_cache.put(cache_key, chunk)
+            else:
+                # A prefetch only needs the chunk to end up on disk. Reading
+                # it back (as retrieve_chunk does) would cost as much disk
+                # I/O as the read it's trying to save, for a chunk that may
+                # not even be read; a plain existence check is enough to
+                # decide whether a download is needed.
+                if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
+                    await self._fetch_chunk(chunk_request)
         finally:
             await self._inflight_coalescer.notify_done(cache_key)
 

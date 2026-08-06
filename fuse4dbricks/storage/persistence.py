@@ -136,6 +136,21 @@ class DiskPersistence:
         with open(path, "rb") as f:
             return f.read()
 
+    async def chunk_exists(
+        self, fs_path: str, chunk_index: int, mtime: float, gen: int = 0
+    ) -> bool:
+        """Whether a chunk is already cached on disk, without reading its
+        content. For a prefetch, the caller only needs to know whether a
+        download is required; reading the full chunk back (as
+        ``retrieve_chunk`` does) would cost as much I/O as the read it is
+        trying to save.
+        """
+        cache_path = self._get_chunk_path(fs_path, chunk_index, mtime, gen)
+        async with self.lock:
+            if cache_path in self.access_map:
+                self.access_map[cache_path] = time.time()
+        return await trio.to_thread.run_sync(os.path.exists, cache_path)
+
     async def store_chunk_from_stream(
         self,
         fs_path: str,
