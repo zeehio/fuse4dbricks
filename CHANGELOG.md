@@ -1,3 +1,7 @@
+# Unreleased
+
+- Fix fatal startup/runtime errors exiting with status 0 instead of 1.
+
 # 0.7.4 (2026-06-20)
 
 - Make writes durable and immediately visible on `close()`. The upload ran only
