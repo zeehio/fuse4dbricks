@@ -299,6 +299,12 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   appear until this short TTL expires. Unlike file metadata, these negative results are *not*
   shared between users.
 
+- **Revoked permissions can stay effective for a short time.** Catalog and
+  schema access permissions are cached using `--metadata-cache-ttl-catalog-sec`,
+  set to 10 minutes (600 seconds) by default. Volume access permissions are
+  cached using `--metadata-cache-ttl-sec`, set to 30 seconds by default. This
+  reduces the request load on the Unity Catalog API, improving performance.
+
 - **Writes are object-store semantics, not POSIX semantics.** The Databricks Files API is a
   full-replace store: a file is not visible to other processes until the writing process closes
   it (`release`). Concurrent writers follow last-write-wins — there is no locking. Deleting a
