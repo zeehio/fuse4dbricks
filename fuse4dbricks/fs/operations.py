@@ -704,9 +704,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         except Exception as e:
             self._raise_fuse_error(e, fs_path=child_fs_path, op="unlink")
 
-        child_inode = self.inodes.get_inode_by_path(child_fs_path)
-        if child_inode is not None:
-            self.inodes._prune_subtree(child_inode)
+        self.inodes.detach_path(child_fs_path)
         self.metadata_manager.invalidate(child_fs_path, is_dir=False)
         # Drop any cached content so a later same-named file is not served stale.
         await self.data_manager.invalidate_path(child_fs_path)
@@ -734,9 +732,7 @@ class UnityCatalogFS(pyfuse3.Operations):
         except Exception as e:
             self._raise_fuse_error(e, fs_path=child_fs_path, op="rmdir")
 
-        child_inode = self.inodes.get_inode_by_path(child_fs_path)
-        if child_inode is not None:
-            self.inodes._prune_subtree(child_inode)
+        self.inodes.detach_path(child_fs_path)
         self.metadata_manager.invalidate(child_fs_path, is_dir=True)
 
     async def rename(self, parent_inode_old, name_old, parent_inode_new, name_new, flags, ctx):
