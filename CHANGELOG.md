@@ -1,3 +1,7 @@
+# 0.7.6 (2026-08-07)
+
+- Force push. Bump for traceability.
+
 # 0.7.5 (2026-08-06)
 
 - Fix fatal startup/runtime errors exiting with status 0 instead of 1.
