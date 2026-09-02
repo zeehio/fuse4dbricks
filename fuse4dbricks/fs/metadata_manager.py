@@ -108,18 +108,18 @@ class MetadataManager:
 
         # --- Request Coalescing (Thundering Herd Protection) ---
         # Stores active requests: { full_path: trio.Event }
-        self._attr_coalescer: InflightCoalescer[str] = InflightCoalescer()
-        self._dir_coalescer: InflightCoalescer[str] = InflightCoalescer()
+        self._attr_coalescer: InflightCoalescer[str, None] = InflightCoalescer()
+        self._dir_coalescer: InflightCoalescer[str, None] = InflightCoalescer()
 
         self._permissions_cache: OrderedDict[
             Tuple[str, str], Tuple[float, bool]
         ] = OrderedDict()
         self._permissions_lock = trio.Lock()
-        self._permissions_coalescer: InflightCoalescer[Tuple[str, str]] = InflightCoalescer()
+        self._permissions_coalescer: InflightCoalescer[Tuple[str, str], None] = InflightCoalescer()
 
         self._principal_cache: OrderedDict[int, str] = OrderedDict()
         self._principal_cache_lock = trio.Lock()
-        self._principal_coalescer: InflightCoalescer[int] = InflightCoalescer()
+        self._principal_coalescer: InflightCoalescer[int, None] = InflightCoalescer()
 
         """(principal, securable) -> (expires_at, has_permission)
         Caches permission checks to avoid redundant API calls for the same

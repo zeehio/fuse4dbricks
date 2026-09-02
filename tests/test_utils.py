@@ -132,14 +132,14 @@ def test_fs_to_securable_deep_path_returns_volume_securable():
 
 @pytest.mark.trio
 async def test_coalescer_first_caller_is_leader():
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     _event, is_leader = await coalescer.join_or_lead("k")
     assert is_leader is True
 
 
 @pytest.mark.trio
 async def test_coalescer_second_caller_on_same_key_is_follower():
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     event1, leader1 = await coalescer.join_or_lead("k")
     event2, leader2 = await coalescer.join_or_lead("k")
     assert leader1 is True
@@ -149,7 +149,7 @@ async def test_coalescer_second_caller_on_same_key_is_follower():
 
 @pytest.mark.trio
 async def test_coalescer_different_keys_are_independent_leaders():
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     _, leader1 = await coalescer.join_or_lead("key_a")
     _, leader2 = await coalescer.join_or_lead("key_b")
     assert leader1 is True
@@ -158,7 +158,7 @@ async def test_coalescer_different_keys_are_independent_leaders():
 
 @pytest.mark.trio
 async def test_coalescer_notify_done_sets_event():
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     event, _ = await coalescer.join_or_lead("k")
     assert not event.is_set()
     await coalescer.notify_done("k")
@@ -167,7 +167,7 @@ async def test_coalescer_notify_done_sets_event():
 
 @pytest.mark.trio
 async def test_coalescer_notify_done_removes_key_so_next_caller_is_leader():
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     await coalescer.join_or_lead("k")
     await coalescer.notify_done("k")
     _, is_leader = await coalescer.join_or_lead("k")
@@ -177,7 +177,7 @@ async def test_coalescer_notify_done_removes_key_so_next_caller_is_leader():
 @pytest.mark.trio
 async def test_coalescer_follower_unblocked_by_notify_done():
     """Follower task waiting on event.wait() must be woken when leader calls notify_done."""
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     follower_woken = []
 
     # Become leader first (before follower task starts)
@@ -202,5 +202,28 @@ async def test_coalescer_follower_unblocked_by_notify_done():
 @pytest.mark.trio
 async def test_coalescer_notify_done_noop_for_unknown_key():
     """notify_done on an unknown key must not raise."""
-    coalescer: InflightCoalescer[str] = InflightCoalescer()
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
     await coalescer.notify_done("never_registered")  # should not raise
+
+
+@pytest.mark.trio
+async def test_coalescer_hands_the_leader_result_to_followers():
+    """The leader's result is published on the entry, so a follower gets the
+    value directly instead of having to look it up somewhere else."""
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
+    entry, is_leader = await coalescer.join_or_lead("k")
+    assert is_leader is True
+    assert entry.result is None
+
+    await coalescer.notify_done("k", "the-value")
+
+    assert entry.result == "the-value"
+
+
+@pytest.mark.trio
+async def test_coalescer_result_defaults_to_none():
+    """Callers that publish their outcome elsewhere can ignore the result."""
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
+    entry, _ = await coalescer.join_or_lead("k")
+    await coalescer.notify_done("k")
+    assert entry.result is None

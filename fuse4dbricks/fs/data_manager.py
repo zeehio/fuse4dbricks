@@ -126,10 +126,25 @@ class DataManager:
         self.uc_client = uc_client
         self.persistence = persistence
         self.chunk_size = 8 * 1024 * 1024
-        self._inflight_coalescer: InflightCoalescer[_CacheKey] = InflightCoalescer()
+        self._inflight_coalescer: InflightCoalescer[_CacheKey, bytes] = InflightCoalescer()
         "Inflight coalescer for downloads identified by (fs_path, chunk_id, mtime, gen)"
 
         self._download_scheduler = DownloadScheduler(process_request=self._process_request, num_workers=num_workers)
+
+        # Writing a downloaded chunk to the disk cache is deliberately NOT on
+        # the read path: the reader is handed the bytes as soon as the network
+        # transfer finishes and these workers persist them concurrently, so a
+        # read costs max(network, disk) instead of network + disk. A read that
+        # is never repeated — the dominant pattern for a one-pass TB-scale
+        # download — then pays nothing for a cache entry it will not reuse.
+        # The channel has no buffer, so a chunk waiting to be written is always
+        # held by one of the `num_workers` writers: a burst of fast sequential
+        # reads applies backpressure to the downloaders instead of piling up an
+        # unbounded number of pending writes in memory.
+        self._num_write_workers = num_workers
+        self._write_send, self._write_recv = trio.open_memory_channel[Tuple[_ChunkRequest, bytes]](
+            max_buffer_size=0
+        )
 
         # Per-path cache generation. Bumped on a local write so previously cached
         # chunks become unreachable without scanning. Absent path => generation 0.
@@ -141,6 +156,10 @@ class DataManager:
 
     def close(self) -> None:
         self._download_scheduler.close()
+        # Writers drain what is already handed to them and then exit on
+        # EndOfChannel; nothing is lost, since every byte queued here has
+        # already been returned to its reader.
+        self._write_send.close()
 
     def _generation(self, fs_path: str) -> int:
         return self._write_generation.get(fs_path, 0)
@@ -157,14 +176,16 @@ class DataManager:
         self._write_generation[fs_path] = self._generation(fs_path) + 1
 
     async def _process_request(self, chunk_request: _ChunkRequest, priority: str):
+        cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime, chunk_request.gen)
+        chunk: bytes | None = None
+        downloaded: bytes | None = None
         try:
-            cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime, chunk_request.gen)
             if priority == "high":
                 # A real read needs the bytes now, so fetch them (from disk,
                 # falling back to network) and cache in RAM.
                 chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen)
                 if chunk is None:
-                    chunk = await self._fetch_chunk(chunk_request)
+                    chunk = downloaded = await self._download_chunk(chunk_request)
                 await self._ram_cache.put(cache_key, chunk)
             else:
                 # A prefetch only needs the chunk to end up on disk. Reading
@@ -173,16 +194,72 @@ class DataManager:
                 # not even be read; a plain existence check is enough to
                 # decide whether a download is needed.
                 if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
-                    await self._fetch_chunk(chunk_request)
+                    chunk = downloaded = await self._download_chunk(chunk_request)
         finally:
-            await self._inflight_coalescer.notify_done(cache_key)
+            # Hand the bytes straight to whoever is waiting on this chunk. They
+            # must not depend on the disk write below having landed, nor on the
+            # chunk still being in the RAM cache (which may have no room for it
+            # at all with a small --ram-cache-mb).
+            await self._inflight_coalescer.notify_done(cache_key, chunk)
+        if downloaded is not None:
+            # Only now, with the reader already served, queue the disk write.
+            await self._persist_chunk(chunk_request, downloaded)
 
+    async def _persist_chunk(self, chunk_request: _ChunkRequest, chunk: bytes) -> None:
+        """Hands a downloaded chunk to the disk-cache writers.
+
+        Blocks while every writer is busy (that is the backpressure), but only
+        the downloader waits here — the read this chunk belongs to has already
+        been served.
+        """
+        try:
+            await self._write_send.send((chunk_request, chunk))
+        except (trio.BrokenResourceError, trio.ClosedResourceError):
+            # Shutting down: the chunk was still delivered to its reader, it
+            # just won't be in the disk cache next time.
+            logger.debug(
+                "Disk cache writers stopped; not caching %s (chunk %s)",
+                chunk_request.fs_path, chunk_request.chunk_id,
+            )
+
+    async def _disk_writer(self) -> None:
+        """Persists downloaded chunks to the disk cache, off the read path."""
+        while True:
+            try:
+                chunk_request, chunk = await self._write_recv.receive()
+            except trio.EndOfChannel:
+                return
+            try:
+                await self.persistence.store_chunk(
+                    fs_path=chunk_request.fs_path,
+                    chunk_index=chunk_request.chunk_id,
+                    mtime=chunk_request.mtime,
+                    gen=chunk_request.gen,
+                    data=chunk,
+                )
+            except Exception:
+                # The reader already has these bytes straight from the network,
+                # so a failed cache write costs nothing but a future disk-cache
+                # miss — exactly what happens for any uncached chunk today. It
+                # must never take the mount down, so it is logged and dropped.
+                logger.exception(
+                    "Failed to cache chunk on disk for %s (chunk %s, mtime %s)",
+                    chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime,
+                )
 
     def run_services(self, nursery):
-        """Starts download workers"""
+        """Starts download workers and disk-cache writers"""
         self._download_scheduler.run_services(nursery)
+        for _ in range(self._num_write_workers):
+            nursery.start_soon(self._disk_writer)
 
-    async def _fetch_chunk(self, chunk_request: _ChunkRequest):
+    async def _download_chunk(self, chunk_request: _ChunkRequest) -> bytes:
+        """Downloads a chunk from Unity Catalog and returns its bytes.
+
+        Caching it on disk is not part of this: the caller returns these bytes
+        to the waiting reader first and queues the write afterwards (see
+        ``_process_request``).
+        """
         uc_path = fs_to_uc_path(chunk_request.fs_path)
         offset = self.chunk_size * chunk_request.chunk_id
         length = chunk_request.chunk_size
@@ -193,19 +270,15 @@ class DataManager:
             ctx=chunk_request.ctx,
             if_unmodified_since=chunk_request.mtime,
         )
-        chunk = await self.persistence.store_chunk_from_stream(
-            fs_path=chunk_request.fs_path,
-            chunk_index=chunk_request.chunk_id,
-            mtime=chunk_request.mtime,
-            gen=chunk_request.gen,
-            stream=stream,
-        )
-        return chunk
+        chunk = bytearray()
+        async for part in stream:
+            chunk.extend(part)
+        return bytes(chunk)
 
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, gen: int, ctx: pyfuse3.RequestContext):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
             cache_key = (fs_path, chunk_id, mtime, gen)
-            (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
+            (_inflight, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
             if not leader:
                 continue  # already being fetched, we don't care about it
             chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, gen=gen, chunk_size=chunk_size, ctx=ctx)
@@ -236,16 +309,22 @@ class DataManager:
             return
 
         # 2. Coalescing
-        (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
+        (inflight, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
 
         if leader:
             # get chunk from network
             chunk_request = _ChunkRequest(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, gen=gen, chunk_size=chunk_size, ctx=ctx)
             await self._download_scheduler.enqueue_request(chunk_request, high_priority=True)
 
-        # Now we wait for the download to complete and fetch it from RAM or Disk
-        await wait_event.wait()
-        chunk = await self._get_chunk_from_cache_or_disk(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, gen=gen)
+        # Now we wait for the download to complete. The downloader hands us the
+        # bytes directly, so we don't have to wait for its disk-cache write:
+        # that runs in the background and may not have landed yet.
+        await inflight.wait()
+        chunk = inflight.result
+        if chunk is None:
+            # The download didn't produce bytes for us: either it failed, or a
+            # prefetch led this key and found the chunk already on disk.
+            chunk = await self._get_chunk_from_cache_or_disk(fs_path=fs_path, chunk_id=chunk_id, mtime=mtime, gen=gen)
         # here if chunk is none, we will return None and let the caller decide what to do (probably return EIO)
         out_dict[chunk_id] = chunk
         return

@@ -26,26 +26,18 @@ async def persistence(cache_dir):
     return p
 
 
-async def async_byte_generator(content: bytes, chunk_size: int = 10):
-    """Helper to simulate an async stream from the network."""
-    for i in range(0, len(content), chunk_size):
-        yield content[i:(i + chunk_size)]
-        await trio.sleep(0)  # Yield control to simulate network latency
-
-
 # --- 1. CORE FUNCTIONALITY & SHARDING ---
 
 
 @pytest.mark.trio
 async def test_store_and_retrieve_basic(persistence):
-    """Happy Path: Stream data in, read data out."""
+    """Happy Path: Store data, read data out."""
     file_id = "test_file_1"
     chunk_index = 0
     data = b"Hello, World! This is a test chunk."
     mtime = 0.0
     # Store
-    stream = async_byte_generator(data)
-    await persistence.store_chunk_from_stream(file_id, chunk_index, mtime, stream)
+    await persistence.store_chunk(file_id, chunk_index, mtime, data)
 
     # Retrieve
     retrieved = await persistence.retrieve_chunk(file_id, chunk_index, mtime)
@@ -70,8 +62,7 @@ async def test_sharding_structure(persistence):
     shard1 = file_hash[:2]
     shard2 = f"{(chunk_index // 1000):07d}"
 
-    stream = async_byte_generator(data)
-    await persistence.store_chunk_from_stream(file_id, chunk_index, mtime, stream)
+    await persistence.store_chunk(file_id, chunk_index, mtime, data)
 
     # Verify file exists at specific sharded location
     expected_path = os.path.join(
@@ -95,10 +86,10 @@ async def test_chunk_path_differs_by_generation(persistence):
 @pytest.mark.trio
 async def test_generations_do_not_collide_on_same_mtime(persistence):
     """Two writes with an identical mtime (the 1-second-resolution collision)
-    but different generations are stored and retrieved independently -- the
+    but different generations are stored and retrieved independently — the
     regression guard for serving stale content after a same-second overwrite."""
-    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"OLD"), gen=0)
-    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"NEW"), gen=1)
+    await persistence.store_chunk("f", 0, 5.0, b"OLD", gen=0)
+    await persistence.store_chunk("f", 0, 5.0, b"NEW", gen=1)
     assert await persistence.retrieve_chunk("f", 0, 5.0, 0) == b"OLD"
     assert await persistence.retrieve_chunk("f", 0, 5.0, 1) == b"NEW"
 
@@ -114,7 +105,7 @@ async def test_retrieve_missing_chunk(persistence):
 async def test_chunk_exists_true_after_store(persistence):
     """chunk_exists reports a stored chunk as present, without needing to
     read its content."""
-    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"data"))
+    await persistence.store_chunk("f", 0, 5.0, b"data")
     assert await persistence.chunk_exists("f", 0, 5.0) is True
 
 
@@ -128,7 +119,7 @@ async def test_chunk_exists_does_not_read_file_content(persistence, monkeypatch)
     """chunk_exists must not pay the I/O cost of reading the chunk back --
     that's the whole point of using it instead of retrieve_chunk for a
     prefetch's "is a download needed" check."""
-    await persistence.store_chunk_from_stream("f", 0, 5.0, async_byte_generator(b"data"))
+    await persistence.store_chunk("f", 0, 5.0, b"data")
 
     def _boom(path):
         raise AssertionError("chunk_exists must not read the file's content")
@@ -153,39 +144,53 @@ async def test_retrieve_missing_chunk_creates_no_dir(persistence):
     assert not os.path.exists(os.path.dirname(path))
 
 
-# --- 2. STREAMING & ATOMICITY ---
+# --- 2. ATOMICITY ---
+
+
+def _files_in(cache_dir: str) -> list[str]:
+    found: list[str] = []
+    for root, _, files in os.walk(cache_dir):
+        found.extend(files)
+    return found
 
 
 @pytest.mark.trio
-async def test_streaming_write_failure_cleanup(persistence):
+async def test_write_failure_cleanup(persistence):
     """
-    Simulate a network error halfway through the stream.
-    Ensure .tmp file is deleted and no garbage is left.
+    Simulate a failure while publishing the chunk.
+    Ensure the .tmp file is deleted and no garbage is left.
     """
-    file_id = "broken_file"
-    chunk_index = 0
+    with patch("os.rename", side_effect=OSError("disk full")):
+        with pytest.raises(OSError):
+            await persistence.store_chunk("broken_file", 0, 0.0, b"start")
 
-    async def broken_generator():
-        yield b"start"
-        raise ConnectionError("Network Reset")
-
-    with pytest.raises(ConnectionError):
-        await persistence.store_chunk_from_stream(
-            file_id, chunk_index, 0.0, broken_generator()
-        )
-
-    # Assertions
     # 1. Chunk should not exist in map
     assert persistence.current_size == 0
     assert len(persistence.access_map) == 0
 
     # 2. Filesystem should be clean (no .bin, no .tmp)
-    # We walk the cache dir to see if anything was left
-    files_found = []
-    for root, _, files in os.walk(persistence.cache_dir):
-        files_found.extend(files)
+    assert _files_in(persistence.cache_dir) == []
 
-    assert len(files_found) == 0
+
+@pytest.mark.trio
+async def test_cancelled_write_cleans_up_temp_file(persistence):
+    """A chunk write now runs in the background, so it can be cancelled at
+    shutdown mid-write. That must not leave a partial .tmp behind."""
+
+    def slow_rename(src, dst):
+        # Runs in a worker thread; long enough for the cancellation below to
+        # land while store_chunk is waiting on it.
+        time.sleep(0.3)
+
+    with patch("os.rename", side_effect=slow_rename):
+        with trio.move_on_after(0.05) as scope:
+            await persistence.store_chunk("cancelled_file", 0, 0.0, b"partial")
+
+    assert scope.cancelled_caught
+    # The rename never happened, so the temp file was still there when the
+    # cancellation arrived; the shielded cleanup must have removed it.
+    assert _files_in(persistence.cache_dir) == []
+    assert persistence.current_size == 0
 
 
 # --- 3. LRU LOGIC & LAZY PROMOTION (CRITICAL) ---
@@ -200,11 +205,11 @@ async def test_eviction_on_size_limit(cache_dir):
     mtime = 0.0
 
     # Write Chunk A (60 bytes)
-    await p.store_chunk_from_stream("A", 0, mtime, async_byte_generator(b"A" * 60))
+    await p.store_chunk("A", 0, mtime, b"A" * 60)
     assert p.current_size == 60
 
     # Write Chunk B (60 bytes) -> Total 120 > 100. Must evict A.
-    await p.store_chunk_from_stream("B", 0, mtime, async_byte_generator(b"B" * 60))
+    await p.store_chunk("B", 0, mtime, b"B" * 60)
 
     assert p.current_size == 60
     assert await p.retrieve_chunk("A", 0, mtime) is None
@@ -225,11 +230,11 @@ async def test_lazy_promotion(cache_dir):
     mtime = 0.0
     # 1. Store A (50 bytes) at T=100
     with patch("time.time", return_value=100.0):
-        await p.store_chunk_from_stream("A", 0, mtime, async_byte_generator(b"A" * 50))
+        await p.store_chunk("A", 0, mtime, b"A" * 50)
 
     # 2. Store B (50 bytes) at T=200
     with patch("time.time", return_value=200.0):
-        await p.store_chunk_from_stream("B", 0, mtime, async_byte_generator(b"B" * 50))
+        await p.store_chunk("B", 0, mtime, b"B" * 50)
 
     # State: [A(100), B(200)]. Size: 100/150.
 
@@ -244,7 +249,7 @@ async def test_lazy_promotion(cache_dir):
     #   - Pop A(100). Check Map. Map says A is 300. 300 > 100. Push A(300).
     #   - Pop B(200). Check Map. Map says B is 200. Evict B.
     with patch("time.time", return_value=400.0):
-        await p.store_chunk_from_stream("C", 0, mtime, async_byte_generator(b"C" * 60))
+        await p.store_chunk("C", 0, mtime, b"C" * 60)
 
     # 5. Assertions
     assert await p.retrieve_chunk("B", 0, mtime) is None  # B was evicted
@@ -334,8 +339,8 @@ async def test_gc_removes_old_files(persistence):
 
     # Store file at T=0
     with patch("time.time", return_value=0):
-        await persistence.store_chunk_from_stream(
-            "old_file", 0, 0.0, async_byte_generator(b"data")
+        await persistence.store_chunk(
+            "old_file", 0, 0.0, b"data"
         )
 
     # Verify it exists
@@ -382,8 +387,8 @@ async def test_gc_panic_mode_disk_full(persistence):
     """Test aggressive cleanup when physical disk is full."""
     # Write a "fresh" file (T=1000)
     with patch("time.time", return_value=1000.0):
-        await persistence.store_chunk_from_stream(
-            "fresh", 0, 0.0, async_byte_generator(b"data")
+        await persistence.store_chunk(
+            "fresh", 0, 0.0, b"data"
         )
 
     # Simulate current time T=1001 (File is NOT expired)
@@ -431,12 +436,12 @@ async def test_concurrent_store_triggers_eviction(cache_dir):
     p = DiskPersistence(cache_dir, max_size_gb=(100 / 1024**3))
 
     # 1. Store A (60 bytes)
-    await p.store_chunk_from_stream("A", 0, 0.0, async_byte_generator(b"A" * 60))
+    await p.store_chunk("A", 0, 0.0, b"A" * 60)
     assert p.current_size == 60
 
     # 2. Store B (60 bytes) - Triggers Eviction of A
     # This call previously caused the recursion deadlock
-    await p.store_chunk_from_stream("B", 0, 0.0, async_byte_generator(b"B" * 60))
+    await p.store_chunk("B", 0, 0.0, b"B" * 60)
 
     # 3. Verify State
     assert p.current_size == 60  # A was evicted, B took its place
@@ -490,8 +495,8 @@ async def test_background_maintenance_non_blocking(persistence):
     persistence.max_age_seconds = 0.1  # Expire very fast
 
     # 1. Store a file
-    await persistence.store_chunk_from_stream(
-        "fast_expire", 0, 0.0, async_byte_generator(b"data")
+    await persistence.store_chunk(
+        "fast_expire", 0, 0.0, b"data"
     )
     path = persistence._get_chunk_path("fast_expire", 0, 0.0)
 

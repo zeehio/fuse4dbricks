@@ -1,6 +1,6 @@
 """
 Disk Persistence Layer for FUSE.
-Implements streaming writes, single-level sharding, and lazy LRU eviction.
+Implements atomic writes, single-level sharding, and lazy LRU eviction.
 """
 
 import hashlib
@@ -9,7 +9,7 @@ import os
 import shutil
 import time
 from heapq import heappop, heappush
-from typing import AsyncGenerator, Tuple
+from typing import Tuple
 
 import trio
 
@@ -50,9 +50,8 @@ class DiskPersistence:
         read (cache hits included), so creating the shard dir here meant a
         blocking ``os.makedirs`` syscall in the async hot path plus empty dirs
         for chunks that are never written. Directory creation now lives on the
-        write path only (see ``store_chunk_from_stream`` /
-        ``_ensure_parent_dir``); a read of a missing chunk simply hits
-        FileNotFoundError and returns None.
+        write path only (see ``store_chunk`` / ``_ensure_parent_dir``); a read
+        of a missing chunk simply hits FileNotFoundError and returns None.
         """
         sha256_hash = hashlib.sha256(fs_path.encode("utf-8")).hexdigest()
         shard1 = sha256_hash[:2]
@@ -151,19 +150,26 @@ class DiskPersistence:
                 self.access_map[cache_path] = time.time()
         return await trio.to_thread.run_sync(os.path.exists, cache_path)
 
-    async def store_chunk_from_stream(
+    async def store_chunk(
         self,
         fs_path: str,
         chunk_index: int,
         mtime: float,
-        stream: AsyncGenerator[bytes, None],
+        data: bytes,
         gen: int = 0,
-    ) -> bytes:
-        """Consumes a stream and writes it to disk. Returns the bytes written."""
+    ) -> None:
+        """Writes an already-downloaded chunk to the cache.
+
+        Atomic (write to ``.tmp``, then rename) and LRU-accounted, as before.
+        What changed is *when* this runs: the downloader hands the bytes back to
+        the waiting reader first and only then queues this write (see
+        ``DataManager._process_request``), so a slow local disk never adds
+        latency to a read. Because the write now outlives the read that produced
+        it, it must clean up after itself when cancelled at shutdown.
+        """
         cache_path = self._get_chunk_path(fs_path, chunk_index, mtime, gen)
         temp_path = f"{cache_path}.{os.getpid()}.tmp"
-        result = bytearray()
-        bytes_written = 0
+        bytes_written = len(data)
         try:
             # The shard dir is created lazily here (off-thread), only when we
             # actually write a chunk — not on every read in _get_chunk_path.
@@ -171,10 +177,7 @@ class DiskPersistence:
 
             # Write to .tmp (No lock needed)
             async with await trio.open_file(temp_path, "wb") as f:
-                async for chunk in stream:
-                    await f.write(chunk)
-                    bytes_written += len(chunk)
-                    result.extend(chunk)
+                await f.write(data)
 
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
@@ -189,11 +192,22 @@ class DiskPersistence:
                 now = time.time()
                 self.access_map[cache_path] = now
                 heappush(self.access_log, (now, cache_path, bytes_written))
-            return bytes(result)
-        except Exception as e:
-            if os.path.exists(temp_path):
-                await trio.to_thread.run_sync(os.remove, temp_path)
-            raise e
+        except BaseException:
+            # BaseException, not Exception: this runs as a background task now,
+            # so trio.Cancelled at shutdown is an expected way to get here and
+            # must not leave a partial .tmp behind. The cleanup is shielded so
+            # it still runs inside the cancelled scope.
+            with trio.CancelScope(shield=True):
+                await trio.to_thread.run_sync(self._remove_quietly, temp_path)
+            raise
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        """Delete ``path`` if it is there, ignoring the case where it is not."""
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     async def evict(self, required_space: int):
         """

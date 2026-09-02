@@ -1,3 +1,23 @@
+# 0.7.7 (2026-09-02)
+
+- Speed up downloads by taking the disk-cache write off the read path. Every
+  downloaded chunk was written to the local cache and that write was fully
+  awaited *before* the bytes were handed back to the reader, so each chunk paid
+  network time *and* local disk time back to back. A read now costs
+  `max(network, disk)` instead of `network + disk`: the bytes go straight to the
+  waiting reader as soon as the transfer finishes, and a pool of writers
+  persists them concurrently. This matters most for the single-pass, TB-scale
+  sequential download, where the cache entry is never reused at all.
+  Caching itself is unchanged — same atomic write-then-rename, same LRU and
+  eviction rules, same TTLs, no new option to turn any of it on — only its
+  timing relative to the read. Both download priorities (a read someone is
+  blocked on, and read-ahead prefetch) behave this way. A cache write that fails
+  is logged and dropped: the reader already has valid bytes from the network,
+  and the chunk is simply re-fetched on a later access, as any uncached chunk
+  is. Pending writes are bounded by the number of download workers, so a fast
+  sequential read applies backpressure instead of piling up chunks in memory,
+  and a write cancelled at shutdown cleans up its partial `.tmp` file.
+
 # 0.7.6 (2026-08-07)
 
 - Force push. Bump for traceability.

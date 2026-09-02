@@ -49,34 +49,68 @@ def uc_to_fs_path(uc_path: str) -> str:
     return "/" + "/".join(parts)
 
 _InflightKey = TypeVar("_InflightKey")
+_InflightResult = TypeVar("_InflightResult")
 
-class InflightCoalescer(Generic[_InflightKey]):
+
+class InflightEntry(Generic[_InflightResult]):
+    """Waitable slot for one in-flight operation.
+
+    Behaves like the ``trio.Event`` it wraps (``wait()`` / ``is_set()``) and
+    additionally carries the value the leader produced, so a follower can be
+    handed the result directly instead of having to look it up somewhere else.
+    """
+
+    __slots__ = ("_event", "result")
+
+    def __init__(self) -> None:
+        self._event = trio.Event()
+        self.result: _InflightResult | None = None
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self) -> None:
+        await self._event.wait()
+
+    def _set(self) -> None:
+        self._event.set()
+
+
+class InflightCoalescer(Generic[_InflightKey, _InflightResult]):
     """
     Request coalescing helper.
 
     Tracks in-flight work keyed by an arbitrary key.
-    - join_or_lead(key) returns (event, is_leader)
-    - notify_done(key) wakes followers and removes the key
+    - join_or_lead(key) returns (entry, is_leader)
+    - notify_done(key, result) wakes followers and removes the key
+
+    ``result`` is optional: callers that publish their outcome elsewhere (a
+    cache, a shared dict) can ignore it and leave it ``None``.
     """
 
     def __init__(self) -> None:
         self._lock = trio.Lock()
-        self._inflight: dict[_InflightKey, trio.Event] = {}
+        self._inflight: dict[_InflightKey, InflightEntry[_InflightResult]] = {}
 
-    async def join_or_lead(self, key: _InflightKey) -> Tuple[trio.Event, bool]:
+    async def join_or_lead(self, key: _InflightKey) -> Tuple[InflightEntry[_InflightResult], bool]:
         """
         If no request is running for key, caller becomes leader and must perform the work.
-        Followers should await the returned event.
+        Followers should await the returned entry and then read its ``result``.
         """
         async with self._lock:
             leader = key not in self._inflight
             if leader:
-                self._inflight[key] = trio.Event()
+                self._inflight[key] = InflightEntry()
             return self._inflight[key], leader
 
-    async def notify_done(self, key: _InflightKey) -> None:
-        """Wake up any followers waiting on key and cleanup."""
+    async def notify_done(self, key: _InflightKey, result: _InflightResult | None = None) -> None:
+        """Publish ``result``, wake up any followers waiting on key and cleanup.
+
+        The entry is dropped from the map here, so the result lives exactly as
+        long as the waiters that still hold a reference to it.
+        """
         async with self._lock:
-            ev = self._inflight.pop(key, None)
-            if ev is not None:
-                ev.set()
+            entry = self._inflight.pop(key, None)
+            if entry is not None:
+                entry.result = result
+                entry._set()

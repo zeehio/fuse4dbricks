@@ -1,18 +1,25 @@
 """
-Tests for fuse4dbricks.fs.data_manager.DataManager.read.
+Tests for fuse4dbricks.fs.data_manager.DataManager.
 
-Strategy: mock _read_chunk so that it always populates out_dict with
-synthetic data, bypassing the network / disk / scheduler entirely.
-This lets us unit-test the chunk-selection and byte-assembly math in
-DataManager.read without spinning up the full download infrastructure.
+Two strategies, depending on what is under test:
+
+- For the chunk-selection and byte-assembly math in read(), _read_chunk is
+  mocked so that it always populates out_dict with synthetic data, bypassing
+  the network / disk / scheduler entirely.
+- For the download-and-cache behaviour, the real path runs with the network
+  client and the disk persistence layer mocked, and the manager's background
+  services started (see the `running` helper).
 """
 
 import errno
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pyfuse3
+import trio
+import trio.testing
 
 from fuse4dbricks.fs.data_manager import DataManager, _ChunkRequest
 from fuse4dbricks.fs.ram_cache import RamCache
@@ -28,18 +35,46 @@ def ctx():
     return SimpleNamespace(uid=1000, pid=5678, gid=1000)
 
 
-def _make_manager() -> DataManager:
+def _download_stream(*parts: bytes):
+    """A stand-in for UnityCatalogClient.download_chunk_stream()."""
+    async def _stream():
+        for part in parts:
+            await trio.sleep(0)  # simulate network latency between packets
+            yield part
+
+    # side_effect, not return_value: every call must get a fresh generator.
+    return MagicMock(side_effect=lambda *args, **kwargs: _stream())
+
+
+def _make_manager(num_workers: int = 1) -> DataManager:
     uc_client = MagicMock()
+    uc_client.download_chunk_stream = _download_stream(b"downloaded")
     persistence = MagicMock()
     persistence.retrieve_chunk = AsyncMock(return_value=None)
-    persistence.store_chunk_from_stream = AsyncMock(return_value=b"")
-    dm = DataManager(uc_client=uc_client, persistence=persistence, ram_cache_mb=1, num_workers=1)
+    persistence.chunk_exists = AsyncMock(return_value=False)
+    persistence.store_chunk = AsyncMock(return_value=None)
+    dm = DataManager(
+        uc_client=uc_client, persistence=persistence, ram_cache_mb=1, num_workers=num_workers
+    )
     return dm
 
 
 @pytest.fixture
 def manager():
     return _make_manager()
+
+
+@asynccontextmanager
+async def running(dm: DataManager):
+    """Runs a DataManager's background services (download workers and disk-cache
+    writers) for the duration of the block, then shuts them down cleanly so any
+    queued disk write has landed before the assertions run."""
+    async with trio.open_nursery() as nursery:
+        dm.run_services(nursery)
+        try:
+            yield dm
+        finally:
+            dm.close()
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +348,10 @@ async def test_process_request_high_priority_disk_hit_caches_in_ram(manager):
     manager.persistence.retrieve_chunk = AsyncMock(return_value=b"cached-bytes")
     request = _chunk_request(manager)
 
-    await manager._process_request(request, priority="high")
+    async with running(manager):
+        await manager._process_request(request, priority="high")
 
-    manager.persistence.store_chunk_from_stream.assert_not_awaited()
+    manager.persistence.store_chunk.assert_not_awaited()
     cached = await manager._ram_cache.get(("/c/s/v/f", 0, 100.0, 0))
     assert cached == b"cached-bytes"
 
@@ -324,14 +360,16 @@ async def test_process_request_high_priority_disk_hit_caches_in_ram(manager):
 async def test_process_request_high_priority_miss_downloads_and_caches_in_ram(manager):
     manager._ram_cache = RamCache(max_entries=8)
     manager.persistence.retrieve_chunk = AsyncMock(return_value=None)
-    manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
     request = _chunk_request(manager)
 
-    await manager._process_request(request, priority="high")
+    async with running(manager):
+        await manager._process_request(request, priority="high")
 
-    manager.persistence.store_chunk_from_stream.assert_awaited_once()
     cached = await manager._ram_cache.get(("/c/s/v/f", 0, 100.0, 0))
     assert cached == b"downloaded"
+    manager.persistence.store_chunk.assert_awaited_once_with(
+        fs_path="/c/s/v/f", chunk_index=0, mtime=100.0, gen=0, data=b"downloaded"
+    )
 
 
 @pytest.mark.trio
@@ -339,30 +377,170 @@ async def test_process_request_prefetch_skips_download_when_already_on_disk(mana
     manager.persistence.chunk_exists = AsyncMock(return_value=True)
     request = _chunk_request(manager, chunk_id=5)
 
-    await manager._process_request(request, priority="regular")
+    async with running(manager):
+        await manager._process_request(request, priority="regular")
 
     manager.persistence.chunk_exists.assert_awaited_once_with(
         fs_path="/c/s/v/f", chunk_index=5, mtime=100.0, gen=0
     )
-    # No download, and -- crucially -- no read of the chunk's content either
+    # No download, and — crucially — no read of the chunk's content either
     # (that would cost the same disk I/O the existence check is avoiding).
     manager.persistence.retrieve_chunk.assert_not_awaited()
-    manager.persistence.store_chunk_from_stream.assert_not_awaited()
+    manager.persistence.store_chunk.assert_not_awaited()
     assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) is None
 
 
 @pytest.mark.trio
 async def test_process_request_prefetch_downloads_when_missing_but_not_cached_in_ram(manager):
     manager.persistence.chunk_exists = AsyncMock(return_value=False)
-    manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
     request = _chunk_request(manager, chunk_id=5)
 
-    await manager._process_request(request, priority="regular")
+    async with running(manager):
+        await manager._process_request(request, priority="regular")
 
     manager.persistence.retrieve_chunk.assert_not_awaited()
-    manager.persistence.store_chunk_from_stream.assert_awaited_once()
+    manager.persistence.store_chunk.assert_awaited_once()
     # Prefetched content is deliberately not promoted into the RAM cache.
     assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: the disk-cache write is off the read path
+#
+# A downloaded chunk is handed to the waiting reader as soon as the network
+# transfer finishes; persisting it to the disk cache happens concurrently. A
+# read therefore costs max(network, disk) rather than network + disk, and a
+# slow, busy or broken local disk cannot hold a read up.
+# ---------------------------------------------------------------------------
+
+
+FILE_SIZE = 10  # b"downloaded"
+
+
+@pytest.mark.trio
+async def test_read_does_not_wait_for_the_disk_cache_write(manager, ctx):
+    """The read must complete while the disk write is still pending."""
+    write_started = trio.Event()
+    release_write = trio.Event()
+
+    async def hanging_store_chunk(**kwargs):
+        write_started.set()
+        await release_write.wait()
+
+    manager.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
+
+    async with running(manager):
+        with trio.fail_after(5):
+            result = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+            assert result == b"downloaded"
+            # The read returned; the write it triggered is still in flight.
+            await write_started.wait()
+        assert not release_write.is_set()
+        release_write.set()
+
+    manager.persistence.store_chunk.assert_awaited_once()
+
+
+@pytest.mark.trio
+async def test_read_returns_bytes_when_the_disk_cache_write_fails(manager, ctx):
+    """A failed cache write costs a future disk-cache miss, nothing more: the
+    reader already has valid bytes straight from the network."""
+    manager.persistence.store_chunk = AsyncMock(side_effect=OSError("disk full"))
+
+    async with running(manager):
+        with trio.fail_after(5):
+            result = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+
+    assert result == b"downloaded"
+    manager.persistence.store_chunk.assert_awaited_once()
+
+
+@pytest.mark.trio
+async def test_prefetch_does_not_wait_for_the_disk_cache_write(manager, ctx):
+    """Story 6: the prefetch path must not block on the disk write either."""
+    release_write = trio.Event()
+    writes_started = 0
+
+    async def hanging_store_chunk(**kwargs):
+        nonlocal writes_started
+        writes_started += 1
+        await release_write.wait()
+
+    # Two workers, so the read's own download is not stuck behind the prefetch.
+    dm = _make_manager(num_workers=2)
+    dm.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
+
+    async with running(dm):
+        with trio.fail_after(5):
+            # A 2-chunk file read from chunk 0: chunk 1 gets prefetched.
+            await dm.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=dm.chunk_size + FILE_SIZE, ctx=ctx,
+            )
+            # Both the read's and the prefetch's writes are pending, yet the
+            # read already returned and the prefetch worker moved on.
+            while writes_started < 2:
+                await trio.sleep(0)
+        release_write.set()
+
+    assert dm.persistence.store_chunk.await_count == 2
+
+
+@pytest.mark.trio
+async def test_second_read_of_the_same_chunk_is_served_from_cache(manager, ctx):
+    """Story 4: once the background write has landed, a repeat read is served
+    from cache instead of hitting the network again."""
+    stored: dict[tuple, bytes] = {}
+
+    async def store_chunk(*, fs_path, chunk_index, mtime, gen, data):
+        stored[(fs_path, chunk_index, mtime, gen)] = data
+
+    async def retrieve_chunk(fs_path, chunk_index, mtime, gen=0):
+        return stored.get((fs_path, chunk_index, mtime, gen))
+
+    manager.persistence.store_chunk = AsyncMock(side_effect=store_chunk)
+    manager.persistence.retrieve_chunk = AsyncMock(side_effect=retrieve_chunk)
+
+    async with running(manager):
+        with trio.fail_after(5):
+            first = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+            # Let the background write land before reading again.
+            while not stored:
+                await trio.sleep(0)
+            second = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+
+    assert first == second == b"downloaded"
+    # One network fetch only: the second read came from the disk cache.
+    assert manager.uc_client.download_chunk_stream.call_count == 1
+
+
+@pytest.mark.trio
+async def test_read_succeeds_with_a_ram_cache_too_small_for_a_chunk(manager, ctx):
+    """The `manager` fixture's 1 MB RAM cache holds no 8 MB chunk at all. The
+    reader is handed the downloaded bytes directly, so it must not depend on
+    the RAM cache — nor on the disk write, which has not landed yet."""
+    assert (await manager._ram_cache.stats())[1] == 0
+
+    async with running(manager):
+        with trio.fail_after(5):
+            result = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+
+    assert result == b"downloaded"
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +563,7 @@ async def test_invalidate_path_bumps_generation(manager):
 @pytest.mark.trio
 async def test_invalidate_path_changes_the_chunk_cache_key(manager):
     """After a write bumps the generation, the next lookup keys the chunk under
-    the new generation -- so a stale RAM/disk chunk from before the write (same
+    the new generation — so a stale RAM/disk chunk from before the write (same
     fs_path, chunk and mtime, but old gen) is bypassed. This is what stops a
     same-second overwrite (mtime has 1s resolution) from serving stale bytes."""
     fs = "/cat/sch/vol/f.txt"
@@ -398,3 +576,60 @@ async def test_invalidate_path_changes_the_chunk_cache_key(manager):
 
     await manager._get_chunk_from_cache_or_disk(fs, 0, mtime, manager._generation(fs))
     manager.persistence.retrieve_chunk.assert_awaited_with(fs, 0, mtime, 1)
+
+
+@pytest.mark.trio
+async def test_shutdown_with_a_pending_disk_write_is_clean(ctx):
+    """Story 5: shutting down while a chunk is still queued for the disk cache
+    must not raise. The bytes were already delivered to their reader; the chunk
+    is simply not in the disk cache next time."""
+    release_write = trio.Event()
+    writes_started = 0
+
+    async def hanging_store_chunk(**kwargs):
+        nonlocal writes_started
+        writes_started += 1
+        await release_write.wait()
+
+    # One download worker and one writer: the writer is busy on the read's own
+    # chunk, so the prefetched chunk is left waiting to be handed over.
+    dm = _make_manager(num_workers=1)
+    dm.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
+
+    async with trio.open_nursery() as nursery:
+        dm.run_services(nursery)
+        with trio.fail_after(5):
+            await dm.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=dm.chunk_size + FILE_SIZE, ctx=ctx,
+            )
+            while writes_started < 1:
+                await trio.sleep(0)
+            await trio.testing.wait_all_tasks_blocked()
+            dm.close()
+            release_write.set()
+
+    # Only the write the writer had already picked up ran.
+    assert dm.persistence.store_chunk.await_count == 1
+
+
+@pytest.mark.trio
+async def test_read_fails_with_eio_when_the_download_fails(manager, ctx):
+    """A chunk that never arrives is still an EIO, and nothing is cached."""
+
+    async def failing_stream(*args, **kwargs):
+        raise ConnectionError("Network Reset")
+        yield b""  # pragma: no cover - makes this an async generator
+
+    manager.uc_client.download_chunk_stream = MagicMock(side_effect=failing_stream)
+
+    async with running(manager):
+        with trio.fail_after(5):
+            with pytest.raises(pyfuse3.FUSEError) as exc_info:
+                await manager.read(
+                    "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                    file_size=FILE_SIZE, ctx=ctx,
+                )
+
+    assert exc_info.value.errno == errno.EIO
+    manager.persistence.store_chunk.assert_not_awaited()
