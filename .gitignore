@@ -217,3 +217,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Agent Skills (npx skills) - installed content ignored, skills-lock.json stays tracked
+# restore with: npx skills experimental_install
+.agents/skills/
+.claude/skills/

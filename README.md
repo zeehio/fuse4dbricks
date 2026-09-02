@@ -327,3 +327,35 @@ discussing them, so feel free to open an issue if any of them is a problem for y
   `--securable-allowlist`/`--securable-denylist` hide securables for everyone using the mount;
   they are not per-user and do not replace Unity Catalog permissions. A user still needs the
   relevant Unity Catalog privileges to read data that the filter allows.
+
+## Development
+
+### Agent skills
+
+This repo uses [Agent Skills](https://skills.sh/) (via the `npx skills` CLI) to extend
+Claude Code / other coding agents with reusable workflows. Installed skill content is not
+committed (see `.gitignore`); only `skills-lock.json` is tracked so every clone can restore
+the exact same skills.
+
+**Restore skills after cloning (or after a pull that touched `skills-lock.json`):**
+
+    npx skills experimental_install
+
+**Add a new skill:**
+
+    npx skills add <owner/repo>@<skill-name>
+
+Example:
+
+    npx skills add mattpocock/skills@tdd
+
+This installs the skill into `.agents/skills/` (symlinked into `.claude/skills/`) and
+updates `skills-lock.json` automatically. Commit the updated `skills-lock.json` so
+teammates get the same skill via `experimental_install`.
+
+**Other useful commands:**
+
+    npx skills list              # list installed skills
+    npx skills find <query>      # search for skills to add
+    npx skills update            # update installed skills to latest, updates the lock
+    npx skills remove <name>     # remove a skill, updates the lock
