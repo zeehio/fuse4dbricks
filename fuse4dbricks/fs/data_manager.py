@@ -142,9 +142,9 @@ class DataManager:
         # reads applies backpressure to the downloaders instead of piling up an
         # unbounded number of pending writes in memory.
         self._num_write_workers = num_workers
-        self._write_send, self._write_recv = trio.open_memory_channel[Tuple[_ChunkRequest, bytes]](
-            max_buffer_size=0
-        )
+        self._write_send, self._write_recv = trio.open_memory_channel[
+            Tuple[_CacheKey, _ChunkRequest, bytes]
+        ](max_buffer_size=0)
 
         # Per-path cache generation. Bumped on a local write so previously cached
         # chunks become unreachable without scanning. Absent path => generation 0.
@@ -179,54 +179,74 @@ class DataManager:
         cache_key = (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime, chunk_request.gen)
         chunk: bytes | None = None
         downloaded: bytes | None = None
+        queued_for_writing = False
         try:
-            if priority == "high":
-                # A real read needs the bytes now, so fetch them (from disk,
-                # falling back to network) and cache in RAM.
-                chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen)
-                if chunk is None:
-                    chunk = downloaded = await self._download_chunk(chunk_request)
-                await self._ram_cache.put(cache_key, chunk)
-            else:
-                # A prefetch only needs the chunk to end up on disk. Reading
-                # it back (as retrieve_chunk does) would cost as much disk
-                # I/O as the read it's trying to save, for a chunk that may
-                # not even be read; a plain existence check is enough to
-                # decide whether a download is needed.
-                if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
-                    chunk = downloaded = await self._download_chunk(chunk_request)
+            try:
+                if priority == "high":
+                    # A real read needs the bytes now, so fetch them (from disk,
+                    # falling back to network) and cache in RAM.
+                    chunk = await self.persistence.retrieve_chunk(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen)
+                    if chunk is None:
+                        chunk = downloaded = await self._download_chunk(chunk_request)
+                    await self._ram_cache.put(cache_key, chunk)
+                else:
+                    # A prefetch only needs the chunk to end up on disk. Reading
+                    # it back (as retrieve_chunk does) would cost as much disk
+                    # I/O as the read it's trying to save, for a chunk that may
+                    # not even be read; a plain existence check is enough to
+                    # decide whether a download is needed.
+                    if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
+                        chunk = downloaded = await self._download_chunk(chunk_request)
+            finally:
+                # Hand the bytes straight to whoever is waiting on this chunk.
+                # They must not depend on the disk write below having landed,
+                # nor on the chunk still being in the RAM cache (which may have
+                # no room for it at all with a small --ram-cache-mb).
+                await self._inflight_coalescer.publish(cache_key, chunk)
+            if downloaded is not None:
+                # Only now, with the reader already served, queue the disk
+                # write. The coalescer key stays reserved until that write
+                # finishes (the writer releases it): a request for this chunk
+                # arriving meanwhile is handed the bytes published above,
+                # instead of missing both caches -- the chunk is not on disk
+                # yet -- and leading a second download that would race this
+                # write for the same cache file.
+                queued_for_writing = await self._persist_chunk(cache_key, chunk_request, downloaded)
         finally:
-            # Hand the bytes straight to whoever is waiting on this chunk. They
-            # must not depend on the disk write below having landed, nor on the
-            # chunk still being in the RAM cache (which may have no room for it
-            # at all with a small --ram-cache-mb).
-            await self._inflight_coalescer.notify_done(cache_key, chunk)
-        if downloaded is not None:
-            # Only now, with the reader already served, queue the disk write.
-            await self._persist_chunk(chunk_request, downloaded)
+            if not queued_for_writing:
+                # Nothing is being written, so nothing else owns the key.
+                # Shielded: a leaked reservation would wedge this chunk for
+                # good, and releasing is in-memory bookkeeping that cannot
+                # block for long.
+                with trio.CancelScope(shield=True):
+                    await self._inflight_coalescer.release(cache_key)
 
-    async def _persist_chunk(self, chunk_request: _ChunkRequest, chunk: bytes) -> None:
-        """Hands a downloaded chunk to the disk-cache writers.
+    async def _persist_chunk(self, cache_key: _CacheKey, chunk_request: _ChunkRequest, chunk: bytes) -> bool:
+        """Hands a downloaded chunk, and its coalescer reservation, to the
+        disk-cache writers. Returns whether a writer took it on.
 
         Blocks while every writer is busy (that is the backpressure), but only
         the downloader waits here — the read this chunk belongs to has already
         been served.
         """
         try:
-            await self._write_send.send((chunk_request, chunk))
+            await self._write_send.send((cache_key, chunk_request, chunk))
+            return True
         except (trio.BrokenResourceError, trio.ClosedResourceError):
             # Shutting down: the chunk was still delivered to its reader, it
-            # just won't be in the disk cache next time.
+            # just won't be in the disk cache next time. The reservation stays
+            # the caller's to release.
             logger.debug(
                 "Disk cache writers stopped; not caching %s (chunk %s)",
                 chunk_request.fs_path, chunk_request.chunk_id,
             )
+            return False
 
     async def _disk_writer(self) -> None:
         """Persists downloaded chunks to the disk cache, off the read path."""
         while True:
             try:
-                chunk_request, chunk = await self._write_recv.receive()
+                cache_key, chunk_request, chunk = await self._write_recv.receive()
             except trio.EndOfChannel:
                 return
             try:
@@ -246,6 +266,12 @@ class DataManager:
                     "Failed to cache chunk on disk for %s (chunk %s, mtime %s)",
                     chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime,
                 )
+            finally:
+                # Written (or failed): a later request for this chunk is free
+                # to lead a fresh download again. Shielded for the same reason
+                # as in _process_request.
+                with trio.CancelScope(shield=True):
+                    await self._inflight_coalescer.release(cache_key)
 
     def run_services(self, nursery):
         """Starts download workers and disk-cache writers"""

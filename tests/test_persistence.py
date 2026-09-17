@@ -534,3 +534,42 @@ async def test_background_maintenance_non_blocking(persistence):
 
     assert persistence.current_size == 0
     assert path not in persistence.access_map
+
+
+@pytest.mark.trio
+async def test_concurrent_writes_of_the_same_chunk_do_not_corrupt_it(persistence):
+    """Two writes of the same chunk must not scribble over each other's partial
+    file. Each gets its own .tmp, so whichever rename lands last publishes an
+    intact chunk rather than a mix of the two.
+
+    DataManager does not produce this case — it holds the chunk's coalescer key
+    from the start of the download until its write finishes — but the cache
+    stores no checksum, so a corrupt chunk here would be served as if it were
+    good.
+    """
+    a = b"A" * 4096
+    b = b"B" * 4096
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(persistence.store_chunk, "f", 0, 1.0, a)
+        nursery.start_soon(persistence.store_chunk, "f", 0, 1.0, b)
+
+    retrieved = await persistence.retrieve_chunk("f", 0, 1.0)
+    assert retrieved in (a, b)
+    # One chunk file and no leftover .tmp.
+    assert _files_in(persistence.cache_dir) == [
+        os.path.basename(persistence._get_chunk_path("f", 0, 1.0))
+    ]
+
+
+@pytest.mark.trio
+async def test_rewriting_a_chunk_does_not_inflate_the_cache_size(persistence):
+    """Storing the same chunk twice must not count its bytes twice, or the
+    cache believes it is fuller than it is and evicts too eagerly."""
+    await persistence.store_chunk("f", 0, 1.0, b"X" * 100)
+    assert persistence.current_size == 100
+
+    await persistence.store_chunk("f", 0, 1.0, b"Y" * 40)
+
+    assert persistence.current_size == 40
+    assert await persistence.retrieve_chunk("f", 0, 1.0) == b"Y" * 40

@@ -227,3 +227,38 @@ async def test_coalescer_result_defaults_to_none():
     entry, _ = await coalescer.join_or_lead("k")
     await coalescer.notify_done("k")
     assert entry.result is None
+
+
+@pytest.mark.trio
+async def test_coalescer_publish_keeps_the_key_reserved():
+    """A leader whose result is usable before its work is finished publishes
+    first and releases later: followers joining in between are served the
+    result immediately instead of leading a redundant attempt."""
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
+    entry, is_leader = await coalescer.join_or_lead("k")
+    assert is_leader is True
+
+    await coalescer.publish("k", "the-value")
+
+    late_entry, late_leader = await coalescer.join_or_lead("k")
+    assert late_leader is False
+    assert late_entry is entry
+    await late_entry.wait()  # already set: does not block
+    assert late_entry.result == "the-value"
+
+    await coalescer.release("k")
+    _, next_leader = await coalescer.join_or_lead("k")
+    assert next_leader is True
+
+
+@pytest.mark.trio
+async def test_coalescer_release_without_publish_wakes_followers():
+    """A leader that dies without publishing must not leave followers waiting
+    forever; they wake with no result and can fall back."""
+    coalescer: InflightCoalescer[str, str] = InflightCoalescer()
+    entry, _ = await coalescer.join_or_lead("k")
+
+    await coalescer.release("k")
+
+    assert entry.is_set()
+    assert entry.result is None

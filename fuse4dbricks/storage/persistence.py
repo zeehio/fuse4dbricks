@@ -4,6 +4,7 @@ Implements atomic writes, single-level sharding, and lazy LRU eviction.
 """
 
 import hashlib
+import itertools
 import logging
 import os
 import shutil
@@ -37,6 +38,9 @@ class DiskPersistence:
         self.lock = trio.Lock()
         self.access_log: list[Tuple[float, str, int]] = []  # Heap: (now, cache_path, bytes_written)
         self.access_map: dict[str, float] = {}  # {cache_path: latest_use_timestamp}
+        # Makes each .tmp name unique within the process, so two writes of the
+        # same chunk can never scribble over each other's partial file.
+        self._temp_seq = itertools.count()
 
     def run_services(self, nursery):
         """Starts background maintenance and discovery."""
@@ -168,7 +172,7 @@ class DiskPersistence:
         it, it must clean up after itself when cancelled at shutdown.
         """
         cache_path = self._get_chunk_path(fs_path, chunk_index, mtime, gen)
-        temp_path = f"{cache_path}.{os.getpid()}.tmp"
+        temp_path = f"{cache_path}.{os.getpid()}.{next(self._temp_seq)}.tmp"
         bytes_written = len(data)
         try:
             # The shard dir is created lazily here (off-thread), only when we
@@ -179,6 +183,10 @@ class DiskPersistence:
             async with await trio.open_file(temp_path, "wb") as f:
                 await f.write(data)
 
+            # Size of the chunk we are about to replace, if any, so the
+            # bookkeeping below can discount it (0 when there is nothing there).
+            replaced_bytes = await trio.to_thread.run_sync(self._size_or_zero, cache_path)
+
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
 
@@ -187,7 +195,14 @@ class DiskPersistence:
 
             # 2. UPDATE METADATA (Acquire Lock)
             async with self.lock:
-                # If overwriting, logic could go here to subtract old size
+                if cache_path in self.access_map:
+                    # Overwriting a chunk we already account for. Without this,
+                    # current_size keeps the old chunk's bytes forever: the
+                    # stale heap entry is dropped without a refund when it is
+                    # popped (its path is no longer the one in access_map), so
+                    # the cache would believe it is fuller than it is and evict
+                    # too eagerly.
+                    self.current_size -= replaced_bytes
                 self.current_size += bytes_written
                 now = time.time()
                 self.access_map[cache_path] = now
@@ -200,6 +215,14 @@ class DiskPersistence:
             with trio.CancelScope(shield=True):
                 await trio.to_thread.run_sync(self._remove_quietly, temp_path)
             raise
+
+    @staticmethod
+    def _size_or_zero(path: str) -> int:
+        """Size of ``path``, or 0 if it is not there."""
+        try:
+            return os.stat(path).st_size
+        except OSError:
+            return 0
 
     @staticmethod
     def _remove_quietly(path: str) -> None:

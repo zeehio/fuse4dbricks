@@ -82,10 +82,17 @@ class InflightCoalescer(Generic[_InflightKey, _InflightResult]):
 
     Tracks in-flight work keyed by an arbitrary key.
     - join_or_lead(key) returns (entry, is_leader)
-    - notify_done(key, result) wakes followers and removes the key
+    - notify_done(key, result) wakes followers and frees the key
 
     ``result`` is optional: callers that publish their outcome elsewhere (a
     cache, a shared dict) can ignore it and leave it ``None``.
+
+    Waking followers and freeing the key can also be done separately, with
+    publish() and release(). A leader whose work is only *usable* at one point
+    but only *finished* later (it still has to commit the result somewhere)
+    publishes at the first and releases at the second: followers arriving in
+    between are served the published result immediately, rather than becoming
+    leaders themselves and redoing work that is already committing.
     """
 
     def __init__(self) -> None:
@@ -109,8 +116,29 @@ class InflightCoalescer(Generic[_InflightKey, _InflightResult]):
         The entry is dropped from the map here, so the result lives exactly as
         long as the waiters that still hold a reference to it.
         """
+        await self.publish(key, result)
+        await self.release(key)
+
+    async def publish(self, key: _InflightKey, result: _InflightResult | None = None) -> None:
+        """Publish ``result`` and wake up any followers waiting on key.
+
+        The key stays reserved, so no one else can become its leader until
+        release() is called. Followers joining after this point do not wait:
+        the entry is already set and carries the result.
+        """
+        async with self._lock:
+            entry = self._inflight.get(key)
+            if entry is not None:
+                entry.result = result
+                entry._set()
+
+    async def release(self, key: _InflightKey) -> None:
+        """Free the key so the next caller can lead a fresh attempt.
+
+        Also wakes followers if publish() was never called, so a leader that
+        dies without publishing cannot leave them waiting forever.
+        """
         async with self._lock:
             entry = self._inflight.pop(key, None)
             if entry is not None:
-                entry.result = result
                 entry._set()

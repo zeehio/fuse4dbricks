@@ -633,3 +633,99 @@ async def test_read_fails_with_eio_when_the_download_fails(manager, ctx):
 
     assert exc_info.value.errno == errno.EIO
     manager.persistence.store_chunk.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: no race between requests for a chunk whose disk write is still pending
+#
+# Returning the bytes early opens a window in which the chunk is in neither
+# cache but a write for it is in flight. The coalescer key stays reserved
+# across that window, so a request arriving in it is served the bytes that were
+# already downloaded instead of leading a second download -- which would both
+# waste the transfer and race the pending write for the same cache file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_request_during_the_write_window_does_not_redownload(ctx):
+    """A second read of the same chunk while its write is still pending must
+    not hit the network again, nor queue a second write of the same file."""
+    release_write = trio.Event()
+    writes = []
+
+    async def hanging_store_chunk(**kwargs):
+        writes.append(kwargs)
+        await release_write.wait()
+
+    dm = _make_manager(num_workers=2)
+    dm.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
+    # Nothing is on disk for the whole window: the chunk is still being written.
+    dm.persistence.retrieve_chunk = AsyncMock(return_value=None)
+
+    async with running(dm):
+        with trio.fail_after(5):
+            first = await dm.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+            while not writes:
+                await trio.sleep(0)
+            # The write is in flight; ask for the very same chunk again.
+            second = await dm.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+        release_write.set()
+
+    assert first == second == b"downloaded"
+    assert dm.uc_client.download_chunk_stream.call_count == 1
+    assert len(writes) == 1
+
+
+@pytest.mark.trio
+async def test_chunk_can_be_downloaded_again_once_its_write_finished(manager, ctx):
+    """The reservation is only held for the duration of the write: afterwards a
+    fresh request may lead a new download (here the chunk is gone from disk)."""
+    async with running(manager):
+        with trio.fail_after(5):
+            for _ in range(2):
+                assert await manager.read(
+                    "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                    file_size=FILE_SIZE, ctx=ctx,
+                ) == b"downloaded"
+                while not manager.persistence.store_chunk.await_count:
+                    await trio.sleep(0)
+
+    assert manager.uc_client.download_chunk_stream.call_count == 2
+
+
+@pytest.mark.trio
+async def test_failed_download_does_not_wedge_the_chunk(manager, ctx):
+    """A leader that fails must free the key, or every later read of that chunk
+    would join a dead reservation and fail forever."""
+    calls = 0
+
+    async def flaky_stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("Network Reset")
+        yield b"downloaded"
+
+    manager.uc_client.download_chunk_stream = MagicMock(side_effect=flaky_stream)
+
+    async with running(manager):
+        with trio.fail_after(5):
+            with pytest.raises(pyfuse3.FUSEError):
+                await manager.read(
+                    "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                    file_size=FILE_SIZE, ctx=ctx,
+                )
+            # The retry must be allowed to lead a fresh download.
+            result = await manager.read(
+                "/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                file_size=FILE_SIZE, ctx=ctx,
+            )
+
+    assert result == b"downloaded"
+    assert calls == 2
