@@ -137,14 +137,19 @@ class DataManager:
         # read costs max(network, disk) instead of network + disk. A read that
         # is never repeated — the dominant pattern for a one-pass TB-scale
         # download — then pays nothing for a cache entry it will not reuse.
-        # The channel has no buffer, so a chunk waiting to be written is always
-        # held by one of the `num_workers` writers: a burst of fast sequential
-        # reads applies backpressure to the downloaders instead of piling up an
-        # unbounded number of pending writes in memory.
+        # At most `num_workers` chunks queued plus `num_workers` being written,
+        # so a burst of fast sequential reads cannot pile up an unbounded number
+        # of pending writes in memory. Handing a chunk over never blocks: a
+        # download worker that waited for a writer would stop serving the
+        # priority queue, and a read someone is actually blocked on would end up
+        # queued behind some unrelated prefetch's disk write — the very latency
+        # this indirection exists to remove. When the writers cannot keep up the
+        # cache write is dropped instead (see _persist_chunk), which costs a
+        # future disk-cache miss and nothing else.
         self._num_write_workers = num_workers
         self._write_send, self._write_recv = trio.open_memory_channel[
             Tuple[_CacheKey, _ChunkRequest, bytes]
-        ](max_buffer_size=0)
+        ](max_buffer_size=num_workers)
 
         # Per-path cache generation. Bumped on a local write so previously cached
         # chunks become unreachable without scanning. Absent path => generation 0.
@@ -204,14 +209,14 @@ class DataManager:
                 # no room for it at all with a small --ram-cache-mb).
                 await self._inflight_coalescer.publish(cache_key, chunk)
             if downloaded is not None:
-                # Only now, with the reader already served, queue the disk
+                # Only now, with the reader already served, hand off the disk
                 # write. The coalescer key stays reserved until that write
                 # finishes (the writer releases it): a request for this chunk
                 # arriving meanwhile is handed the bytes published above,
                 # instead of missing both caches -- the chunk is not on disk
                 # yet -- and leading a second download that would race this
                 # write for the same cache file.
-                queued_for_writing = await self._persist_chunk(cache_key, chunk_request, downloaded)
+                queued_for_writing = self._persist_chunk(cache_key, chunk_request, downloaded)
         finally:
             if not queued_for_writing:
                 # Nothing is being written, so nothing else owns the key.
@@ -221,21 +226,27 @@ class DataManager:
                 with trio.CancelScope(shield=True):
                     await self._inflight_coalescer.release(cache_key)
 
-    async def _persist_chunk(self, cache_key: _CacheKey, chunk_request: _ChunkRequest, chunk: bytes) -> bool:
+    def _persist_chunk(self, cache_key: _CacheKey, chunk_request: _ChunkRequest, chunk: bytes) -> bool:
         """Hands a downloaded chunk, and its coalescer reservation, to the
-        disk-cache writers. Returns whether a writer took it on.
+        disk-cache writers. Returns whether one took it on.
 
-        Blocks while every writer is busy (that is the backpressure), but only
-        the downloader waits here — the read this chunk belongs to has already
-        been served.
+        Never blocks and never waits: the calling download worker has to get
+        back to the priority queue, where a read someone is blocked on may
+        already be waiting. When the queue is full (the disk cannot keep up) or
+        the writers are gone (shutdown), the chunk is simply not cached — the
+        reader has its bytes either way, and the chunk is re-fetched on a later
+        access exactly as any uncached chunk is.
         """
         try:
-            await self._write_send.send((cache_key, chunk_request, chunk))
+            self._write_send.send_nowait((cache_key, chunk_request, chunk))
             return True
+        except trio.WouldBlock:
+            logger.debug(
+                "Disk cache writers saturated; not caching %s (chunk %s)",
+                chunk_request.fs_path, chunk_request.chunk_id,
+            )
+            return False
         except (trio.BrokenResourceError, trio.ClosedResourceError):
-            # Shutting down: the chunk was still delivered to its reader, it
-            # just won't be in the disk cache next time. The reservation stays
-            # the caller's to release.
             logger.debug(
                 "Disk cache writers stopped; not caching %s (chunk %s)",
                 chunk_request.fs_path, chunk_request.chunk_id,

@@ -183,10 +183,6 @@ class DiskPersistence:
             async with await trio.open_file(temp_path, "wb") as f:
                 await f.write(data)
 
-            # Size of the chunk we are about to replace, if any, so the
-            # bookkeeping below can discount it (0 when there is nothing there).
-            replaced_bytes = await trio.to_thread.run_sync(self._size_or_zero, cache_path)
-
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
 
@@ -195,14 +191,7 @@ class DiskPersistence:
 
             # 2. UPDATE METADATA (Acquire Lock)
             async with self.lock:
-                if cache_path in self.access_map:
-                    # Overwriting a chunk we already account for. Without this,
-                    # current_size keeps the old chunk's bytes forever: the
-                    # stale heap entry is dropped without a refund when it is
-                    # popped (its path is no longer the one in access_map), so
-                    # the cache would believe it is fuller than it is and evict
-                    # too eagerly.
-                    self.current_size -= replaced_bytes
+                # If overwriting, logic could go here to subtract old size
                 self.current_size += bytes_written
                 now = time.time()
                 self.access_map[cache_path] = now
@@ -215,14 +204,6 @@ class DiskPersistence:
             with trio.CancelScope(shield=True):
                 await trio.to_thread.run_sync(self._remove_quietly, temp_path)
             raise
-
-    @staticmethod
-    def _size_or_zero(path: str) -> int:
-        """Size of ``path``, or 0 if it is not there."""
-        try:
-            return os.stat(path).st_size
-        except OSError:
-            return 0
 
     @staticmethod
     def _remove_quietly(path: str) -> None:

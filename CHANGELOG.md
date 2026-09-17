@@ -14,23 +14,21 @@
   blocked on, and read-ahead prefetch) behave this way. A cache write that fails
   is logged and dropped: the reader already has valid bytes from the network,
   and the chunk is simply re-fetched on a later access, as any uncached chunk
-  is. Pending writes are bounded by the number of download workers, so a fast
-  sequential read applies backpressure instead of piling up chunks in memory,
-  and a write cancelled at shutdown cleans up its partial `.tmp` file.
+  is. Pending writes are bounded (at most one queued and one in progress per
+  download worker), so a fast sequential read cannot pile up chunks in memory;
+  when the disk cannot keep up the cache write is dropped rather than waited
+  on, since making a download worker wait for a writer would leave a read
+  someone is blocked on queued behind some unrelated prefetch's disk write. A
+  write cancelled at shutdown cleans up its partial `.tmp` file.
   Returning the bytes early opens a window in which a chunk is in neither cache
   but a write for it is in flight, so a chunk's request-coalescing key is now
   held from the start of its download until that write finishes: a request
   arriving in the window is handed the bytes that were already downloaded,
   rather than missing both caches and starting a second download that would
   race the pending write for the same cache file.
-- Fix the disk cache over-reporting its size when a chunk is written over an
-  existing one. The new chunk's bytes were added without discounting the bytes
-  already accounted for the chunk it replaced, and the stale bookkeeping entry
-  is dropped without a refund, so `current_size` drifted up for good and the
-  cache evicted more eagerly than it needed to. Chunk `.tmp` files are also
-  named uniquely per write now, so two writes of the same chunk cannot scribble
-  over each other's partial file — the cache stores no checksum, so a chunk
-  corrupted that way would be served as if it were good.
+- Chunk `.tmp` files are named uniquely per write, so two writes of the same
+  chunk cannot scribble over each other's partial file — the cache stores no
+  checksum, so a chunk corrupted that way would be served as if it were good.
 
 # 0.7.6 (2026-08-07)
 

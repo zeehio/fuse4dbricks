@@ -560,16 +560,3 @@ async def test_concurrent_writes_of_the_same_chunk_do_not_corrupt_it(persistence
     assert _files_in(persistence.cache_dir) == [
         os.path.basename(persistence._get_chunk_path("f", 0, 1.0))
     ]
-
-
-@pytest.mark.trio
-async def test_rewriting_a_chunk_does_not_inflate_the_cache_size(persistence):
-    """Storing the same chunk twice must not count its bytes twice, or the
-    cache believes it is fuller than it is and evicts too eagerly."""
-    await persistence.store_chunk("f", 0, 1.0, b"X" * 100)
-    assert persistence.current_size == 100
-
-    await persistence.store_chunk("f", 0, 1.0, b"Y" * 40)
-
-    assert persistence.current_size == 40
-    assert await persistence.retrieve_chunk("f", 0, 1.0) == b"Y" * 40

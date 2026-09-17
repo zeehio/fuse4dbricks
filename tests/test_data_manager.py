@@ -581,8 +581,9 @@ async def test_invalidate_path_changes_the_chunk_cache_key(manager):
 @pytest.mark.trio
 async def test_shutdown_with_a_pending_disk_write_is_clean(ctx):
     """Story 5: shutting down while a chunk is still queued for the disk cache
-    must not raise. The bytes were already delivered to their reader; the chunk
-    is simply not in the disk cache next time."""
+    must not raise, and must not strand the writers. A clean close drains what
+    is already queued; anything still unwritten costs a future disk-cache miss
+    and nothing else, since the bytes reached their reader long ago."""
     release_write = trio.Event()
     writes_started = 0
 
@@ -592,7 +593,7 @@ async def test_shutdown_with_a_pending_disk_write_is_clean(ctx):
         await release_write.wait()
 
     # One download worker and one writer: the writer is busy on the read's own
-    # chunk, so the prefetched chunk is left waiting to be handed over.
+    # chunk, so the prefetched chunk is still queued behind it.
     dm = _make_manager(num_workers=1)
     dm.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
 
@@ -609,8 +610,9 @@ async def test_shutdown_with_a_pending_disk_write_is_clean(ctx):
             dm.close()
             release_write.set()
 
-    # Only the write the writer had already picked up ran.
-    assert dm.persistence.store_chunk.await_count == 1
+    # The in-progress write and the queued one both completed; the nursery
+    # exited on its own rather than being cancelled or deadlocked.
+    assert dm.persistence.store_chunk.await_count == 2
 
 
 @pytest.mark.trio
@@ -729,3 +731,44 @@ async def test_failed_download_does_not_wedge_the_chunk(manager, ctx):
 
     assert result == b"downloaded"
     assert calls == 2
+
+
+@pytest.mark.trio
+async def test_a_real_read_is_not_queued_behind_a_prefetch_disk_write(ctx):
+    """Handing a chunk to the writers must never block the download worker. If
+    it did, a worker parked waiting for a writer would stop serving the
+    priority queue, and a read someone is blocked on would wait for some
+    unrelated prefetch's disk write -- the latency this whole indirection
+    exists to remove."""
+    release_write = trio.Event()
+    writes_started = 0
+
+    async def hanging_store_chunk(**kwargs):
+        nonlocal writes_started
+        writes_started += 1
+        await release_write.wait()
+
+    # A single download worker and a single writer, so the writer saturates
+    # immediately and the worker must not be the one that waits for it.
+    dm = _make_manager(num_workers=1)
+    dm.persistence.store_chunk = AsyncMock(side_effect=hanging_store_chunk)
+    file_size = 2 * dm.chunk_size + FILE_SIZE  # 3 chunks
+
+    async with running(dm):
+        # Read chunk 0: its write occupies the writer, and the prefetch of
+        # chunk 1 then fills the queue behind it.
+        await dm.read("/c/s/v/f", offset=0, length=FILE_SIZE, mtime=100.0,
+                      file_size=file_size, ctx=ctx)
+        while not writes_started:
+            await trio.sleep(0)
+        await trio.testing.wait_all_tasks_blocked()
+
+        with trio.fail_after(5):
+            # A real read, of an unrelated chunk, with the disk fully backed up.
+            result = await dm.read(
+                "/c/s/v/f", offset=2 * dm.chunk_size, length=FILE_SIZE,
+                mtime=100.0, file_size=file_size, ctx=ctx,
+            )
+        release_write.set()
+
+    assert result == b"downloaded"
