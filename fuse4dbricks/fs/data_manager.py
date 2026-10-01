@@ -116,7 +116,7 @@ class DownloadScheduler:
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefecth_mb=80):
         """
         uc_client: client to download chunks from UC
         persistence: where to store downloaded chunks on disk
@@ -129,6 +129,9 @@ class DataManager:
         self._inflight_coalescer: InflightCoalescer[_CacheKey] = InflightCoalescer()
         "Inflight coalescer for downloads identified by (fs_path, chunk_id, mtime, gen)"
 
+        if num_workers < 1:
+            raise ValueError("num_workers must be >= 1")
+
         self._download_scheduler = DownloadScheduler(process_request=self._process_request, num_workers=num_workers)
 
         # Per-path cache generation. Bumped on a local write so previously cached
@@ -138,6 +141,11 @@ class DataManager:
         # max number of chunks to cache in memory
         max_ram_chunks = int(ram_cache_mb*1024*1024 / self.chunk_size)
         self._ram_cache: RamCache[_CacheKey] = RamCache(max_entries = max_ram_chunks)
+        prefetch_bytes = prefecth_mb * 1024 * 1024
+        chunks_to_prefetch = int(prefetch_bytes / self.chunk_size)
+        if chunks_to_prefetch < 0:
+            chunks_to_prefetch = 0
+        self._chunks_to_prefetch = chunks_to_prefetch
 
     def close(self) -> None:
         self._download_scheduler.close()
@@ -296,7 +304,7 @@ class DataManager:
                         self._read_chunk, fs_path, chunk_id, mtime, gen, chunk_size, ctx, chunks
                     )
         # fetch ahead next 10 chunks once we are beyond chunk 0 (avoid prefetching too much on `head *` command)
-        num_chunks_to_prefetch = 10 if end_chunk > 0 else 1
+        num_chunks_to_prefetch = self._chunks_to_prefetch if end_chunk > 0 else min(1, self._chunks_to_prefetch)
         chunks_to_prefetch = []
         for i in range(num_chunks_to_prefetch):
             chunk_to_prefetch = end_chunk + 1 + i
