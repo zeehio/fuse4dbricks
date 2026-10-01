@@ -1,3 +1,8 @@
+# 0.7.7 (2026-10-01)
+
+- Add --num-download-workers and --prefetch-mb to control prefetching
+  and parallel downloads.
+
 # 0.7.6 (2026-08-07)
 
 - Force push. Bump for traceability.
