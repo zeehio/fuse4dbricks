@@ -116,7 +116,7 @@ class DownloadScheduler:
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefecth_mb=80):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80):
         """
         uc_client: client to download chunks from UC
         persistence: where to store downloaded chunks on disk
@@ -141,7 +141,7 @@ class DataManager:
         # max number of chunks to cache in memory
         max_ram_chunks = int(ram_cache_mb*1024*1024 / self.chunk_size)
         self._ram_cache: RamCache[_CacheKey] = RamCache(max_entries = max_ram_chunks)
-        prefetch_bytes = prefecth_mb * 1024 * 1024
+        prefetch_bytes = prefetch_mb * 1024 * 1024
         chunks_to_prefetch = int(prefetch_bytes / self.chunk_size)
         if chunks_to_prefetch < 0:
             chunks_to_prefetch = 0
