@@ -1,3 +1,7 @@
+# 0.7.8 (2026-10-15)
+
+- Fix typo in DataManager
+
 # 0.7.7 (2026-10-01)
 
 - Add --num-download-workers and --prefetch-mb to control prefetching
