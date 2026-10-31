@@ -1,4 +1,4 @@
-# Unreleased
+# 0.7.9 (2026-10-31)
 
 - Fix prefetch re-queueing chunks that had already been downloaded. A
   finished prefetch was forgotten, so every following read requested it
