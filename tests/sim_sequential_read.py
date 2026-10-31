@@ -410,6 +410,9 @@ class FakePersistence:
         self.rec.disk_read_bytes += size
         return content_for(self.cfg, chunk_index * self.cfg.chunk_size, size)
 
+    def has_chunk(self, fs_path, chunk_index, mtime, gen=0):
+        return (fs_path, chunk_index, mtime, gen) in self.stored
+
     async def chunk_exists(self, fs_path, chunk_index, mtime, gen=0):
         await self._latency()
         return (fs_path, chunk_index, mtime, gen) in self.stored

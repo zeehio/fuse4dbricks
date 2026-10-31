@@ -33,6 +33,7 @@ def _make_manager() -> DataManager:
     persistence = MagicMock()
     persistence.retrieve_chunk = AsyncMock(return_value=None)
     persistence.store_chunk_from_stream = AsyncMock(return_value=b"")
+    persistence.has_chunk = MagicMock(return_value=False)
     dm = DataManager(uc_client=uc_client, persistence=persistence, ram_cache_mb=1, num_workers=1)
     return dm
 
@@ -398,3 +399,54 @@ async def test_invalidate_path_changes_the_chunk_cache_key(manager):
 
     await manager._get_chunk_from_cache_or_disk(fs, 0, mtime, manager._generation(fs))
     manager.persistence.retrieve_chunk.assert_awaited_with(fs, 0, mtime, 1)
+
+
+# ---------------------------------------------------------------------------
+# Tests: prefetch skips chunks already on disk (persistence.has_chunk)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.trio
+async def test_prefetch_skips_chunks_already_on_disk(manager, ctx):
+    on_disk = {2, 4}
+    manager.persistence.has_chunk = MagicMock(
+        side_effect=lambda fs_path, chunk_id, mtime, gen: chunk_id in on_disk
+    )
+    enqueued = []
+
+    async def fake_enqueue(chunk_request, high_priority):
+        enqueued.append(chunk_request.chunk_id)
+
+    with patch.object(manager._download_scheduler, "enqueue_request", side_effect=fake_enqueue):
+        await manager._request_fetch_ahead_chunks(
+            "/cat/sch/vol/f", [(i, 10) for i in range(1, 6)], 0.0, 0, ctx
+        )
+    assert enqueued == [1, 3, 5]
+    # Skipped chunks must not be left registered as in-flight.
+    assert not any(k[1] in on_disk for k in manager._inflight_coalescer._inflight)
+
+
+@pytest.mark.trio
+async def test_prefetch_of_downloaded_chunk_is_not_requeued_on_every_read(manager, ctx):
+    """Regression: a prefetched chunk that finished downloading left the
+    coalescer and was enqueued again by every subsequent read."""
+    stored = set()
+    manager.persistence.has_chunk = MagicMock(
+        side_effect=lambda fs_path, chunk_id, mtime, gen: chunk_id in stored
+    )
+    enqueued = []
+
+    async def fake_enqueue(chunk_request, high_priority):
+        enqueued.append(chunk_request.chunk_id)
+        # Simulate the download completing right away.
+        stored.add(chunk_request.chunk_id)
+        await manager._inflight_coalescer.notify_done(
+            (chunk_request.fs_path, chunk_request.chunk_id, chunk_request.mtime, chunk_request.gen)
+        )
+
+    with patch.object(manager._download_scheduler, "enqueue_request", side_effect=fake_enqueue):
+        for _ in range(64):  # 64 kernel reads of the same chunk
+            await manager._request_fetch_ahead_chunks(
+                "/cat/sch/vol/f", [(i, 10) for i in range(1, 11)], 0.0, 0, ctx
+            )
+    assert sorted(enqueued) == list(range(1, 11))

@@ -212,6 +212,14 @@ class DataManager:
 
     async def _request_fetch_ahead_chunks(self, fs_path: str, chunks_to_prefetch: list[Tuple[int, int]], mtime: float, gen: int, ctx: pyfuse3.RequestContext):
         for (chunk_id, chunk_size) in chunks_to_prefetch:
+            # Already on disk: nothing to prefetch. Without this check, a chunk
+            # that finished downloading (and so left the coalescer) was
+            # re-enqueued on every read until the reader reached it: 64 reads
+            # per 8 MiB chunk x up to N prefetch chunks, each costing a worker
+            # wake-up and a chunk_exists() thread hop. has_chunk() is a
+            # synchronous in-RAM lookup.
+            if self.persistence.has_chunk(fs_path, chunk_id, mtime, gen):
+                continue
             cache_key = (fs_path, chunk_id, mtime, gen)
             (wait_event, leader) = await self._inflight_coalescer.join_or_lead(cache_key)
             if not leader:
