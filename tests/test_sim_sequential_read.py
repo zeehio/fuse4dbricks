@@ -20,7 +20,7 @@ def _link_rate(n_flows: int) -> float:
     """Aggregate MiB/s achieved by n parallel 10 MiB flows on a 20/200 MiB/s link."""
 
     async def main():
-        link = sim.FluidLink("net", 200 * sim.MiB, 20 * sim.MiB, 0.001)
+        link = sim.FluidLink("net", 200 * sim.MiB, 20 * sim.MiB)
         async with trio.open_nursery() as n:
             n.start_soon(link.run)
             t0 = trio.current_time()
