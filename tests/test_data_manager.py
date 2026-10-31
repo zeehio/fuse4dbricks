@@ -295,7 +295,9 @@ async def test_read_prefetch_stops_at_eof(manager, ctx):
 # Prefetch ("regular" priority) only needs the chunk to end up on disk --
 # reading it back would cost as much disk I/O as the read it's trying to
 # save, for a chunk that may never be read, so it uses a cheap existence
-# check and never populates the RAM cache.
+# check. With prefetch_to_ram (default) a chunk it actually downloads is also
+# kept in RAM, since the bytes are already in memory; a chunk that was already
+# on disk is never loaded.
 # ---------------------------------------------------------------------------
 
 
@@ -337,6 +339,7 @@ async def test_process_request_high_priority_miss_downloads_and_caches_in_ram(ma
 
 @pytest.mark.trio
 async def test_process_request_prefetch_skips_download_when_already_on_disk(manager):
+    manager._ram_cache = RamCache(max_entries=8)  # so a stray put would be visible
     manager.persistence.chunk_exists = AsyncMock(return_value=True)
     request = _chunk_request(manager, chunk_id=5)
 
@@ -353,7 +356,8 @@ async def test_process_request_prefetch_skips_download_when_already_on_disk(mana
 
 
 @pytest.mark.trio
-async def test_process_request_prefetch_downloads_when_missing_but_not_cached_in_ram(manager):
+async def test_process_request_prefetch_downloads_when_missing_and_caches_in_ram(manager):
+    manager._ram_cache = RamCache(max_entries=8)  # fixture's cache has 0 entries
     manager.persistence.chunk_exists = AsyncMock(return_value=False)
     manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
     request = _chunk_request(manager, chunk_id=5)
@@ -362,8 +366,30 @@ async def test_process_request_prefetch_downloads_when_missing_but_not_cached_in
 
     manager.persistence.retrieve_chunk.assert_not_awaited()
     manager.persistence.store_chunk_from_stream.assert_awaited_once()
-    # Prefetched content is deliberately not promoted into the RAM cache.
+    # prefetch_to_ram (default): the downloaded bytes are kept in RAM, so the
+    # read that reaches this chunk does not read it back from disk.
+    assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) == b"downloaded"
+
+
+@pytest.mark.trio
+async def test_process_request_prefetch_not_cached_in_ram_when_disabled(manager):
+    manager._prefetch_to_ram = False
+    manager._ram_cache = RamCache(max_entries=8)  # so a put would be visible
+    manager.persistence.chunk_exists = AsyncMock(return_value=False)
+    manager.persistence.store_chunk_from_stream = AsyncMock(return_value=b"downloaded")
+    request = _chunk_request(manager, chunk_id=5)
+
+    await manager._process_request(request, priority="regular")
+
+    manager.persistence.store_chunk_from_stream.assert_awaited_once()
     assert await manager._ram_cache.get(("/c/s/v/f", 5, 100.0, 0)) is None
+
+
+@pytest.mark.trio
+async def test_prefetch_to_ram_flag_reaches_data_manager():
+    from fuse4dbricks.fs.data_manager import DataManager as DM
+    assert DM(uc_client=MagicMock(), persistence=MagicMock())._prefetch_to_ram is True
+    assert DM(uc_client=MagicMock(), persistence=MagicMock(), prefetch_to_ram=False)._prefetch_to_ram is False
 
 
 # ---------------------------------------------------------------------------

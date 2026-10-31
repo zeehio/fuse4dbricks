@@ -90,6 +90,7 @@ class SimConfig:
     prefetch_mb: int = 80
     ram_cache_mb: int = 512
     chunk_mib: float = 8
+    prefetch_to_ram: bool = True
     # Kernel / cp model
     request_kib: int = 128
     kernel_concurrency: int = 1
@@ -437,7 +438,8 @@ class FakePersistence:
 
 
 def build_data_manager(cfg: SimConfig, uc: FakeUCClient, pers: FakePersistence, rec: Recorder) -> DataManager:
-    dm = DataManager(uc, pers, ram_cache_mb=cfg.ram_cache_mb, num_workers=cfg.num_workers, prefetch_mb=cfg.prefetch_mb)
+    dm = DataManager(uc, pers, ram_cache_mb=cfg.ram_cache_mb, num_workers=cfg.num_workers, prefetch_mb=cfg.prefetch_mb,
+                     prefetch_to_ram=cfg.prefetch_to_ram)
     if cfg.chunk_size != dm.chunk_size:
         # chunk_size is hard-coded to 8 MiB; override and recompute what __init__ derived from it.
         dm.chunk_size = cfg.chunk_size

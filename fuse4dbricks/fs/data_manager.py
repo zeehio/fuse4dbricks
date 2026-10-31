@@ -116,12 +116,15 @@ class DownloadScheduler:
 
 
 class DataManager:
-    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80):
+    def __init__(self, uc_client: UnityCatalogClient, persistence: DiskPersistence, ram_cache_mb = 512, num_workers=10, prefetch_mb=80, prefetch_to_ram: bool = True):
         """
         uc_client: client to download chunks from UC
         persistence: where to store downloaded chunks on disk
         ram_cache_mb: how much RAM to use for caching chunks in memory (LRU eviction)
         num_workers: how many concurrent downloads to allow
+        prefetch_to_ram: also keep freshly prefetched chunks in the RAM cache,
+            so the read that reaches them does not have to read them back from
+            disk (and concurrent reads of the same chunk do not each do so)
         """
         self.uc_client = uc_client
         self.persistence = persistence
@@ -146,6 +149,7 @@ class DataManager:
         if chunks_to_prefetch < 0:
             chunks_to_prefetch = 0
         self._chunks_to_prefetch = chunks_to_prefetch
+        self._prefetch_to_ram = prefetch_to_ram
 
     def close(self) -> None:
         self._download_scheduler.close()
@@ -181,7 +185,14 @@ class DataManager:
                 # not even be read; a plain existence check is enough to
                 # decide whether a download is needed.
                 if not await self.persistence.chunk_exists(fs_path=chunk_request.fs_path, chunk_index=chunk_request.chunk_id, mtime=chunk_request.mtime, gen=chunk_request.gen):
-                    await self._fetch_chunk(chunk_request)
+                    chunk = await self._fetch_chunk(chunk_request)
+                    # The bytes are already in memory (store_chunk_from_stream
+                    # returns them), so keeping them costs no extra I/O or copy
+                    # and saves the reader an 8 MiB read-back from disk. Chunks
+                    # that were already on disk are NOT loaded: that read-back
+                    # is exactly what the existence check avoids.
+                    if self._prefetch_to_ram:
+                        await self._ram_cache.put(cache_key, chunk)
         finally:
             await self._inflight_coalescer.notify_done(cache_key)
 
