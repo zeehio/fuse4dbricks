@@ -498,11 +498,18 @@ def analytic_estimate(cfg: SimConfig) -> dict[str, float]:
     t_chunk = cfg.ttfb_ms / 1000 + chunk / per
     net = parallel * chunk / t_chunk
     est = min(net, cfg.global_mib_s * MiB)
+    # Every byte is written to the disk cache once. It is also read back once,
+    # unless prefetch keeps chunks in RAM and the RAM cache can hold the whole
+    # prefetch window (plus the chunk being read) until the reader gets there.
+    ram_entries = int(cfg.ram_cache_mb * MiB / chunk)
+    read_back = not (cfg.prefetch_to_ram and ram_entries >= prefetch_chunks + 1)
+    disk_passes = 2 if read_back else 1
     if cfg.disk_mib_s > 0:
-        est = min(est, cfg.disk_mib_s * MiB / 2)  # every byte is written once and read once
+        est = min(est, cfg.disk_mib_s * MiB / disk_passes)
     if cfg.dest_mib_s > 0:
         est = min(est, cfg.dest_mib_s * MiB)
-    return {"parallel_downloads": parallel, "chunk_time_s": t_chunk, "throughput_mib_s": est / MiB}
+    return {"parallel_downloads": parallel, "chunk_time_s": t_chunk, "disk_passes": disk_passes,
+            "throughput_mib_s": est / MiB}
 
 
 async def _simulate(cfg: SimConfig) -> dict[str, Any]:

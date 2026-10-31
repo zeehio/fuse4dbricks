@@ -55,3 +55,20 @@ def test_small_simulation_is_consistent():
     # Can never beat the link, and the first read pays at least TTFB + one chunk.
     assert s["throughput_mib_s"] <= cfg.global_mib_s * 1.001
     assert s["first_read_latency_s"] >= cfg.ttfb_ms / 1000 + cfg.chunk_mib / cfg.per_stream_mib_s - 0.01
+
+
+@pytest.mark.parametrize(
+    "kw, passes, expected",
+    [
+        # prefetch-to-RAM: the disk cache is only written, so a 100 MiB/s disk caps at 100.
+        (dict(disk_mib_s=100), 1, 100.0),
+        # disk-only prefetch: every byte is written and read back -> half the disk speed.
+        (dict(disk_mib_s=100, prefetch_to_ram=False), 2, 50.0),
+        # RAM cache too small for the prefetch window: chunks are evicted and read back.
+        (dict(disk_mib_s=100, ram_cache_mb=40), 2, 50.0),
+    ],
+)
+def test_analytic_estimate_disk_passes(kw, passes, expected):
+    est = sim.analytic_estimate(sim.SimConfig(**kw))
+    assert est["disk_passes"] == passes
+    assert est["throughput_mib_s"] == pytest.approx(expected)
