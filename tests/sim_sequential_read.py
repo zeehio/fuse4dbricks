@@ -20,7 +20,7 @@ What is real and what is simulated
 
 Bandwidth model
 ---------------
-Network and disk are "fluid" links advanced in small time steps. Every
+Network and disk are event-driven "fluid" links (exact, no time steps). Every
 active flow gets a fair share ``min(per_flow_cap, total_cap / n_active)``
 (water-filling: capacity a flow cannot use is redistributed). A network
 flow only consumes bandwidth while it has room in its socket buffer, so a
@@ -32,7 +32,11 @@ Time
 By default the run uses trio's MockClock with autojump: simulated seconds
 pass instantly and results are deterministic, but Python CPU cost counts as
 zero. ``--real-clock`` runs in wall time, which also exposes event-loop CPU
-overhead (a 3 GiB run then takes at least ~16 s).
+overhead (a 3 GiB run then takes at least ~16 s). Use it with ``--no-verify``:
+the fakes then return cached zero buffers so the simulator's own CPU stays
+small, although it still shares the trio loop with DataManager. Not modelled:
+pyfuse3 request dispatch, httpx parsing and the thread hops of the real
+DiskPersistence, so real-clock results are an optimistic bound.
 
 Usage
 -----
@@ -100,7 +104,6 @@ class SimConfig:
     disk_mib_s: float = 500.0  # shared by reads and writes; 0 = infinite
     disk_op_latency_ms: float = 0.0
     # Simulation
-    tick_ms: float = 1.0
     sample_ms: float = 100.0
     real_clock: bool = False
     seed: int = 42
@@ -133,6 +136,20 @@ def make_content(offset: int, length: int) -> bytes:
     return bytes(buf)
 
 
+_ZEROS: dict[int, bytes] = {}
+
+
+def content_for(cfg: "SimConfig", offset: int, length: int) -> bytes:
+    """Real pattern when verifying; otherwise cached zeros, so that in
+    --real-clock runs the simulator itself burns as little CPU as possible."""
+    if cfg.verify:
+        return make_content(offset, length)
+    z = _ZEROS.get(length)
+    if z is None:
+        z = _ZEROS[length] = bytes(length)
+    return z
+
+
 def verify_content(offset: int, data: bytes) -> bool:
     first_page = -(-offset // PAGE) * PAGE  # first page start >= offset
     for page in range(first_page, offset + len(data) - 7, PAGE):
@@ -147,109 +164,156 @@ def verify_content(offset: int, data: bytes) -> bool:
 # ---------------------------------------------------------------------------
 
 
-class Flow:
-    __slots__ = ("remaining", "buffered", "buffer_cap", "event", "delivered")
+_EPS = 0.5  # bytes; below this a flow counts as finished / a wait as satisfied
 
-    def __init__(self, size: int, buffer_cap: float):
-        self.remaining = size  # bytes not yet transferred over the link
+
+class Flow:
+    __slots__ = ("remaining", "buffered", "buffer_cap", "rate", "last", "want", "scope")
+
+    def __init__(self, size: int, buffer_cap: float, now: float):
+        self.remaining = float(size)  # bytes not yet transferred over the link
         self.buffered = 0.0  # transferred, not yet consumed
         self.buffer_cap = buffer_cap
-        self.delivered = 0.0
-        self.event = trio.Event()
+        self.rate = 0.0  # bytes/s currently allocated
+        self.last = now  # time up to which this flow has been settled
+        self.want = 0.0  # buffered level the waiter needs
+        self.scope: trio.CancelScope | None = None  # set while a consumer waits
+
+    def headroom(self) -> float:
+        return self.buffer_cap - self.buffered
 
 
 class FluidLink:
-    """Time-stepped processor-sharing link with per-flow and total caps."""
+    """Processor-sharing link with per-flow and total caps, exact and cheap.
 
-    def __init__(self, name: str, total_bps: float, per_flow_bps: float, tick: float):
+    Rates are piecewise constant: they are only recomputed when a flow opens
+    or closes, or a socket buffer fills/drains. Between those events every
+    flow advances analytically, and a waiting consumer simply sleeps until the
+    computed arrival time of the bytes it needs (a CancelScope deadline that
+    is moved if the rates change). No time steps, and in --real-clock runs the
+    model costs about one wake-up per 64 KiB piece, like a real socket read.
+    """
+
+    def __init__(self, name: str, total_bps: float, per_flow_bps: float):
         self.name = name
         self.total_bps = total_bps if total_bps > 0 else math.inf
         self.per_flow_bps = per_flow_bps if per_flow_bps > 0 else math.inf
-        self.tick = tick
         self.flows: set[Flow] = set()
-        self._wake = trio.Event()
+        self._n_active = 0
+        self._timer: trio.CancelScope | None = None  # buffer-full events
+        self._next_full = math.inf
+        self._stats_last: float | None = None
         # stats
-        self.bytes_moved = 0.0
+        self.bytes_moved = 0.0  # updated when flows are settled
         self.busy_time = 0.0  # time with >= 1 flow transferring
         self.flow_time = 0.0  # integral of number of transferring flows
 
+    @property
+    def unlimited(self) -> bool:
+        return self.total_bps == math.inf and self.per_flow_bps == math.inf
+
+    def transferring(self) -> int:
+        return self._n_active
+
+    def sync(self) -> None:
+        """Bring byte/time counters up to date (they are updated lazily)."""
+        self._reallocate()
+
+    # -- model ---------------------------------------------------------------
+
+    def _settle(self, f: Flow, now: float) -> None:
+        dt = now - f.last
+        f.last = now
+        if dt <= 0 or f.rate <= 0:
+            return
+        give = min(f.rate * dt, f.remaining, f.headroom())
+        if f.remaining - give < _EPS:
+            give = f.remaining
+        f.remaining -= give
+        f.buffered += give
+        self.bytes_moved += give
+
+    def _deadline(self, f: Flow, now: float) -> float:
+        need = min(f.want - f.buffered, f.remaining)
+        if need <= _EPS:
+            return now
+        if f.rate <= 0:
+            return math.inf
+        return now + need / f.rate
+
+    def _reallocate(self) -> None:
+        now = trio.current_time()
+        if self._stats_last is not None and self._n_active:
+            dt = now - self._stats_last
+            self.busy_time += dt
+            self.flow_time += self._n_active * dt
+        self._stats_last = now
+        for f in self.flows:
+            self._settle(f, now)
+        eligible = [f for f in self.flows if f.remaining > 0 and f.headroom() > _EPS]
+        self._n_active = len(eligible)
+        rate = min(self.per_flow_bps, self.total_bps / len(eligible)) if eligible else 0.0
+        next_full = math.inf
+        for f in self.flows:
+            f.rate = rate if f in eligible else 0.0
+            if f.rate > 0 and f.buffer_cap != math.inf and f.headroom() < f.remaining:
+                next_full = min(next_full, now + f.headroom() / f.rate)
+            if f.scope is not None:
+                f.scope.deadline = self._deadline(f, now)
+        self._next_full = next_full
+        if self._timer is not None:
+            self._timer.deadline = next_full
+
+    async def run(self) -> None:
+        """Only needed to react to a socket buffer filling up."""
+        while True:
+            with trio.CancelScope(deadline=self._next_full) as scope:
+                self._timer = scope
+                await trio.sleep_forever()
+            self._timer = None
+            self._reallocate()
+
+    async def _wait(self, f: Flow, want: float) -> None:
+        now = trio.current_time()
+        self._settle(f, now)
+        while f.buffered < want - _EPS and f.remaining > 0:
+            f.want = want
+            with trio.CancelScope(deadline=self._deadline(f, now)) as scope:
+                f.scope = scope
+                await trio.sleep_forever()
+            f.scope = None
+            now = trio.current_time()
+            self._settle(f, now)
+
+    # -- API -----------------------------------------------------------------
+
     def open(self, size: int, buffer_cap: float = math.inf) -> Flow:
-        f = Flow(size, buffer_cap)
+        f = Flow(size, buffer_cap, trio.current_time())
         self.flows.add(f)
-        self._wake.set()
+        self._reallocate()
         return f
 
     def close(self, f: Flow) -> None:
         self.flows.discard(f)
-
-    def transferring(self) -> int:
-        return sum(1 for f in self.flows if f.remaining > 0 and f.buffered < f.buffer_cap)
-
-    async def run(self) -> None:
-        last = trio.current_time()
-        while True:
-            if not self.flows:
-                self._wake = trio.Event()
-                await self._wake.wait()
-                last = trio.current_time()
-                continue
-            await trio.sleep(self.tick)
-            now = trio.current_time()
-            self._advance(now - last)
-            last = now
-
-    def _advance(self, dt: float) -> None:
-        if dt <= 0:
-            return
-        demands = []
-        for f in self.flows:
-            if f.remaining <= 0:
-                continue
-            headroom = f.buffer_cap - f.buffered
-            if headroom <= 0:
-                continue
-            demands.append((min(self.per_flow_bps * dt, f.remaining, headroom), f))
-        if not demands:
-            return
-        self.busy_time += dt
-        self.flow_time += len(demands) * dt
-        demands.sort(key=lambda x: x[0])
-        cap_left = self.total_bps * dt
-        n_left = len(demands)
-        for demand, f in demands:
-            give = min(demand, cap_left / n_left)
-            # Avoid float dust: finish a flow if it's within a byte.
-            if f.remaining - give < 1:
-                give = f.remaining
-            f.remaining -= give
-            f.buffered += give
-            f.delivered += give
-            self.bytes_moved += give
-            cap_left -= give
-            n_left -= 1
-            f.event.set()
+        self._reallocate()
 
     async def take(self, f: Flow, n: int) -> int:
         """Consume up to n bytes from a flow's buffer, waiting for them."""
-        while f.buffered < n and f.remaining > 0:
-            f.event = trio.Event()
-            await f.event.wait()
-        k = int(min(n, f.buffered))
-        if f.remaining <= 0 and f.buffered - k < 1:
-            k = int(round(f.buffered))
-        f.buffered -= k
-        self._wake.set()
+        await self._wait(f, n)
+        was_full = f.rate <= 0 and f.remaining > 0
+        k = int(min(n, f.buffered + _EPS))
+        f.buffered = max(0.0, f.buffered - k)
+        if was_full:  # buffer drained: the flow competes for bandwidth again
+            self._reallocate()
         return k
 
     async def transfer(self, n: int) -> None:
         """Move n bytes (no buffering semantics), e.g. a disk read/write."""
-        if n <= 0 or self.total_bps == math.inf and self.per_flow_bps == math.inf:
+        if n <= 0 or self.unlimited:
             return
         f = self.open(n)
         try:
-            while f.remaining > 0:
-                f.event = trio.Event()
-                await f.event.wait()
+            await self._wait(f, float(n))
         finally:
             self.close(f)
 
@@ -315,7 +379,7 @@ class FakeUCClient:
                 if k <= 0:
                     break
                 self.rec.downloaded_bytes += k
-                yield make_content(offset + pos, k)
+                yield content_for(self.cfg, offset + pos, k)
                 pos += k
         finally:
             self.net.close(flow)
@@ -344,7 +408,7 @@ class FakePersistence:
             return None
         await self.disk.transfer(size)
         self.rec.disk_read_bytes += size
-        return make_content(chunk_index * self.cfg.chunk_size, size)
+        return content_for(self.cfg, chunk_index * self.cfg.chunk_size, size)
 
     async def chunk_exists(self, fs_path, chunk_index, mtime, gen=0):
         await self._latency()
@@ -440,9 +504,8 @@ async def _simulate(cfg: SimConfig) -> dict[str, Any]:
     rng = random.Random(cfg.seed)
     t0 = trio.current_time()
     rec = Recorder(t0)
-    tick = cfg.tick_ms / 1000
-    net = FluidLink("net", cfg.global_mib_s * MiB, cfg.per_stream_mib_s * MiB, tick)
-    disk = FluidLink("disk", cfg.disk_mib_s * MiB, 0, tick)
+    net = FluidLink("net", cfg.global_mib_s * MiB, cfg.per_stream_mib_s * MiB)
+    disk = FluidLink("disk", cfg.disk_mib_s * MiB, 0)
     uc = FakeUCClient(cfg, net, rec, rng)
     pers = FakePersistence(cfg, disk, rec)
     dm = build_data_manager(cfg, uc, pers, rec)
@@ -484,6 +547,8 @@ async def _simulate(cfg: SimConfig) -> dict[str, Any]:
         last_t, last_net, last_disk, last_read = 0.0, 0.0, 0.0, 0
         while True:
             await trio.sleep(cfg.sample_ms / 1000)
+            net.sync()
+            disk.sync()
             t = trio.current_time() - t0
             dt = t - last_t
             cur = progress["max_chunk"]
@@ -513,6 +578,8 @@ async def _simulate(cfg: SimConfig) -> dict[str, Any]:
             for _ in range(cfg.kernel_concurrency):
                 readers.start_soon(kernel_slot)
         total = trio.current_time() - t0
+        net.sync()
+        disk.sync()
         # Let pending prefetches drain so byte counters are final, then stop.
         with trio.move_on_after(5):
             while rec.workers_busy or len(sched._requests_priority) or len(sched._requests_regular):
