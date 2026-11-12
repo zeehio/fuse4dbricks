@@ -6,9 +6,10 @@ Handles pagination, robust authentication, and asynchronous streaming for FUSE.
 import logging
 import os
 import random
+import time
 import urllib.parse
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from enum import Enum
 from typing import AsyncGenerator
@@ -59,6 +60,30 @@ _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _DEFAULT_MAX_RETRIES = 4
 _BACKOFF_BASE_S = 0.5
 _BACKOFF_CAP_S = 20.0
+
+# Presigned (direct-to-storage) downloads, enabled with --use-presigned-downloads.
+# Shorter than the Databricks SDK's 1 h default: a cached URL keeps working after
+# the user's access is revoked, and a refresh costs one API call per file.
+_PRESIGNED_URL_LIFETIME_S = 15 * 60
+_PRESIGNED_URL_REFRESH_MARGIN_S = 60
+# After a presigned download fails for (uid, path), go straight to the Files API
+# for this long instead of paying a failed attempt on every chunk.
+_PRESIGNED_FAILURE_TTL_S = 60.0
+_PRESIGNED_CACHE_MAX_ENTRIES = 4096
+_PRESIGNED_DOWNLOAD_CONCURRENCY = 50
+
+
+@dataclass(frozen=True)
+class PresignedDownloadUrl:
+    """A presigned cloud-storage URL from create-download-url.
+
+    ``url`` (and possibly ``headers``) carry a credential: never log them.
+    """
+
+    url: str = field(repr=False)
+    headers: dict[str, str] = field(repr=False)
+    expires_at: float
+    "time.monotonic() deadline after which the URL is refreshed"
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -139,8 +164,19 @@ class UnityCatalogClient:
             follow_redirects=True,
         )
 
+        # Presigned downloads (only used with --use-presigned-downloads).
+        self._download_urls: dict[tuple[int, str], PresignedDownloadUrl] = {}
+        "(uid, uc_path) -> cached presigned URL"
+        self._download_url_inflight: dict[tuple[int, str], trio.Event] = {}
+        self._presigned_failures: dict[tuple[int, str], float] = {}
+        "(uid, uc_path) -> monotonic time until which the Files API is used directly"
+        self._storage_client: httpx.Client | None = None
+        self._storage_limiter = trio.CapacityLimiter(_PRESIGNED_DOWNLOAD_CONCURRENCY)
+
     async def close(self):
         await self.client.aclose()
+        if self._storage_client is not None:
+            self._storage_client.close()
 
     async def _with_retry(self, operation, *, uc_path: str | None = None, max_retries: int = _DEFAULT_MAX_RETRIES):
         """
@@ -207,7 +243,23 @@ class UnityCatalogClient:
             raise UcConflict(msg, status_code=409, uc_path=uc_path, url=url, request_id=request_id)
 
         if resp.status_code == 400:
-            raise UcBadRequest(msg, status_code=400, uc_path=uc_path, url=url, request_id=request_id)
+            raise UcBadRequest(
+                msg,
+                status_code=400,
+                uc_path=uc_path,
+                url=url,
+                request_id=request_id,
+            )
+							
+											   
+
+							   
+					
+								
+								
+						
+									  
+			 
 
         if resp.status_code == 412:
             # Precondition failed: the file changed under an If-Unmodified-Since
@@ -706,6 +758,310 @@ class UnityCatalogClient:
         await self._request(
             "PUT", f"/api/2.0/fs/directories{encoded_path}", ctx=ctx, uc_path=uc_path
         )
+
+    # --- Presigned (direct-to-storage) downloads ---
+
+    async def get_download_url(
+        self, path: str, *, ctx: pyfuse3.RequestContext
+    ) -> PresignedDownloadUrl:
+        """Create a presigned URL to read ``path`` directly from cloud storage.
+
+        POST /api/2.0/fs/create-download-url with ``path`` and ``expire_time`` as
+        query parameters, as the Databricks SDK does. Not cached: see
+        ``_get_cached_download_url``.
+        """
+        requested_at = time.monotonic()
+        expire_time = datetime.now(timezone.utc) + timedelta(seconds=_PRESIGNED_URL_LIFETIME_S)
+        data = await self._request(
+            "POST",
+            "/api/2.0/fs/create-download-url",
+            ctx=ctx,
+            params={"path": path, "expire_time": expire_time.strftime("%Y-%m-%dT%H:%M:%SZ")},
+            uc_path=path,
+            raise_on_not_found=True,
+        )
+        url = data.get("url") if isinstance(data, dict) else None
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise UcError("create-download-url returned no usable URL", uc_path=path)
+        headers: dict[str, str] = {}
+        for header in data.get("headers") or []:
+            if isinstance(header, dict):
+                name, value = header.get("name"), header.get("value")
+                if isinstance(name, str) and isinstance(value, str):
+                    headers[name] = value
+        return PresignedDownloadUrl(
+            url=url,
+            headers=headers,
+            expires_at=requested_at + _PRESIGNED_URL_LIFETIME_S - _PRESIGNED_URL_REFRESH_MARGIN_S,
+        )
+
+    async def _get_cached_download_url(
+        self, path: str, *, ctx: pyfuse3.RequestContext
+    ) -> PresignedDownloadUrl:
+        """Presigned URL for (ctx.uid, path), created once and shared by
+        concurrent chunk downloads until it is about to expire."""
+        key = (ctx.uid, path)
+        while True:
+            cached = self._download_urls.get(key)
+            if cached is not None and time.monotonic() < cached.expires_at:
+                return cached
+            pending = self._download_url_inflight.get(key)
+            if pending is None:
+                break
+            await pending.wait()
+
+        done = trio.Event()
+        self._download_url_inflight[key] = done
+        try:
+            presigned = await self.get_download_url(path, ctx=ctx)
+            if len(self._download_urls) >= _PRESIGNED_CACHE_MAX_ENTRIES:
+                now = time.monotonic()
+                for stale in [k for k, v in self._download_urls.items() if v.expires_at <= now]:
+                    del self._download_urls[stale]
+                if len(self._download_urls) >= _PRESIGNED_CACHE_MAX_ENTRIES:
+                    self._download_urls.clear()
+            self._download_urls[key] = presigned
+            return presigned
+        finally:
+            del self._download_url_inflight[key]
+            done.set()
+
+    def _invalidate_download_url(self, key: tuple[int, str], presigned: PresignedDownloadUrl) -> None:
+        # Only drop the URL that failed: a concurrent download may already have
+        # replaced it with a fresh one.
+        if self._download_urls.get(key) is presigned:
+            del self._download_urls[key]
+
+    def _mark_presigned_failure(self, key: tuple[int, str], reason: str) -> None:
+        now = time.monotonic()
+        if len(self._presigned_failures) >= _PRESIGNED_CACHE_MAX_ENTRIES:
+            for stale in [k for k, until in self._presigned_failures.items() if until <= now]:
+                del self._presigned_failures[stale]
+        self._presigned_failures[key] = now + _PRESIGNED_FAILURE_TTL_S
+        logger.warning(
+            "Presigned download unavailable for %s (%s); using the Files API for the next %.0fs",
+            key[1], reason, _PRESIGNED_FAILURE_TTL_S,
+        )
+
+    def _get_storage_client(self) -> httpx.Client:
+        if self._storage_client is None:
+            self._storage_client = httpx.Client(
+                http2=False,
+                follow_redirects=False,
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=60.0,
+                    write=10.0,
+                    pool=5.0,
+                ),
+                limits=httpx.Limits(
+                    max_keepalive_connections=50,
+                    max_connections=50,
+                ),
+            )
+
+        return self._storage_client
+
+    @staticmethod
+    def _storage_get_blocking(
+        client: httpx.Client,
+        url: str,
+        headers: dict[str, str],
+        length: int,
+        accept_200: bool,
+    ) -> tuple[int, bytes]:
+
+        start = time.perf_counter()
+
+        with client.stream(
+            "GET",
+            url,
+            headers=headers,
+            follow_redirects=False,
+        ) as resp:
+
+            status = resp.status_code
+            
+            # bottleneck revision
+            logger.info(
+                "HTTPX_PROTOCOL version=%s status=%s",
+                resp.http_version,
+                resp.status_code,
+            )
+
+            if status == 206 or (status == 200 and accept_200):
+
+                body = resp.read()
+                
+                # blottleneck
+                #if len(body) > length:
+                #    body = body[:length]
+
+                elapsed = time.perf_counter() - start
+                # bottleneck: calculate throughput in MB/s
+                throughput_mb_s = (
+                    len(body) / 1024 / 1024 / elapsed
+                    if elapsed > 0
+                    else 0
+                )
+
+                logger.info(
+                    "HTTPX_DOWNLOAD "
+                    "status=%s bytes=%s expected=%s took=%.3fs throughput=%.1fMB/s",
+                    status,
+                    len(body),
+                    length,
+                    elapsed,
+                    throughput_mb_s,
+                )
+
+                return status, body
+
+            elapsed = time.perf_counter() - start
+
+            logger.info(
+                "HTTPX_DOWNLOAD_ERROR status=%s took=%.3fs",
+                status,
+                elapsed,
+            )
+
+            return status, b""
+
+    async def _download_range_presigned(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        ctx: pyfuse3.RequestContext,
+        if_unmodified_since: float | None,
+    ) -> bytes | None:
+        """Read [offset, offset + length) directly from storage.
+        Returns None when the caller should use the Files API instead. Nothing
+        logged or raised here includes the presigned URL.
+        """
+        key = (ctx.uid, path)
+        if self._presigned_failures.get(key, 0.0) > time.monotonic():
+            return None
+
+        range_headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+        if if_unmodified_since:
+            range_headers["If-Unmodified-Since"] = formatdate(if_unmodified_since, usegmt=True)
+        client = self._get_storage_client()
+
+        refreshed = False
+        attempt = 0
+        while True:
+            try:
+                presigned = await self._get_cached_download_url(path, ctx=ctx)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                detail = f" status={status}" if status is not None else ""
+                self._mark_presigned_failure(key, f"create-download-url failed: {type(exc).__name__}{detail}")
+                return None
+
+            try:
+                headers = presigned.headers.copy()
+                headers.update(range_headers)
+
+                status, body = await trio.to_thread.run_sync(
+                    self._storage_get_blocking,
+                    client,
+                    presigned.url,
+                    headers,
+                    length,
+                    offset == 0,
+                    limiter=self._storage_limiter,
+                )
+                
+                # bottleneck validation
+                logger.info(
+                    "PRESIGNED_RANGE "
+                    "offset=%s length=%s returned=%s status=%s",
+                    offset,
+                    length,
+                    len(body),
+                    status,
+                )
+                
+                failure = f"storage status {status}"
+            except httpx.HTTPError as exc:
+                # Message deliberately not logged: it may contain the URL.
+                status, body = None, b""
+                failure = f"storage transport error {type(exc).__name__}"
+
+            if status == 206 or (status == 200 and offset == 0):
+                if len(body) == length:
+
+                    logger.info(
+                        "DOWNLOAD_OK "
+                        "offset=%s expected=%s returned=%s",
+                        offset,
+                        length,
+                        len(body),
+                    )
+
+                    return body
+                failure = f"short read ({len(body)} of {length} bytes)"
+                status = None  # retried like a transport error
+
+            if status == 403 and not refreshed:
+                # Expired or revoked signature: get a new URL once.
+                self._invalidate_download_url(key, presigned)
+                refreshed = True
+                continue
+            if status == 412:
+                # Let the Files API decide: it raises UcPreconditionFailed if the
+                # file really changed, and serves the data if storage's
+                # Last-Modified merely differs from the mtime Unity Catalog reports.
+                logger.debug("Presigned download of %s got 412; retrying via the Files API", path)
+                return None
+            if (status is None or status in _RETRY_STATUS) and attempt < _DEFAULT_MAX_RETRIES:
+                delay = _backoff_delay(attempt, None)
+                logger.warning(
+                    "Presigned download of %s failed (%s). Retrying in %.1fs (attempt %d/%d).",
+                    path, failure, delay, attempt + 1, _DEFAULT_MAX_RETRIES,
+                )
+                await trio.sleep(delay)
+                attempt += 1
+                continue
+
+            self._mark_presigned_failure(key, failure)
+            return None
+
+    async def download_chunk_stream_presigned(
+        self,
+        path: str,
+        offset: int,
+        length: int,
+        *,
+        ctx: pyfuse3.RequestContext,
+        if_unmodified_since: float | None = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Same contract as ``download_chunk_stream``, but reads the range
+        directly from cloud storage through a presigned URL.
+
+        Falls back to ``download_chunk_stream`` (GET /api/2.0/fs/files) when no
+        URL can be created or storage does not serve the range.
+        Yields the requested range as a single chunk.
+        
+        Unlike download_chunk_stream(), which forwards the Files API stream in
+        64 KiB pieces, the presigned path reads the whole requested Fuse chunk
+        (typically 8 MiB) into memory and yields it once. This matches the
+        DataManager's chunk-oriented design and reduces Python and async
+        overhead during large sequential reads.
+        """
+        logger.debug(f"uc_client.download_chunk_stream_presigned for {path}")
+        data = await self._download_range_presigned(
+            path, offset, length, ctx=ctx, if_unmodified_since=if_unmodified_since
+        )
+        if data is None:
+            async for piece in self.download_chunk_stream(
+                path, offset, length, ctx=ctx, if_unmodified_since=if_unmodified_since
+            ):
+                yield piece
+            return
+        yield data
 
     async def download_chunk_stream(
         self,

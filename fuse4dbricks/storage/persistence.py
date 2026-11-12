@@ -210,17 +210,28 @@ class DiskPersistence:
         temp_path = f"{cache_path}.{os.getpid()}.tmp"
         result = bytearray()
         bytes_written = 0
+
         try:
             # The shard dir is created lazily here (off-thread), only when we
             # actually write a chunk — not on every read in _get_chunk_path.
             await trio.to_thread.run_sync(self._ensure_parent_dir, cache_path)
 
-            # Write to .tmp (No lock needed)
+            # Accumulate the chunk and persist it with a single write operation.
+            #
+            # Fuse4dbricks operates on fixed-size chunks (typically 8 MiB). Writing
+            # the completed chunk at once avoids many smaller write syscalls and
+            # improves cache-write throughput.
+            #
+            # The chunk is already accumulated here because it is returned to the
+            # caller for RAM caching, so persisting it with a single write does not
+            # introduce additional buffering.
             async with await trio.open_file(temp_path, "wb") as f:
                 async for chunk in stream:
-                    await f.write(chunk)
                     bytes_written += len(chunk)
                     result.extend(chunk)
+
+                if result:
+                    await f.write(result)
 
             # Atomic Rename (No lock needed)
             await trio.to_thread.run_sync(os.rename, temp_path, cache_path)
@@ -230,16 +241,17 @@ class DiskPersistence:
 
             # 2. UPDATE METADATA (Acquire Lock)
             async with self.lock:
-                # If overwriting, logic could go here to subtract old size
                 self.current_size += bytes_written
                 now = time.time()
                 self.access_map[cache_path] = now
                 heappush(self.access_log, (now, cache_path, bytes_written))
+
             return bytes(result)
-        except Exception as e:
+
+        except Exception:
             if os.path.exists(temp_path):
                 await trio.to_thread.run_sync(os.remove, temp_path)
-            raise e
+            raise
 
     async def evict(self, required_space: int):
         """
