@@ -1,4 +1,4 @@
-# 0.7.10 (2026-11-06)
+# 0.7.10 (2026-11-24)
 
 - Add experimental `--use-presigned-downloads` (off by default). File data is
   read directly from cloud storage through presigned URLs obtained from
