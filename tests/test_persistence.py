@@ -530,7 +530,6 @@ async def test_background_maintenance_non_blocking(persistence):
     assert persistence.current_size == 0
     assert path not in persistence.access_map
 
-
 # --- IN-RAM CHUNK INDEX (has_chunk) ---
 
 
